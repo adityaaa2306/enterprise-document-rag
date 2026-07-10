@@ -5,7 +5,6 @@ import { motion } from "framer-motion"
 import { Sidebar } from "@/components/sidebar"
 import { TopBar } from "@/components/top-bar"
 import { API_BASE_URL } from "@/config"
-import { apiFetch } from "@/lib/api"
 import { CheckCircle2, XCircle, Server } from "lucide-react"
 
 export default function SettingsPage() {
