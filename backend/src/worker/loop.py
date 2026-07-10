@@ -93,7 +93,7 @@ def run_worker_forever(*, worker_id: Optional[str] = None, once: bool = False) -
     from src.memory import storage
 
     log.info("Worker: ensuring database + Chroma are ready...")
-    storage.init_database()  # includes wait_for_chroma() with exponential backoff
+    storage.init_database()  # DB + embedded Chroma PersistentClient
     from src.agents import models as agent_models
 
     agent_models.load_all_models()

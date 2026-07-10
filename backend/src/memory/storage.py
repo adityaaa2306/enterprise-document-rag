@@ -6,7 +6,7 @@ from datetime import datetime
 from src.core.config import settings
 from src.agents import models
 from src.memory.document_ids import align_chunks_to_document_id
-from src.memory.chroma import get_chroma_client, wait_for_chroma, ChromaUnavailableError
+from src.memory.chroma import get_chroma_client, init_chroma
 from src.db.session import get_engine, get_session, get_session_factory, init_engine
 from src.db.models import ChunkModel, DocumentModel, UserModel
 
@@ -40,7 +40,7 @@ def _sync_session_aliases() -> None:
 
 # -----------------------------------------------------------
 # ChromaDB — vectors only (see src.memory.chroma). Not Postgres/pgvector.
-# Production: HttpClient → dedicated Chroma server (shared by API + workers).
+# Embedded PersistentClient under CHROMA_PERSIST_DIRECTORY.
 # -----------------------------------------------------------
 
 
@@ -283,13 +283,11 @@ def init_database(*, block_on_chroma: bool = True):
     Called by API lifespan / worker startup.
 
     Schema migrations are owned by the Docker entrypoint
-    (`alembic upgrade head` when RUN_MIGRATIONS_ON_STARTUP=true). This function
-    must NOT call Alembic again — a second in-process upgrade delayed uvicorn
-    bind on Render and contributed to "No open ports detected".
+    (`alembic upgrade head` when RUN_MIGRATIONS_ON_STARTUP=true).
 
-    ``block_on_chroma``:
-      - True  — worker: wait_for_chroma() with backoff (no HTTP port to bind)
-      - False — API: one-shot probe only so lifespan can finish and bind PORT
+    Chroma is embedded (PersistentClient): init is local disk I/O only and
+    must not block PORT bind with network retries. ``block_on_chroma`` is
+    retained for call-site compatibility but both paths init immediately.
     """
     try:
         init_engine()
@@ -310,33 +308,16 @@ def init_database(*, block_on_chroma: bool = True):
         log.error(f"Failed to initialize relational DB: {e}")
         raise
 
-    if block_on_chroma:
-        try:
-            info = wait_for_chroma()
-            if not info.get("ok"):
-                log.error(f"ChromaDB not ready after startup wait: {info}")
-            else:
-                log.info(
-                    "ChromaDB vector store ready mode=%s collection=%s",
-                    info.get("mode"),
-                    info.get("collection"),
-                )
-        except ChromaUnavailableError:
-            raise
-        except Exception as e:
-            log.error(f"ChromaDB init check failed: {e}")
-            if getattr(settings, "CHROMA_STARTUP_REQUIRED", True):
-                raise
-        return
-
-    # API path: never touch Chroma during lifespan (HttpClient can hang on bad hosts).
-    # Worker still uses wait_for_chroma(). Readiness is GET /api/ready.
-    log.info(
-        "Skipping Chroma wait on API startup (CHROMA_MODE=%s host=%s) — "
-        "/api/health binds immediately; /api/ready probes Chroma",
-        getattr(settings, "CHROMA_MODE", ""),
-        (getattr(settings, "CHROMA_SERVER_HOST", "") or "").strip() or "(unset)",
-    )
+    info = init_chroma()
+    if info.get("ok"):
+        log.info(
+            "Chroma PersistentClient ready path=%s collection=%s",
+            info.get("path"),
+            info.get("collection"),
+        )
+    else:
+        # Do not raise — /api/ready reports failure; lifespan must still yield.
+        log.error("Chroma init failed at startup: %s", info.get("error") or info)
 
 # -----------------------------------------------------------
 # FINAL SUMMARY STORAGE

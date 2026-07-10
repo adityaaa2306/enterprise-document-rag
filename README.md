@@ -10,6 +10,11 @@ A production-ready intelligent document processing system with carbon-aware comp
 - **Real-time Dashboard**: Monitor processing metrics, carbon savings, and efficiency
 - **Modern UI**: Glassmorphism design with dark mode support
 
+> **Chroma:** The application currently uses an embedded Chroma instance for
+> cost-efficient portfolio deployment. The production deployment architecture
+> supports migrating to a standalone Chroma server (`HttpClient`) with no
+> application-level changes beyond restoring the client factory branch.
+
 ---
 
 ## Table of Contents

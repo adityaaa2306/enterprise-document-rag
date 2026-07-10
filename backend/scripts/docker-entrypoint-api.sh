@@ -4,12 +4,13 @@ set -euo pipefail
 cd "${APP_HOME:-/app}"
 
 export APP_ENV="${APP_ENV:-production}"
-export VECTOR_DB_PATH="${VECTOR_DB_PATH:-/data/chroma}"
+export VECTOR_DB_PATH="${VECTOR_DB_PATH:-/data/aux}"
+export CHROMA_PERSIST_DIRECTORY="${CHROMA_PERSIST_DIRECTORY:-/data/chroma}"
 export PORT="${PORT:-8000}"
 export UVICORN_GRACEFUL_TIMEOUT="${UVICORN_GRACEFUL_TIMEOUT:-30}"
 export RUN_MIGRATIONS_ON_STARTUP="${RUN_MIGRATIONS_ON_STARTUP:-true}"
 
-mkdir -p "${VECTOR_DB_PATH}" temp_uploads \
+mkdir -p "${VECTOR_DB_PATH}" "${CHROMA_PERSIST_DIRECTORY}" temp_uploads \
   "${OBJECT_STORAGE_LOCAL_ROOT:-/data/object_store}"
 
 if [[ "${RUN_MIGRATIONS_ON_STARTUP}" == "true" || "${RUN_MIGRATIONS_ON_STARTUP}" == "1" ]]; then

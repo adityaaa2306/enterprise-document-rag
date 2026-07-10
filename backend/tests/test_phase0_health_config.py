@@ -27,8 +27,21 @@ def client(monkeypatch):
     monkeypatch.setattr(agent_models, "load_all_models", lambda: None)
 
     from src.memory import storage
+    from src.memory import chroma as chroma_mod
 
     monkeypatch.setattr(storage, "init_database", lambda **kwargs: None)
+    monkeypatch.setattr(
+        chroma_mod,
+        "chroma_health_check",
+        lambda: {
+            "ok": True,
+            "mode": "persistent",
+            "path": "/tmp/chroma-test",
+            "collection": "test",
+            "ready": True,
+        },
+    )
+    monkeypatch.setattr(chroma_mod, "is_chroma_ready", lambda: True)
 
     from src.api.main import app
 
@@ -40,9 +53,10 @@ def test_api_health(client):
     r = client.get("/api/health")
     assert r.status_code == 200
     body = r.json()
-    assert body["status"] == "ok"
+    assert body["status"] in ("ok", "degraded")
     assert "version" in body
     assert body["env"] in ("testing", "development", "production")
+    assert "chroma" in body
 
 
 def test_api_ready(client):

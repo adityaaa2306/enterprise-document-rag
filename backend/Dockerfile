@@ -62,6 +62,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     APP_HOME=/app \
     APP_ENV=production \
     VECTOR_DB_PATH=/data/aux \
+    CHROMA_PERSIST_DIRECTORY=/data/chroma \
     OBJECT_STORAGE_LOCAL_ROOT=/data/object_store \
     PYTHONPATH=/app
 
@@ -75,7 +76,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         poppler-utils \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser \
-    && mkdir -p /data/aux /data/object_store /app/temp_uploads \
+    && mkdir -p /data/aux /data/chroma /data/object_store /app/temp_uploads \
     && chown -R appuser:appuser /data /app
 
 COPY --from=builder /opt/venv /opt/venv

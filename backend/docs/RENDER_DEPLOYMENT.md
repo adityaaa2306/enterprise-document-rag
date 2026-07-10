@@ -9,13 +9,18 @@ flowchart TB
   Vercel -->|HTTPS Bearer| API[Render Web Service — FastAPI]
   API --> Neon[(Neon PostgreSQL)]
   API --> R2[(Cloudflare R2)]
-  API --> Chroma[Render Private Service — ChromaDB]
+  API --> Disk[(Embedded Chroma PersistentClient)]
   Worker[Render Background Worker] --> Neon
   Worker --> R2
-  Worker --> Chroma
+  Worker --> Disk
   API --> NIM[NVIDIA NIM APIs]
   Worker --> NIM
 ```
+
+> The application currently uses an embedded Chroma instance for cost-efficient
+> portfolio deployment. The production deployment architecture supports migrating
+> to a standalone Chroma server (`HttpClient`) with no application-level changes
+> beyond restoring the client factory branch.
 
 ---
 
@@ -29,7 +34,7 @@ flowchart TB
 | Image size | Large (torch/transformers/unstructured) but CUDA avoided; BuildKit pip cache |
 | Build caching | `requirements.txt` copied before app code; pip cache mount |
 
-**Local:** `docker compose up --build` (postgres + chroma + api + worker).
+**Local:** `docker compose up --build` (postgres + api + worker; embedded Chroma volume).
 
 ---
 
@@ -37,9 +42,10 @@ flowchart TB
 
 | Service | Type | Docker target | Start command | Health |
 |---------|------|---------------|---------------|--------|
-| `green-agentic-chroma` | Private service (image) | n/a — `chromadb/chroma:0.5.23` | image default | Chroma heartbeat |
 | `green-agentic-api` | **Web Service** | `api` | `/app/scripts/docker-entrypoint-api.sh` | `GET /api/health` |
 | `green-agentic-worker` | **Background Worker** | `worker` | `/app/scripts/docker-entrypoint-worker.sh` | process + DB; app-level `/api/worker/health` |
+
+No separate Chroma service — embeddings use `CHROMA_PERSIST_DIRECTORY` on the service disk.
 
 **Root Directory:** `backend` (repo root → set Root Dir to `backend` in each Docker service).
 
@@ -64,15 +70,13 @@ Without `dockerBuildTarget`, Render may build the last Dockerfile stage (`worker
 1. [ ] Neon project → copy pooled `DATABASE_URL` (SSL)
 2. [ ] Cloudflare R2 bucket + API token
 3. [ ] NVIDIA NIM API key
-4. [ ] Render → Blueprint (`backend/render.yaml`) **or** create 3 services manually
-5. [ ] Chroma private service + disk (`/chroma/chroma`)
-6. [ ] API Web Service: **`dockerBuildTarget: api`**, health `/api/health`, disk `/data/aux`
-7. [ ] Worker: **`dockerBuildTarget: worker`**, same Neon + R2 + Chroma + **same JWT_SECRET_KEY**
-8. [ ] Set `CHROMA_SERVER_HOST` on API + Worker to Chroma **internal** hostname
-9. [ ] Set `CORS_ORIGINS` on **API** to Vercel URL(s) (worker CORS optional)
-10. [ ] Deploy → `GET https://<api>.onrender.com/api/health` and `/api/ready`
-11. [ ] Confirm `/api/worker/health` shows a live worker
-12. [ ] Vercel: `NEXT_PUBLIC_API_URL=https://<api>.onrender.com`
+4. [ ] Render → Blueprint (`backend/render.yaml`) **or** create API (+ optional Worker)
+5. [ ] API Web Service: **`dockerBuildTarget: api`**, health `/api/health`, disk `/data`
+6. [ ] Set `CHROMA_PERSIST_DIRECTORY=/data/chroma` (and `VECTOR_DB_PATH=/data/aux`)
+7. [ ] Worker (optional): **`dockerBuildTarget: worker`**, same Neon + R2 + **same JWT_SECRET_KEY**
+8. [ ] Set `CORS_ORIGINS` on **API** (or `*` for portfolio demos)
+9. [ ] Deploy → `GET https://<api>.onrender.com/api/health` and `/api/ready`
+10. [ ] Vercel: `NEXT_PUBLIC_API_URL=https://<api>.onrender.com`
 
 ---
 
@@ -96,37 +100,29 @@ Without `dockerBuildTarget`, Render may build the last Dockerfile stage (`worker
 | `NVIDIA_API_KEY` | ✓ | |
 | `OBJECT_STORAGE_BACKEND` | ✓ | `r2` |
 | `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET` | ✓ | |
-| `CHROMA_MODE` | ✓ | `http` |
-| `CHROMA_SERVER_HOST` | ✓ | Chroma private host |
-| `CHROMA_SERVER_PORT` | ✓ | `8000` |
-| `CHROMA_STARTUP_REQUIRED` | | `true` |
+| `CHROMA_PERSIST_DIRECTORY` | ✓ | `/data/chroma` (embedded PersistentClient) |
+| `CHROMA_COLLECTION_NAME` | ✓ | shared collection name |
 | `RUN_MIGRATIONS_ON_STARTUP` | ✓ | `true` on API only |
 | `PERSIST_JOBS_TO_DB` | ✓ | `true` |
-| `VECTOR_DB_PATH` | | `/data/aux` (not embeddings) |
+| `VECTOR_DB_PATH` | | `/data/aux` (BM25/cache — not embeddings) |
 
 ### Render Worker
-Must share Neon, R2, NVIDIA, Chroma, and **JWT** with the API:
+Must share Neon, R2, NVIDIA, and **JWT** with the API. Embedded Chroma on the
+Worker disk is **separate** from the API disk unless you later use HttpClient.
 
 | Variable | Required | Notes |
 |----------|:--------:|-------|
 | `APP_ENV` | ✓ | `production` |
 | `SERVICE_ROLE` | ✓ | `worker` (skips CORS validation) |
 | `DATABASE_URL` | ✓ | **Same** Neon URL as API |
-| `JWT_SECRET_KEY` | ✓ | **Same value** as API (copy from API dashboard) |
+| `JWT_SECRET_KEY` | ✓ | **Same value** as API |
 | `NVIDIA_API_KEY` | ✓ | Same as API |
 | `OBJECT_STORAGE_BACKEND` | ✓ | `r2` |
 | `R2_*` | ✓ | Same as API |
-| `CHROMA_MODE` / `CHROMA_SERVER_HOST` | ✓ | Same as API |
+| `CHROMA_PERSIST_DIRECTORY` | ✓ | `/data/chroma` |
 | `RUN_MIGRATIONS_ON_STARTUP` | ✓ | `false` |
 | `WORKER_ID` | ✓ | Unique per replica |
-| `WORKER_SHUTDOWN_GRACE_SEC` | | `120` |
 | `CORS_ORIGINS` | | Optional; not validated on worker |
-
-### Chroma private service
-| Variable | Value |
-|----------|-------|
-| `IS_PERSISTENT` | `TRUE` |
-| Disk | `/chroma/chroma` |
 
 ---
 

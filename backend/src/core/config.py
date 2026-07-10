@@ -115,7 +115,8 @@ class Settings(BaseSettings):
 
     # --- Database Configuration ---
     # Local default: SQLite. Production: postgresql://... or postgresql+psycopg://...
-    VECTOR_DB_PATH: str = "./local_db/chroma"
+    # Aux files (BM25, embed cache, file conversations) — not Chroma embeddings
+    VECTOR_DB_PATH: str = "./local_db/aux"
     DATABASE_URL: str = "sqlite:///./agentic_db.sqlite"
     CHROMA_COLLECTION_NAME: str = "documents_nemotron_v2"
     DB_POOL_SIZE: int = 5
@@ -123,7 +124,7 @@ class Settings(BaseSettings):
     # When True, skip Alembic and call metadata.create_all (dev convenience only)
     # Forced off when APP_ENV=production (see validate_for_runtime).
     AUTO_CREATE_SCHEMA: bool = False
-    # When True, run `alembic upgrade head` during init_database (convenient locally)
+    # When True, Docker entrypoint runs `alembic upgrade head` before uvicorn
     RUN_MIGRATIONS_ON_STARTUP: bool = False
 
     # --- Durable runtime state (feature flags — set False to roll back to legacy) ---
@@ -143,23 +144,10 @@ class Settings(BaseSettings):
     # After SIGTERM: finish current job up to this many seconds, then exit
     WORKER_SHUTDOWN_GRACE_SEC: float = 120.0
 
-    # --- Chroma vector store (NOT Postgres / NOT pgvector) ---
-    # Production (Render): CHROMA_MODE=http + CHROMA_SERVER_HOST → dedicated Chroma service.
-    # Local single-process / tests: CHROMA_MODE=persistent (or empty host) → VECTOR_DB_PATH.
-    # http | persistent | auto (default: http if CHROMA_SERVER_HOST set, else persistent)
-    CHROMA_MODE: str = "auto"
-    CHROMA_SERVER_HOST: str = ""
-    CHROMA_SERVER_PORT: int = 8000
-    CHROMA_SERVER_SSL: bool = False
-    CHROMA_AUTH_TOKEN: str = ""
-    CHROMA_TENANT: str = ""
-    CHROMA_DATABASE: str = ""
-    # Startup wait (API + Worker) — exponential backoff until Chroma is healthy
-    CHROMA_STARTUP_MAX_WAIT_SEC: float = 120.0
-    CHROMA_STARTUP_INITIAL_DELAY_SEC: float = 0.5
-    CHROMA_STARTUP_MAX_DELAY_SEC: float = 10.0
-    # When true, refuse to finish startup if Chroma never becomes healthy
-    CHROMA_STARTUP_REQUIRED: bool = True
+    # --- Chroma vector store (embedded PersistentClient — NOT remote HttpClient) ---
+    # Portfolio / single-service: embeddings on local disk under this path.
+    # Empty → falls back to VECTOR_DB_PATH for legacy env files.
+    CHROMA_PERSIST_DIRECTORY: str = "./local_db/chroma"
 
     # --- Carbon Scheduler Settings ---
     BASELINE_GRID_INTENSITY: float = 450.0
@@ -331,22 +319,8 @@ class Settings(BaseSettings):
                 log.warning("CORS_ALLOW_ALL is ignored when APP_ENV=production")
             if not (self.NVIDIA_API_KEY or "").strip():
                 log.warning("NVIDIA_API_KEY is empty in production — LLM calls will fail")
-            # Chroma: embedded persistent is not safe for multi-service Render deploys
-            mode_raw = (self.CHROMA_MODE or "auto").strip().lower()
-            host = (self.CHROMA_SERVER_HOST or "").strip()
-            if mode_raw in ("http", "server", "remote"):
-                resolved = "http"
-            elif mode_raw in ("persistent", "embedded", "local"):
-                resolved = "persistent"
-            else:
-                resolved = "http" if host else "persistent"
-            if resolved != "http":
-                log.warning(
-                    "Production APP_ENV with Chroma mode=%s — API and Worker cannot "
-                    "share embeddings unless they share a filesystem. "
-                    "Set CHROMA_MODE=http and CHROMA_SERVER_HOST to a Chroma service.",
-                    resolved,
-                )
+            persist = (self.CHROMA_PERSIST_DIRECTORY or self.VECTOR_DB_PATH or "").strip()
+            log.info("Chroma embedded persist directory=%s", persist or "(default)")
 
 
 settings = Settings()

@@ -22,11 +22,11 @@ def test_compose_separates_api_and_worker():
     assert "api:" in text
     assert "worker:" in text
     assert "postgres:" in text
-    assert "chroma:" in text
     assert "target: api" in text
     assert "target: worker" in text
     assert "stop_grace_period" in text
-    assert "CHROMA_MODE: http" in text
+    assert "CHROMA_PERSIST_DIRECTORY" in text
+    assert "chromadb/chroma" not in text
 
 
 def test_render_blueprint_exists():
@@ -35,14 +35,14 @@ def test_render_blueprint_exists():
     text = path.read_text(encoding="utf-8")
     assert "green-agentic-api" in text
     assert "green-agentic-worker" in text
-    assert "green-agentic-chroma" in text
+    assert "green-agentic-chroma" not in text
     assert "healthCheckPath: /api/health" in text
     assert "docker-entrypoint-api.sh" in text
     assert "docker-entrypoint-worker.sh" in text
     assert "dockerBuildTarget: api" in text
     assert "dockerBuildTarget: worker" in text
+    assert "CHROMA_PERSIST_DIRECTORY" in text
     assert "railway" not in text.lower()
-    # Worker must receive JWT (same secret as API)
     assert text.count("JWT_SECRET_KEY") >= 2
     assert "SERVICE_ROLE" in text
 

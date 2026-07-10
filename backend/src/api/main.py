@@ -51,8 +51,7 @@ async def lifespan(app: FastAPI):
     3. Initializes relational DB; probes Chroma without long blocking waits.
 
     Critical for Render: uvicorn does not bind PORT until this lifespan
-    completes. Long sync waits here cause "No open ports detected".
-    Chroma readiness is reported by GET /api/ready, not by blocking bind.
+    completes. Embedded Chroma init is local disk only (no network waits).
     """
     log.info("API Startup: validating configuration...")
     settings.validate_for_runtime()
@@ -71,7 +70,7 @@ async def lifespan(app: FastAPI):
     # 2. Load NVIDIA NIM client (no local HF model downloads)
     models.load_all_models()
 
-    # 3. Relational DB only — do not block port bind on Chroma / second Alembic
+    # 3. Relational DB + embedded Chroma (local disk — no remote wait)
     storage.init_database(block_on_chroma=False)
 
     yield

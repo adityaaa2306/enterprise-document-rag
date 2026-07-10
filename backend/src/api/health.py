@@ -1,7 +1,7 @@
 """
 Liveness and readiness probes.
 
-GET /api/health  — process is up (no dependency checks)
+GET /api/health  — process up + embedded Chroma persist dir usable
 GET /api/ready   — relational DB + Chroma + object storage usable
 """
 from __future__ import annotations
@@ -21,13 +21,36 @@ router = APIRouter(tags=["health"])
 
 @router.get("/api/health")
 def health() -> Dict[str, Any]:
-    """Liveness: process is running."""
-    return {
+    """
+    Liveness (+ light Chroma check for portfolio deploys).
+
+    Verifies the process is up and embedded Chroma persist directory is
+    accessible. Does not perform remote HTTP checks.
+    """
+    body: Dict[str, Any] = {
         "status": "ok",
         "service": settings.APP_NAME,
         "version": settings.APP_VERSION,
         "env": settings.app_env_normalized,
     }
+    try:
+        from src.memory.chroma import chroma_health_check, is_chroma_ready
+
+        chroma = chroma_health_check()
+        body["chroma"] = {
+            "ok": bool(chroma.get("ok")),
+            "mode": chroma.get("mode"),
+            "path": chroma.get("path"),
+            "ready": is_chroma_ready() or bool(chroma.get("ok")),
+        }
+        if not chroma.get("ok"):
+            body["status"] = "degraded"
+            body["chroma"]["error"] = chroma.get("error")
+    except Exception as e:
+        body["status"] = "degraded"
+        body["chroma"] = {"ok": False, "error": str(e)}
+        log.warning(f"Health Chroma check failed: {e}")
+    return body
 
 
 @router.get("/api/ready")
@@ -52,7 +75,7 @@ def ready(response: Response) -> Dict[str, Any]:
         checks["database"] = {"ok": False, "error": str(e)}
         log.warning(f"Readiness DB check failed: {e}")
 
-    # Chroma (HTTP server or embedded persistent)
+    # Embedded Chroma (PersistentClient — local disk)
     try:
         from src.memory.chroma import chroma_health_check
 
@@ -62,7 +85,7 @@ def ready(response: Response) -> Dict[str, Any]:
             ready_ok = False
     except Exception as e:
         ready_ok = False
-        checks["chroma"] = {"ok": False, "error": str(e)}
+        checks["chroma"] = {"ok": False, "mode": "persistent", "error": str(e)}
         log.warning(f"Readiness Chroma check failed: {e}")
 
     # Object storage (local / R2 / S3)

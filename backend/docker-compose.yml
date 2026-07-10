@@ -1,9 +1,8 @@
-# Local stack with production-parity Chroma Server (shared by API + Worker).
+# Local stack — embedded Chroma PersistentClient (no separate Chroma service).
 #
 #   docker compose up --build
 #
-# Chroma runs as its own service with a persistent volume.
-# API/Worker use CHROMA_MODE=http — same pattern as Render.
+# API and Worker share a volume at CHROMA_PERSIST_DIRECTORY so embeddings match.
 
 name: green-agentic
 
@@ -24,28 +23,6 @@ services:
       timeout: 5s
       retries: 10
 
-  # Dedicated Chroma server — single source of truth for embeddings
-  chroma:
-    image: chromadb/chroma:0.5.23
-    ports:
-      - "8001:8000"
-    volumes:
-      - chroma_server_data:/chroma/chroma
-    environment:
-      IS_PERSISTENT: "TRUE"
-      ANONYMIZED_TELEMETRY: "FALSE"
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/heartbeat')\" || python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v2/heartbeat')\"",
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 20s
-    restart: unless-stopped
-
   api:
     build:
       context: .
@@ -59,12 +36,7 @@ services:
       APP_ENV: production
       PORT: "8000"
       DATABASE_URL: postgresql+psycopg://green:green@postgres:5432/green_agentic
-      # Shared Chroma server (not embedded disk)
-      CHROMA_MODE: http
-      CHROMA_SERVER_HOST: chroma
-      CHROMA_SERVER_PORT: "8000"
-      CHROMA_SERVER_SSL: "false"
-      # Aux local files only (BM25/embed cache) — not vector embeddings
+      CHROMA_PERSIST_DIRECTORY: /data/chroma
       VECTOR_DB_PATH: /data/aux
       OBJECT_STORAGE_BACKEND: local
       OBJECT_STORAGE_LOCAL_ROOT: /data/object_store
@@ -76,12 +48,11 @@ services:
       PERSIST_CONVERSATIONS_TO_DB: "true"
       PERSIST_ROUTING_EVENTS_TO_DB: "true"
     volumes:
+      - chroma_data:/data/chroma
       - aux_data:/data/aux
       - object_store:/data/object_store
     depends_on:
       postgres:
-        condition: service_healthy
-      chroma:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
@@ -102,10 +73,7 @@ services:
     environment:
       APP_ENV: production
       DATABASE_URL: postgresql+psycopg://green:green@postgres:5432/green_agentic
-      CHROMA_MODE: http
-      CHROMA_SERVER_HOST: chroma
-      CHROMA_SERVER_PORT: "8000"
-      CHROMA_SERVER_SSL: "false"
+      CHROMA_PERSIST_DIRECTORY: /data/chroma
       VECTOR_DB_PATH: /data/aux
       OBJECT_STORAGE_BACKEND: local
       OBJECT_STORAGE_LOCAL_ROOT: /data/object_store
@@ -116,12 +84,11 @@ services:
       WORKER_POLL_INTERVAL_SEC: "2"
       WORKER_CLAIM_TIMEOUT_SEC: "900"
     volumes:
+      - chroma_data:/data/chroma
       - aux_data:/data/aux
       - object_store:/data/object_store
     depends_on:
       postgres:
-        condition: service_healthy
-      chroma:
         condition: service_healthy
       api:
         condition: service_healthy
@@ -130,6 +97,6 @@ services:
 
 volumes:
   pgdata:
-  chroma_server_data:
+  chroma_data:
   aux_data:
   object_store:
