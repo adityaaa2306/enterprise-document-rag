@@ -28,7 +28,7 @@ def client(monkeypatch):
 
     from src.memory import storage
 
-    monkeypatch.setattr(storage, "init_database", lambda: None)
+    monkeypatch.setattr(storage, "init_database", lambda **kwargs: None)
 
     from src.api.main import app
 
@@ -105,6 +105,21 @@ def test_dev_jwt_fallback():
     secret = s.resolved_jwt_secret()
     assert secret
     assert "dev-only" in secret
+
+
+def test_cors_star_allowed_in_production_without_credentials():
+    from src.core.config import Settings
+
+    s = Settings(
+        APP_ENV="production",
+        JWT_SECRET_KEY="prod-secret-key-for-cors-star-test!!",
+        CORS_ORIGINS="*",
+        CORS_ALLOW_ALL=False,
+        _env_file=None,
+    )
+    assert s.cors_allow_origins() == ["*"]
+    assert s.cors_allow_credentials() is False
+    s.validate_for_runtime(require_cors=True)
 
 
 def test_worker_validation_skips_cors_but_requires_jwt():

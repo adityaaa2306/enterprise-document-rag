@@ -16,8 +16,9 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Do not ignore frontend/lib (Next.js shared client code)
+/lib/
+/lib64/
 parts/
 sdist/
 var/

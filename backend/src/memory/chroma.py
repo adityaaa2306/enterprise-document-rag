@@ -133,6 +133,8 @@ def chroma_health_check() -> dict:
             out["path"] = os.path.abspath(settings.VECTOR_DB_PATH)
         if beat is not None:
             out["heartbeat"] = beat
+        global _chroma_ready
+        _chroma_ready = True
         return out
     except Exception as e:
         log.warning("Chroma health check failed: %s", e)

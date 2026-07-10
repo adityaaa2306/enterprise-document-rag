@@ -11,7 +11,6 @@ import re
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 
-from src.agents import models
 from src.core.config import settings
 
 log = logging.getLogger(__name__)
@@ -87,13 +86,12 @@ def _contradiction_rate(source: str, summary: str) -> float:
 def validate_pair(source: str, summary: str) -> ValidationVerdict:
     codes: List[str] = []
 
-    # Faithfulness via existing NLI checker when available
-    nli_ok = models.run_accuracy_check(source, summary)
-    faithfulness = 0.85 if nli_ok else 0.35
-
+    # Faithfulness from lexical coverage / hallucination heuristics (no HF NLI).
     coverage = _coverage(source, summary)
     hallu = _hallucination_rate(source, summary)
     contra = _contradiction_rate(source, summary)
+    faithfulness = max(0.0, min(1.0, 0.70 * coverage + 0.30 * (1.0 - hallu)))
+
 
     conf = (
         0.40 * faithfulness

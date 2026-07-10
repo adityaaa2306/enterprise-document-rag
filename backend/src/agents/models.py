@@ -4,7 +4,6 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import requests
 from openai import OpenAI
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from src.core.config import settings
 
@@ -418,66 +417,16 @@ def rerank(query: str, passages: List[str], top_k: int) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Accuracy-Checker Model (Local NLI) — escalation gate
-# ---------------------------------------------------------------------------
-
-def load_checker_model():
-    """Loads the local NLI accuracy checker from Hugging Face."""
-    global models_registry
-    if "checker_model" not in models_registry:
-        try:
-            log.info(f"Loading Accuracy Checker ({settings.CHECKER_MODEL_REPO})...")
-            models_registry["checker_tokenizer"] = AutoTokenizer.from_pretrained(
-                settings.CHECKER_MODEL_REPO
-            )
-            models_registry["checker_model"] = AutoModelForSequenceClassification.from_pretrained(
-                settings.CHECKER_MODEL_REPO
-            )
-            log.info("Accuracy Checker loaded successfully.")
-        except Exception as e:
-            log.error(f"Failed to load Accuracy Checker: {e}")
-            models_registry["checker_model"] = None
-            models_registry["checker_tokenizer"] = None
-
-
-def run_accuracy_check(original_text: str, summary: str) -> bool:
-    """
-    Checks if the summary is factually consistent with the original text.
-    Returns True if accurate, False if not.
-    """
-    tokenizer = models_registry.get("checker_tokenizer")
-    model = models_registry.get("checker_model")
-
-    if not tokenizer or not model:
-        log.warning("Accuracy checker not available. Assuming all summaries are accurate.")
-        return True
-
-    try:
-        input_text = f"[PREMISE] {original_text} [HYPOTHESIS] {summary}"
-        tokenized_input = tokenizer(
-            input_text, return_tensors="pt", max_length=512, truncation=True
-        )
-        logits = model(**tokenized_input).logits
-        prediction = logits.argmax().item()
-        # 2 = Entailment
-        return prediction == 2
-    except Exception as e:
-        log.error(f"Error in accuracy checker: {e}. Defaulting to 'True'.")
-        return True
-
-
-# ---------------------------------------------------------------------------
 # Startup loader
 # ---------------------------------------------------------------------------
 
 def load_all_models():
     """
-    Called once on API startup. Configures NIM client + local NLI checker.
-    Does not download DistilBART / MiniLM / Ollama / Groq.
+    Called once on API startup. Configures the NVIDIA NIM OpenAI-compatible client.
+    No local Hugging Face / NLI model downloads.
     """
-    log.info("--- Loading NVIDIA NIM stack + local accuracy checker... ---")
+    log.info("--- Loading NVIDIA NIM stack... ---")
     load_nim_client()
-    load_checker_model()
     if get_nim_client():
         log.info(
             "NIM models ready: "

@@ -41,10 +41,8 @@ RUN python -m venv /opt/venv
 # requirements first → better layer cache when only app code changes
 COPY requirements.txt .
 
-# CPU torch first (avoids multi-GB CUDA wheels), then the rest
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip \
- && pip install torch --index-url https://download.pytorch.org/whl/cpu \
  && pip install -r requirements.txt
 
 COPY alembic.ini ./

@@ -278,30 +278,22 @@ def delete_chunks(document_id: str):
 # -----------------------------------------------------------
 # Initialization (Called by Main.py)
 # -----------------------------------------------------------
-def init_database():
+def init_database(*, block_on_chroma: bool = True):
     """
-    Called by main.py on startup.
-    Initializes the shared SQLAlchemy engine and verifies ChromaDB.
-    Schema is managed by Alembic; AUTO_CREATE_SCHEMA is a local-dev escape hatch.
+    Called by API lifespan / worker startup.
+
+    Schema migrations are owned by the Docker entrypoint
+    (`alembic upgrade head` when RUN_MIGRATIONS_ON_STARTUP=true). This function
+    must NOT call Alembic again — a second in-process upgrade delayed uvicorn
+    bind on Render and contributed to "No open ports detected".
+
+    ``block_on_chroma``:
+      - True  — worker: wait_for_chroma() with backoff (no HTTP port to bind)
+      - False — API: one-shot probe only so lifespan can finish and bind PORT
     """
     try:
         init_engine()
         _sync_session_aliases()
-        if getattr(settings, "RUN_MIGRATIONS_ON_STARTUP", False):
-            try:
-                from alembic import command
-                from alembic.config import Config
-                import os
-
-                ini = os.path.abspath(
-                    os.path.join(os.path.dirname(__file__), "..", "..", "alembic.ini")
-                )
-                cfg = Config(ini)
-                command.upgrade(cfg, "head")
-                log.info("Alembic upgrade head completed (RUN_MIGRATIONS_ON_STARTUP).")
-            except Exception as e:
-                log.error(f"Startup Alembic migration failed: {e}")
-                raise
         if getattr(settings, "AUTO_CREATE_SCHEMA", False):
             if settings.is_production:
                 log.error("Refusing AUTO_CREATE_SCHEMA in production — use Alembic.")
@@ -318,22 +310,33 @@ def init_database():
         log.error(f"Failed to initialize relational DB: {e}")
         raise
 
-    try:
-        info = wait_for_chroma()
-        if not info.get("ok"):
-            log.error(f"ChromaDB not ready after startup wait: {info}")
-        else:
-            log.info(
-                "ChromaDB vector store ready mode=%s collection=%s",
-                info.get("mode"),
-                info.get("collection"),
-            )
-    except ChromaUnavailableError:
-        raise
-    except Exception as e:
-        log.error(f"ChromaDB init check failed: {e}")
-        if getattr(settings, "CHROMA_STARTUP_REQUIRED", True):
+    if block_on_chroma:
+        try:
+            info = wait_for_chroma()
+            if not info.get("ok"):
+                log.error(f"ChromaDB not ready after startup wait: {info}")
+            else:
+                log.info(
+                    "ChromaDB vector store ready mode=%s collection=%s",
+                    info.get("mode"),
+                    info.get("collection"),
+                )
+        except ChromaUnavailableError:
             raise
+        except Exception as e:
+            log.error(f"ChromaDB init check failed: {e}")
+            if getattr(settings, "CHROMA_STARTUP_REQUIRED", True):
+                raise
+        return
+
+    # API path: never touch Chroma during lifespan (HttpClient can hang on bad hosts).
+    # Worker still uses wait_for_chroma(). Readiness is GET /api/ready.
+    log.info(
+        "Skipping Chroma wait on API startup (CHROMA_MODE=%s host=%s) — "
+        "/api/health binds immediately; /api/ready probes Chroma",
+        getattr(settings, "CHROMA_MODE", ""),
+        (getattr(settings, "CHROMA_SERVER_HOST", "") or "").strip() or "(unset)",
+    )
 
 # -----------------------------------------------------------
 # FINAL SUMMARY STORAGE

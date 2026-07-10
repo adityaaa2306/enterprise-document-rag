@@ -87,7 +87,6 @@ This system processes documents (PDFs, text files) through an intelligent multi-
 ┌─────────────────────────────────────────────────────────────┐
 │                      AI Models (NVIDIA NIM)                  │
 │  Light / Medium / Heavy LLMs + Nemotron embed & rerank      │
-│  Local: RoBERTa NLI accuracy checker                        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -189,9 +188,6 @@ EMBEDDING_MODEL=nvidia/llama-nemotron-embed-1b-v2
 RERANK_MODEL=nvidia/llama-nemotron-rerank-1b-v2
 RAG_CANDIDATE_K=20
 RAG_TOP_K=5
-
-# Local NLI accuracy checker
-CHECKER_MODEL_REPO=Moritz/robert-base-c-fact-all
 
 # Database
 DATABASE_URL=sqlite:///./agentic_db.sqlite
@@ -415,9 +411,8 @@ Full API documentation available at: `http://localhost:8000/docs`
 ### Known Issues
 
 1. **Bcrypt Warning**: Harmless warning about bcrypt version detection on Windows
-2. **Accuracy Checker**: Model `Moritz/robert-base-c-fact-all` may fail to load (non-critical)
-3. **CORS**: May need adjustment for production domains
-4. **Session Persistence**: JWT tokens stored in localStorage (consider httpOnly cookies for production)
+2. **CORS**: May need adjustment for production domains
+3. **Session Persistence**: JWT tokens stored in localStorage (consider httpOnly cookies for production)
 
 ### Workarounds
 

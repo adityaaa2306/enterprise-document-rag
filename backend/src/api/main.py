@@ -47,8 +47,12 @@ async def lifespan(app: FastAPI):
     """
     This function runs on application startup.
     1. Validates runtime config (env, JWT, CORS).
-    2. Loads the NVIDIA NIM client and local accuracy checker into memory.
-    3. Initializes relational DB + ChromaDB.
+    2. Loads the NVIDIA NIM client.
+    3. Initializes relational DB; probes Chroma without long blocking waits.
+
+    Critical for Render: uvicorn does not bind PORT until this lifespan
+    completes. Long sync waits here cause "No open ports detected".
+    Chroma readiness is reported by GET /api/ready, not by blocking bind.
     """
     log.info("API Startup: validating configuration...")
     settings.validate_for_runtime()
@@ -64,11 +68,11 @@ async def lifespan(app: FastAPI):
 
     log.info("Startup checks complete.")
 
-    # 2. Load NVIDIA NIM client + local accuracy checker
+    # 2. Load NVIDIA NIM client (no local HF model downloads)
     models.load_all_models()
 
-    # 3. Relational DB + wait for Chroma (exponential backoff) before serving traffic
-    storage.init_database()
+    # 3. Relational DB only — do not block port bind on Chroma / second Alembic
+    storage.init_database(block_on_chroma=False)
 
     yield
 

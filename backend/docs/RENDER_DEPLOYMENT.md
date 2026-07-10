@@ -78,10 +78,11 @@ Without `dockerBuildTarget`, Render may build the last Dockerfile stage (`worker
 
 ## 4. Environment variable checklist
 
-### Vercel (frontend)
-| Variable | Example |
-|----------|---------|
-| `NEXT_PUBLIC_API_URL` | `https://green-agentic-api.onrender.com` |
+### CORS note (production)
+
+- `CORS_ORIGINS=*` is allowed and disables credentialed cookies (Bearer-token SPAs are fine).
+- Prefer your real Vercel origin when you have it: `https://your-app.vercel.app`.
+- `CORS_ALLOW_ALL` is ignored in production — use `CORS_ORIGINS` only.
 
 ### Render API (Web Service)
 | Variable | Required | Notes |

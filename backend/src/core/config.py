@@ -93,9 +93,6 @@ class Settings(BaseSettings):
     CONVERSATION_TTL_HOURS: float = 24.0
     CONVERSATION_MAX_TURNS: int = 40
 
-    # --- Local accuracy checker (NLI escalation gate) ---
-    CHECKER_MODEL_REPO: str = "Moritz/robert-base-c-fact-all"
-
     # --- Capability Requirement Engine (CRE) ---
     CRE_POLICY_VERSION: str = "cre-v1.0"
     CRE_WEIGHT_REASONING: float = 0.35
@@ -247,7 +244,11 @@ class Settings(BaseSettings):
         return _DEV_INSECURE_JWT
 
     def cors_allow_origins(self) -> List[str]:
-        """Origins list for CORSMiddleware."""
+        """Origins list for CORSMiddleware.
+
+        Production: set CORS_ORIGINS to real frontend origin(s), or ``*`` for
+        open CORS (disables credentials — fine for Bearer-token SPAs).
+        """
         if self.CORS_ALLOW_ALL and not self.is_production:
             return ["*"]
         origins = [
@@ -262,12 +263,17 @@ class Settings(BaseSettings):
                     "(CORS_ALLOW_ALL is ignored in production)."
                 )
             return ["http://localhost:3000", "http://127.0.0.1:3000"]
+        # Explicit wildcard is allowed in production (credentials auto-disabled).
+        if origins == ["*"] or (len(origins) == 1 and origins[0] == "*"):
+            return ["*"]
         return origins
 
     def cors_allow_credentials(self) -> bool:
         # Browsers reject Access-Control-Allow-Origin: * with credentials.
         origins = self.cors_allow_origins()
-        return origins != ["*"]
+        if origins == ["*"]:
+            return False
+        return True
 
     def light_models(self) -> List[str]:
         return [m for m in [self.LIGHT_MODEL_PRIMARY, self.LIGHT_MODEL_FALLBACK] if m]
