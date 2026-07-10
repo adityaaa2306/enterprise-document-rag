@@ -1,0 +1,1 @@
+from .carbon_calculator import analyze_pdf_carbon_impact

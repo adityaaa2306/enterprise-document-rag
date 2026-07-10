@@ -1,0 +1,9 @@
+WATTTIME_USERNAME = "your_username"
+WATTTIME_PASSWORD = "YourStrongP@ssw0rd!"  # must include letters, numbers, and special chars
+EMAIL = "you@example.com"
+ORG = "your_org"
+
+# Location to validate region lookup and data fetch (Eugene, Oregon)
+TEST_LAT = 44.0521
+TEST_LON = -123.0868
+

@@ -1,0 +1,188 @@
+# Render Blueprint — Green Agentic backend
+# Root Directory in Render: backend
+#
+# Architecture:
+#   Vercel (Next.js) → Web Service (API) → Background Worker
+#   Neon Postgres · Cloudflare R2 · Chroma private service · NVIDIA NIM
+#
+# Apply: Render Dashboard → New → Blueprint → select this repo / render.yaml
+# Or create services manually using RENDER_DEPLOYMENT.md
+#
+# CRITICAL: dockerBuildTarget must be set — Dockerfile last stage is `worker`.
+
+services:
+  # ---------------------------------------------------------------------------
+  # ChromaDB — private service with persistent disk (embeddings only)
+  # ---------------------------------------------------------------------------
+  - type: pserv
+    name: green-agentic-chroma
+    runtime: image
+    plan: starter
+    region: oregon
+    image:
+      url: docker.io/chromadb/chroma:0.5.23
+    disk:
+      name: chroma-data
+      mountPath: /chroma/chroma
+      sizeGB: 5
+    envVars:
+      - key: IS_PERSISTENT
+        value: "TRUE"
+      - key: ANONYMIZED_TELEMETRY
+        value: "FALSE"
+
+  # ---------------------------------------------------------------------------
+  # FastAPI — public Web Service
+  # Build target: api | Start: docker-entrypoint-api.sh
+  # Health: GET /api/health | Ready: GET /api/ready
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: green-agentic-api
+    runtime: docker
+    plan: starter
+    region: oregon
+    rootDir: .
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerBuildTarget: api
+    dockerCommand: /app/scripts/docker-entrypoint-api.sh
+    healthCheckPath: /api/health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: SERVICE_ROLE
+        value: api
+      - key: PORT
+        value: "8000"
+      - key: CHROMA_MODE
+        value: http
+      - key: CHROMA_SERVER_HOST
+        sync: false
+      - key: CHROMA_SERVER_PORT
+        value: "8000"
+      - key: CHROMA_SERVER_SSL
+        value: "false"
+      - key: CHROMA_COLLECTION_NAME
+        value: documents_nemotron_v2
+      - key: CHROMA_STARTUP_REQUIRED
+        value: "true"
+      - key: CHROMA_STARTUP_MAX_WAIT_SEC
+        value: "120"
+      - key: VECTOR_DB_PATH
+        value: /data/aux
+      - key: RUN_MIGRATIONS_ON_STARTUP
+        value: "true"
+      - key: AUTO_CREATE_SCHEMA
+        value: "false"
+      - key: PERSIST_JOBS_TO_DB
+        value: "true"
+      - key: PERSIST_CONVERSATIONS_TO_DB
+        value: "true"
+      - key: PERSIST_ROUTING_EVENTS_TO_DB
+        value: "true"
+      - key: OBJECT_STORAGE_BACKEND
+        value: r2
+      - key: CORS_ALLOW_ALL
+        value: "false"
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: NVIDIA_BASE_URL
+        value: https://integrate.api.nvidia.com/v1
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+    disk:
+      name: api-aux
+      mountPath: /data/aux
+      sizeGB: 1
+
+  # ---------------------------------------------------------------------------
+  # Durable job worker — Background Worker
+  # Build target: worker | Start: docker-entrypoint-worker.sh
+  # JWT_SECRET_KEY must match the API service (copy value in dashboard).
+  # CORS_ORIGINS optional for worker (validation skipped); set for env parity.
+  # ---------------------------------------------------------------------------
+  - type: worker
+    name: green-agentic-worker
+    runtime: docker
+    plan: starter
+    region: oregon
+    rootDir: .
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerBuildTarget: worker
+    dockerCommand: /app/scripts/docker-entrypoint-worker.sh
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: SERVICE_ROLE
+        value: worker
+      - key: CHROMA_MODE
+        value: http
+      - key: CHROMA_SERVER_HOST
+        sync: false
+      - key: CHROMA_SERVER_PORT
+        value: "8000"
+      - key: CHROMA_SERVER_SSL
+        value: "false"
+      - key: CHROMA_COLLECTION_NAME
+        value: documents_nemotron_v2
+      - key: CHROMA_STARTUP_REQUIRED
+        value: "true"
+      - key: CHROMA_STARTUP_MAX_WAIT_SEC
+        value: "120"
+      - key: VECTOR_DB_PATH
+        value: /data/aux
+      - key: RUN_MIGRATIONS_ON_STARTUP
+        value: "false"
+      - key: AUTO_CREATE_SCHEMA
+        value: "false"
+      - key: PERSIST_JOBS_TO_DB
+        value: "true"
+      - key: PERSIST_CONVERSATIONS_TO_DB
+        value: "true"
+      - key: PERSIST_ROUTING_EVENTS_TO_DB
+        value: "true"
+      - key: OBJECT_STORAGE_BACKEND
+        value: r2
+      - key: WORKER_ID
+        value: render-worker-1
+      - key: WORKER_SHUTDOWN_GRACE_SEC
+        value: "120"
+      - key: DATABASE_URL
+        sync: false
+      # Must be identical to API JWT_SECRET_KEY
+      - key: JWT_SECRET_KEY
+        sync: false
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: NVIDIA_BASE_URL
+        value: https://integrate.api.nvidia.com/v1
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      # Optional on worker (startup skips CORS validation); keep in sync with API if set
+      - key: CORS_ORIGINS
+        sync: false
+      - key: CORS_ALLOW_ALL
+        value: "false"
+    disk:
+      name: worker-aux
+      mountPath: /data/aux
+      sizeGB: 1

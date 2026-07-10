@@ -1,0 +1,36 @@
+{
+  "servers": [
+    {
+      "id": "us-east-1",
+      "name": "US East (Virginia)",
+      "region": "US-VA",
+      "provider": "AWS/OpenAI",
+      "base_power_watts": 150,
+      "cost_per_1k_tokens": 0.01,
+      "latitude": 37.4316,
+      "longitude": -78.6569
+    },
+    {
+      "id": "eu-west-1",
+      "name": "EU West (Ireland)",
+      "region": "IE",
+      "provider": "AWS/OpenAI",
+      "base_power_watts": 140,
+      "cost_per_1k_tokens": 0.012,
+      "latitude": 53.3501,
+      "longitude": -6.2661
+    },
+    {
+      "id": "us-west-2",
+      "name": "US West (Oregon)",
+      "region": "US-OR",
+      "provider": "AWS/OpenAI",
+      "base_power_watts": 145,
+      "cost_per_1k_tokens": 0.011,
+      "latitude": 44.0521,
+      "longitude": -123.0868
+    }
+  ]
+}
+
+

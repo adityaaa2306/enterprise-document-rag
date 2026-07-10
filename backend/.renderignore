@@ -1,0 +1,36 @@
+# Local development files
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Database (will use persistent disk)
+agentic_db.sqlite
+local_db/
+
+# Test files
+test*.py
+debug*.py
+check*.py
+clear*.py
+
+# Temporary files
+temp_uploads/
+*.pdf
+*.log
+
+# Documentation
+README.md
