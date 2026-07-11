@@ -303,7 +303,12 @@ Document excerpt:
             "classifier_method": "nim_light_llm",
         }
     except Exception as e:
-        log.warning(f"LLM document classifier failed: {e}")
+        # Timeouts / 5xx / connection errors are expected under NIM load —
+        # never abort the pipeline for optional classification metadata.
+        if models.is_transient_nim_error(e):
+            log.warning(f"LLM document classifier transient failure: {e}")
+        else:
+            log.warning(f"LLM document classifier failed: {e}")
         return None
 
 
@@ -437,40 +442,136 @@ def runtime_constraints() -> Dict[str, Any]:
 # Main entry
 # ---------------------------------------------------------------------------
 
+def default_features(
+    chunks: Optional[List[Any]] = None,
+    triage_meta: Optional[Dict[str, Any]] = None,
+    *,
+    reason: str = "fallback",
+) -> Dict[str, Any]:
+    """
+    Safe default metadata when LLM/embedding feature extraction fails.
+    Keeps CRE + routing functional without aborting the pipeline.
+    """
+    chunks = chunks or []
+    triage_meta = triage_meta or {}
+    try:
+        structural = structural_profile(chunks, triage_meta) if chunks else {
+            "structural_score": 0.5,
+            "table_density": 0.0,
+            "title_count": 0,
+            "avg_chunk_chars": 0,
+        }
+        reasoning = reasoning_profile(chunks) if chunks else {
+            "reasoning_score": 0.5,
+            "multi_document_signals": 0,
+        }
+        coherence = coherence_profile(chunks) if chunks else {"coherence_score": 0.5}
+        classification = classify_document_heuristic(
+            _sample_text(_chunk_texts(chunks)) if chunks else "",
+            structural,
+            reasoning,
+        )
+    except Exception:
+        structural = {"structural_score": 0.5, "table_density": 0.0, "title_count": 0, "avg_chunk_chars": 0}
+        reasoning = {"reasoning_score": 0.5, "multi_document_signals": 0}
+        coherence = {"coherence_score": 0.5}
+        classification = {
+            "document_type": "general_text",
+            "domain_label": "general",
+            "risk_level": "low",
+            "classifier_confidence": 0.3,
+            "classifier_method": "default_metadata",
+        }
+
+    classification = {
+        **classification,
+        "classifier_method": f"default_metadata:{reason}",
+    }
+    return {
+        **classification,
+        **structural,
+        **reasoning,
+        **coherence,
+        "retrieval_confidence": 0.6,
+        "retrieval_method": "default",
+        "carbon": carbon_context(),
+        "runtime": runtime_constraints(),
+        "chunk_count": len(chunks),
+    }
+
+
 def extract_features(
     chunks: List[Any],
     triage_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Full feature vector for CRE + Router.
+
+    Feature extraction is optional metadata: NVIDIA classifier / embedding probe
+    failures fall back to heuristics / defaults and never abort the job.
     """
     triage_meta = triage_meta or {}
-    texts = _chunk_texts(chunks)
-    sample = _sample_text(texts)
+    optional = bool(getattr(settings, "FEATURE_EXTRACTION_OPTIONAL", True))
 
-    structural = structural_profile(chunks, triage_meta)
-    reasoning = reasoning_profile(chunks)
-    coherence = coherence_profile(chunks)
-    retrieval = retrieval_confidence_probe(chunks)
+    try:
+        texts = _chunk_texts(chunks)
+        sample = _sample_text(texts)
 
-    classification = classify_document_llm(sample)
-    if not classification:
-        classification = classify_document_heuristic(sample, structural, reasoning)
+        structural = structural_profile(chunks, triage_meta)
+        reasoning = reasoning_profile(chunks)
+        coherence = coherence_profile(chunks)
 
-    features = {
-        **classification,
-        **structural,
-        **reasoning,
-        **coherence,
-        **retrieval,
-        "carbon": carbon_context(),
-        "runtime": runtime_constraints(),
-        "chunk_count": len(chunks),
-    }
-    log.info(
-        f"FEA: type={features['document_type']} domain={features['domain_label']}/"
-        f"{features['risk_level']} R={features['reasoning_score']} "
-        f"S={features['structural_score']} X={features['coherence_score']} "
-        f"ρ={features['retrieval_confidence']} via {features['classifier_method']}"
-    )
-    return features
+        try:
+            retrieval = retrieval_confidence_probe(chunks)
+        except Exception as e:
+            log.warning(
+                "feature extraction: retrieval probe failed (%s) → heuristic defaults",
+                e,
+            )
+            retrieval = {"retrieval_confidence": 0.6, "retrieval_method": "heuristic_after_error"}
+
+        classification = None
+        try:
+            classification = classify_document_llm(sample)
+            if classification:
+                log.info(
+                    "feature extraction: LLM classification ok method=%s type=%s",
+                    classification.get("classifier_method"),
+                    classification.get("document_type"),
+                )
+        except Exception as e:
+            log.warning(
+                "feature extraction: LLM classification failed (%s) → heuristic fallback",
+                e,
+            )
+            classification = None
+
+        if not classification:
+            log.info("feature extraction: using heuristic / default metadata")
+            classification = classify_document_heuristic(sample, structural, reasoning)
+
+        features = {
+            **classification,
+            **structural,
+            **reasoning,
+            **coherence,
+            **retrieval,
+            "carbon": carbon_context(),
+            "runtime": runtime_constraints(),
+            "chunk_count": len(chunks),
+        }
+        log.info(
+            f"FEA: type={features['document_type']} domain={features['domain_label']}/"
+            f"{features['risk_level']} R={features['reasoning_score']} "
+            f"S={features['structural_score']} X={features['coherence_score']} "
+            f"ρ={features['retrieval_confidence']} via {features['classifier_method']}"
+        )
+        return features
+    except Exception as e:
+        if not optional:
+            raise
+        log.exception(
+            "feature extraction: unexpected failure (%s) → default metadata; pipeline continues",
+            e,
+        )
+        return default_features(chunks, triage_meta, reason=type(e).__name__)

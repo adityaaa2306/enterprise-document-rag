@@ -2,8 +2,9 @@ import logging
 import time
 from typing import List, Dict, Any, Optional, Tuple
 
+import httpx
 import requests
-from openai import OpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
 from src.core.config import settings
 
@@ -13,12 +14,27 @@ log = logging.getLogger(__name__)
 models_registry: Dict[str, Any] = {}
 
 
+class NimApiError(RuntimeError):
+    """Raised when a NIM call fails due to timeout, 5xx, or connection errors."""
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None, cause: Optional[BaseException] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.__cause__ = cause
+
+
 # ---------------------------------------------------------------------------
 # NIM client bootstrap
 # ---------------------------------------------------------------------------
 
+def _nim_timeout() -> httpx.Timeout:
+    read = float(getattr(settings, "NIM_HTTP_TIMEOUT_SEC", 90.0) or 90.0)
+    connect = float(getattr(settings, "NIM_CONNECT_TIMEOUT_SEC", 10.0) or 10.0)
+    return httpx.Timeout(read, connect=connect)
+
+
 def load_nim_client() -> None:
-    """Configure the OpenAI-compatible NVIDIA NIM client."""
+    """Configure the OpenAI-compatible NVIDIA NIM client with hard timeouts."""
     global models_registry
     if not settings.NVIDIA_API_KEY:
         log.error(
@@ -30,10 +46,17 @@ def load_nim_client() -> None:
         return
 
     try:
-        log.info(f"Configuring NVIDIA NIM client ({settings.NVIDIA_BASE_URL})...")
+        timeout = _nim_timeout()
+        max_retries = int(getattr(settings, "NIM_SDK_MAX_RETRIES", 0) or 0)
+        log.info(
+            f"Configuring NVIDIA NIM client ({settings.NVIDIA_BASE_URL}) "
+            f"timeout={timeout.read}s connect={timeout.connect}s retries={max_retries}..."
+        )
         models_registry["nim_client"] = OpenAI(
             api_key=settings.NVIDIA_API_KEY,
             base_url=settings.NVIDIA_BASE_URL,
+            timeout=timeout,
+            max_retries=max_retries,
         )
         log.info("NVIDIA NIM client configured successfully.")
     except Exception as e:
@@ -43,6 +66,57 @@ def load_nim_client() -> None:
 
 def get_nim_client() -> Optional[OpenAI]:
     return models_registry.get("nim_client")
+
+
+def is_transient_nim_error(exc: BaseException) -> bool:
+    """True for timeouts, connection errors, and HTTP 5xx / gateway failures."""
+    if isinstance(exc, (APITimeoutError, APIConnectionError, TimeoutError, ConnectionError)):
+        return True
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    if isinstance(exc, APIStatusError):
+        code = getattr(exc, "status_code", None) or 0
+        return int(code) >= 500
+    if isinstance(exc, NimApiError):
+        return True
+    err = str(exc).lower()
+    markers = (
+        "timeout",
+        "timed out",
+        "504",
+        "502",
+        "503",
+        "500",
+        "gateway",
+        "connection",
+        "temporarily unavailable",
+        "service unavailable",
+    )
+    return any(m in err for m in markers)
+
+
+def _classify_nim_exception(exc: BaseException, *, model_id: str) -> Exception:
+    """Normalize SDK/network errors into NimApiError when transient."""
+    if isinstance(exc, NimApiError):
+        return exc
+    if isinstance(exc, APITimeoutError) or isinstance(exc, httpx.TimeoutException):
+        return NimApiError(
+            f"NIM timeout calling {model_id} after {getattr(settings, 'NIM_HTTP_TIMEOUT_SEC', 90)}s",
+            cause=exc,
+        )
+    if isinstance(exc, APIConnectionError):
+        return NimApiError(f"NIM connection error calling {model_id}: {exc}", cause=exc)
+    if isinstance(exc, APIStatusError):
+        code = int(getattr(exc, "status_code", 0) or 0)
+        if code >= 500:
+            return NimApiError(
+                f"NIM HTTP {code} calling {model_id}: {exc}",
+                status_code=code,
+                cause=exc,
+            )
+    if is_transient_nim_error(exc):
+        return NimApiError(f"NIM transient failure calling {model_id}: {exc}", cause=exc)
+    return exc if isinstance(exc, Exception) else RuntimeError(str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -60,12 +134,16 @@ def call_chat_with_fallback(
     """
     Try each model in order. On rate-limit / HTTP / empty errors, fall through
     to the next model. Returns (text, model_id_used) or raises if all fail.
+
+    Timeouts, connection errors, and HTTP 5xx are classified as NimApiError
+    so callers can soft-fail optional steps or hard-fail essential ones.
     """
     client = get_nim_client()
     if client is None:
         raise RuntimeError("NVIDIA NIM client is not configured (missing NVIDIA_API_KEY).")
 
     last_error: Optional[Exception] = None
+    timeout = _nim_timeout()
 
     for model_id in model_ids:
         for attempt in range(max_retries_per_model):
@@ -75,6 +153,7 @@ def call_chat_with_fallback(
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    timeout=timeout,
                 )
                 text = (completion.choices[0].message.content or "").strip()
                 if not text:
@@ -82,7 +161,8 @@ def call_chat_with_fallback(
                 log.info(f"Chat succeeded with model '{model_id}'")
                 return text, model_id
             except Exception as e:
-                last_error = e
+                classified = _classify_nim_exception(e, model_id=model_id)
+                last_error = classified if isinstance(classified, Exception) else e
                 err_str = str(e)
                 is_rate_limit = "429" in err_str or "rate" in err_str.lower()
                 if is_rate_limit and attempt < max_retries_per_model - 1:
@@ -93,12 +173,15 @@ def call_chat_with_fallback(
                     )
                     time.sleep(wait)
                     continue
-                log.warning(f"Model '{model_id}' failed: {e}. Trying next fallback if any.")
+                log.warning(
+                    f"Model '{model_id}' failed ({type(classified).__name__}): {classified}. "
+                    f"Trying next fallback if any."
+                )
                 break  # next model
 
     raise RuntimeError(
         f"All models failed ({model_ids}). Last error: {last_error}"
-    )
+    ) from last_error
 
 
 # ---------------------------------------------------------------------------
@@ -323,16 +406,20 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
 
 
 def _embed_batch_nim(client: OpenAI, model_id: str, texts: List[str]) -> List[List[float]]:
-    """Call NIM embeddings API in batches; preserve input order."""
+    """Call NIM embeddings API in batches; preserve input order. Raises NimApiError on transient failures."""
     if not texts:
         return []
     batch_size = 32
     all_embeddings: List[List[float]] = []
+    timeout = _nim_timeout()
     for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
-        response = client.embeddings.create(model=model_id, input=batch)
-        sorted_data = sorted(response.data, key=lambda d: d.index)
-        all_embeddings.extend([d.embedding for d in sorted_data])
+        try:
+            response = client.embeddings.create(model=model_id, input=batch, timeout=timeout)
+            sorted_data = sorted(response.data, key=lambda d: d.index)
+            all_embeddings.extend([d.embedding for d in sorted_data])
+        except Exception as e:
+            raise _classify_nim_exception(e, model_id=model_id) from e
     return all_embeddings
 
 
@@ -377,8 +464,9 @@ def rerank(query: str, passages: List[str], top_k: int) -> List[str]:
         "Content-Type": "application/json",
     }
 
+    rerank_timeout = min(60.0, float(getattr(settings, "NIM_HTTP_TIMEOUT_SEC", 90.0) or 90.0))
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=60)
+        resp = requests.post(url, json=payload, headers=headers, timeout=rerank_timeout)
         resp.raise_for_status()
         data = resp.json()
         rankings = data.get("rankings") or data.get("results") or []

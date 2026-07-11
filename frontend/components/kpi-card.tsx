@@ -11,7 +11,7 @@ interface KPICardProps {
   icon: LucideIcon
   trend?: {
     value: number
-    direction: "up" | "down"
+    direction: "up" | "down" | "neutral"
   }
   delay?: number
 }
@@ -39,8 +39,17 @@ export function KPICard({ title, value, unit, icon: Icon, trend, delay = 0 }: KP
         </div>
 
         {trend && (
-          <div className={`text-xs font-medium ${trend.direction === "up" ? "text-green-400" : "text-red-400"}`}>
-            {trend.direction === "up" ? "↑" : "↓"} {trend.value}% from last week
+          <div
+            className={`text-xs font-medium ${
+              trend.direction === "up"
+                ? "text-green-400"
+                : trend.direction === "down"
+                  ? "text-red-400"
+                  : "text-muted-foreground"
+            }`}
+          >
+            {trend.direction === "up" ? "↑" : trend.direction === "down" ? "↓" : "→"}{" "}
+            {trend.value}% from last week
           </div>
         )}
       </Card>

@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     NVIDIA_API_KEY: str = ""
     NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
     ELECTRICITY_MAPS_API_KEY: Optional[str] = None
+    # Per-request HTTP timeout for chat/embeddings (prevents infinite "processing")
+    NIM_HTTP_TIMEOUT_SEC: float = 90.0
+    # Connect timeout for NIM (separate from read/write)
+    NIM_CONNECT_TIMEOUT_SEC: float = 10.0
+    # OpenAI SDK transport retries (we also fall back across models ourselves)
+    NIM_SDK_MAX_RETRIES: int = 0
 
     # --- Light tier (chunk summarization) ---
     LIGHT_MODEL_PRIMARY: str = "meta/llama-3.2-3b-instruct"
@@ -143,6 +149,10 @@ class Settings(BaseSettings):
     WORKER_RECLAIM_INTERVAL_SEC: float = 30.0
     # After SIGTERM: finish current job up to this many seconds, then exit
     WORKER_SHUTDOWN_GRACE_SEC: float = 120.0
+    # Hard wall-clock limit for a single claim attempt (stops orphaned "processing")
+    JOB_MAX_RUNTIME_SEC: float = 600.0
+    # Feature extraction LLM/embed probe is optional metadata — never abort the job
+    FEATURE_EXTRACTION_OPTIONAL: bool = True
 
     # --- Chroma vector store (embedded PersistentClient — NOT remote HttpClient) ---
     # Portfolio / single-service: embeddings on local disk under this path.

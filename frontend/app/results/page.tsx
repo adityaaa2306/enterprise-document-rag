@@ -16,6 +16,43 @@ import {
   type ProcessingInsightsData,
 } from "@/components/processing-insights"
 
+/** Poll every 3s (within the 2–5s target range). */
+const POLL_INTERVAL_MS = 3000
+/** Stop polling after this wall-clock budget so the UI never spins forever. */
+const POLL_TIMEOUT_MS = Number(
+  process.env.NEXT_PUBLIC_JOB_POLL_TIMEOUT_MS || 15 * 60 * 1000,
+)
+
+const TERMINAL_STATUSES = new Set([
+  "complete",
+  "completed",
+  "done",
+  "success",
+  "error",
+  "failed",
+  "failure",
+  "cancelled",
+  "canceled",
+])
+
+function normalizeStatus(raw: string | undefined | null): string {
+  return (raw || "").trim().toLowerCase()
+}
+
+function isTerminalStatus(raw: string | undefined | null): boolean {
+  return TERMINAL_STATUSES.has(normalizeStatus(raw))
+}
+
+function isSuccessStatus(raw: string | undefined | null): boolean {
+  const s = normalizeStatus(raw)
+  return s === "complete" || s === "completed" || s === "done" || s === "success"
+}
+
+function isErrorStatus(raw: string | undefined | null): boolean {
+  const s = normalizeStatus(raw)
+  return s === "error" || s === "failed" || s === "failure"
+}
+
 interface JobStatus {
   status: string
   progress: number
@@ -68,6 +105,9 @@ function ResultsContent() {
   const jobId = searchParams.get("job_id")
 
   const [isComplete, setIsComplete] = useState(false)
+  const [jobFailed, setJobFailed] = useState(false)
+  const [pollTimedOut, setPollTimedOut] = useState(false)
+  const [failureMessage, setFailureMessage] = useState<string | null>(null)
   const [logs, setLogs] = useState<any[]>([])
   const [result, setResult] = useState<JobResult | null>(null)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
@@ -77,43 +117,96 @@ function ResultsContent() {
   useEffect(() => {
     if (!jobId) return
 
-    let pollInterval: NodeJS.Timeout
+    let cancelled = false
+    let pollInterval: ReturnType<typeof setInterval> | undefined
+    const startedAt = Date.now()
+
+    const stopPolling = () => {
+      if (pollInterval !== undefined) {
+        clearInterval(pollInterval)
+        pollInterval = undefined
+      }
+    }
+
+    const appendLog = (message: string, type: "info" | "error" = "info") => {
+      if (cancelled) return
+      setLogs((prev) => {
+        const newLog = {
+          id: `${Date.now()}-${prev.length}`,
+          timestamp: new Date().toLocaleTimeString(),
+          message,
+          type,
+        }
+        if (prev.length > 0 && prev[prev.length - 1].message === message) return prev
+        return [...prev, newLog]
+      })
+    }
 
     const pollStatus = async () => {
+      if (cancelled) return
+
+      if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
+        stopPolling()
+        if (!cancelled) {
+          setPollTimedOut(true)
+          setFailureMessage(
+            `Polling timed out after ${Math.round(POLL_TIMEOUT_MS / 60000)} minutes. The job may still be running on the server — refresh later or check worker logs.`,
+          )
+          appendLog("Polling timed out — stopped requesting /job-status.", "error")
+        }
+        return
+      }
+
       try {
         const response = await apiFetch(`/job-status/${jobId}`)
+        if (cancelled) return
+
+        if (response.status === 404) {
+          stopPolling()
+          setJobFailed(true)
+          setFailureMessage("Job not found.")
+          appendLog("Job not found (404).", "error")
+          return
+        }
+
+        if (response.status === 401 || response.status === 403) {
+          stopPolling()
+          setJobFailed(true)
+          setFailureMessage("Authentication expired. Please sign in again.")
+          appendLog("Auth error while polling job status.", "error")
+          return
+        }
+
         if (response.ok) {
           const data: JobStatus = await response.json()
+          appendLog(
+            data.message || `Status: ${data.status}`,
+            isErrorStatus(data.status) ? "error" : "info",
+          )
 
-          setLogs((prev) => {
-            const newLog = {
-              id: Date.now().toString(),
-              timestamp: new Date().toLocaleTimeString(),
-              message: data.message,
-              type: data.status === "error" ? "error" : "info",
-            }
-            if (prev.length > 0 && prev[prev.length - 1].message === data.message) return prev
-            return [...prev, newLog]
-          })
-
-          if (data.status === "complete") {
+          if (isSuccessStatus(data.status)) {
             setIsComplete(true)
-            clearInterval(pollInterval)
+            stopPolling()
             fetchResult()
-          } else if (data.status === "error") {
-            clearInterval(pollInterval)
-            alert(`Job failed: ${data.message}`)
+          } else if (isErrorStatus(data.status) || isTerminalStatus(data.status)) {
+            setJobFailed(true)
+            setFailureMessage(data.message || "Job failed.")
+            stopPolling()
           }
         }
       } catch (error) {
         console.error("Polling error:", error)
+        // Keep polling on transient network errors until POLL_TIMEOUT_MS
       }
     }
 
-    pollInterval = setInterval(pollStatus, 2000)
+    pollInterval = setInterval(pollStatus, POLL_INTERVAL_MS)
     pollStatus()
 
-    return () => clearInterval(pollInterval)
+    return () => {
+      cancelled = true
+      stopPolling()
+    }
   }, [jobId])
 
   const fetchResult = async () => {
@@ -213,6 +306,9 @@ function ResultsContent() {
     result?.processing_insights?.routing_preference,
   )
 
+  const showLiveFeed = !isComplete && !jobFailed && !pollTimedOut
+  const showFailure = jobFailed || pollTimedOut
+
   return (
     <div className="flex">
       <Sidebar />
@@ -280,6 +376,11 @@ function ResultsContent() {
                         <p className="text-sm">{result.carbon_data.compute_location || "Unknown"}</p>
                       </div>
                     </div>
+                  ) : showFailure ? (
+                    <div className="text-sm text-red-400 space-y-2">
+                      <p className="font-medium">{pollTimedOut ? "Polling timed out" : "Job failed"}</p>
+                      <p className="text-muted-foreground">{failureMessage}</p>
+                    </div>
                   ) : (
                     <div className="text-muted-foreground text-sm">Waiting for results...</div>
                   )}
@@ -296,8 +397,18 @@ function ResultsContent() {
                 transition={{ delay: 0.2 }}
                 className="lg:col-span-2"
               >
-                {!isComplete ? (
+                {showLiveFeed ? (
                   <LiveFeed logs={logs} />
+                ) : showFailure ? (
+                  <Card className="p-6 bg-card/50 border-border/50">
+                    <h3 className="text-lg font-semibold mb-2 text-red-400">
+                      {pollTimedOut ? "Polling stopped" : "Processing failed"}
+                    </h3>
+                    <p className="text-sm text-muted-foreground mb-4">
+                      {failureMessage || "The job did not complete successfully."}
+                    </p>
+                    <LiveFeed logs={logs} />
+                  </Card>
                 ) : (
                   <Tabs defaultValue="summary" className="w-full">
                     <TabsList className="grid w-full grid-cols-2">

@@ -131,7 +131,15 @@ def validate_pair(source: str, summary: str) -> ValidationVerdict:
         hallucination_rate=round(hallu, 4),
         contradiction_rate=round(contra, 4),
         codes=codes,
-        details={"nli_ok": nli_ok},
+        # Lexical QVA only — no HF/RoBERTa NLI in this build.
+        details={
+            "method": "lexical",
+            "nli_ok": None,
+            "faithfulness_min": faith_min,
+            "hallucination_max": hallu_max,
+            "contradiction_max": contra_max,
+            "confidence_threshold": tau,
+        },
     )
 
 

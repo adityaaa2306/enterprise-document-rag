@@ -35,14 +35,27 @@ export default function NewJobPage() {
       )
 
       if (!response.ok) {
-        throw new Error("Upload failed")
+        let detail = "Upload failed"
+        try {
+          const errBody = await response.json()
+          if (typeof errBody?.detail === "string") detail = errBody.detail
+        } catch {
+          /* ignore */
+        }
+        throw new Error(`${detail} (HTTP ${response.status})`)
       }
 
       const data = await response.json()
       router.push(`/results?job_id=${data.job_id}`)
     } catch (error) {
       console.error("Error uploading file:", error)
-      alert("Failed to start job. Please try again.")
+      const msg =
+        error instanceof TypeError
+          ? `Cannot reach API at ${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}. Start the backend (uvicorn) and worker (python -m src.worker), then retry.`
+          : error instanceof Error
+            ? error.message
+            : "Failed to start job. Please try again."
+      alert(msg)
       setIsSubmitting(false)
     }
   }

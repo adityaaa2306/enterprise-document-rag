@@ -7,7 +7,7 @@ import { FileText, Download, Clock } from "lucide-react"
 import { apiFetch } from "@/lib/api"
 
 interface Document {
-    document_id: str
+    document_id: string
     summary: string
     saved_at: string
 }

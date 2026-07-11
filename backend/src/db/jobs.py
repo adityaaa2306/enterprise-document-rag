@@ -70,10 +70,22 @@ def upsert_job(job_id: str, **fields: Any) -> Dict[str, Any]:
     Returns the full status dict (same shape as legacy JOB_STATUSES[job_id]).
     """
     current = dict(JOB_STATUSES.get(job_id) or {})
+    prev_status = current.get("status")
     for k, v in fields.items():
         current[k] = v
     current["job_id"] = job_id
     JOB_STATUSES[job_id] = current
+
+    new_status = current.get("status")
+    if "status" in fields and new_status is not None and str(new_status) != str(prev_status or ""):
+        msg = current.get("message") or ""
+        log.info(
+            "Job %s: status %s → %s%s",
+            job_id,
+            prev_status or "(none)",
+            new_status,
+            f" | {msg}" if msg else "",
+        )
 
     if _db_enabled():
         try:
@@ -122,31 +134,32 @@ def set_understanding(job_id: str, value: str) -> None:
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Read job status: memory first, then DB when durable mode is on."""
-    cached = JOB_STATUSES.get(job_id)
-    if cached is not None:
-        return cached
+    """
+    Read job status.
 
-    if not _db_enabled():
-        return None
-
-    try:
-        from src.db.models import JobModel
-        from src.db.session import get_session
-
-        db = get_session()
+    When durable DB mode is on, always refresh from Postgres/SQLite so the API
+    process sees worker claim/progress updates (in-memory cache is per-process).
+    """
+    if _db_enabled():
         try:
-            row = db.get(JobModel, job_id)
-            if not row:
-                return None
-            status = _row_to_status(row)
-            JOB_STATUSES[job_id] = status
-            return status
-        finally:
-            db.close()
-    except Exception as e:
-        log.error(f"Failed to load job {job_id} from DB: {e}")
-        return None
+            from src.db.models import JobModel
+            from src.db.session import get_session
+
+            db = get_session()
+            try:
+                row = db.get(JobModel, job_id)
+                if not row:
+                    return JOB_STATUSES.get(job_id)
+                status = _row_to_status(row)
+                JOB_STATUSES[job_id] = status
+                return status
+            finally:
+                db.close()
+        except Exception as e:
+            log.error(f"Failed to load job {job_id} from DB: {e}")
+            return JOB_STATUSES.get(job_id)
+
+    return JOB_STATUSES.get(job_id)
 
 
 def touch_job_heartbeat(job_id: str, worker_id: str) -> None:
@@ -356,7 +369,15 @@ def fail_or_retry_job(
     backoff = int(getattr(settings, "WORKER_RETRY_BACKOFF_SEC", 30) or 30)
     now = _now()
 
+    # Never leave a job stuck in processing after a failure path.
     if attempts < max_att:
+        log.warning(
+            "Job %s: processing → pending (retry %s/%s) | %s",
+            job_id,
+            attempts,
+            max_att,
+            error,
+        )
         return upsert_job(
             job_id,
             status=job_status_mod.STATUS_PENDING,
@@ -370,6 +391,7 @@ def fail_or_retry_job(
             understanding="skipped",
         )
 
+    log.error("Job %s: processing → error (terminal) | %s", job_id, error)
     return upsert_job(
         job_id,
         status=job_status_mod.STATUS_ERROR,

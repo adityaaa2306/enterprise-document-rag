@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from typing import Any, Dict, Optional
 
 from src.core import job_status as job_status_mod
@@ -26,16 +27,18 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
 
     Expects job dict with job_id; loads document storage metadata from DB.
     Does not modify CRE / router / agents — only invokes agentic_graph.
+
+    Guarantees a terminal transition out of ``processing``:
+      processing → complete  (success)
+      processing → pending   (retryable failure)
+      processing → error     (exhausted retries / hard failure)
     """
     job_id = str(job["job_id"])
     document_id = job_id
     mode = normalize_routing_preference(job.get("job_mode") or "automatic")
     user_id = job.get("user_id")
     display_name = job.get("filename") or "upload.bin"
-
-    storage_key = storage.get_document_storage_key(document_id)
-    if not storage_key:
-        raise RuntimeError(f"No storage_key for document {document_id}")
+    max_runtime = float(getattr(settings, "JOB_MAX_RUNTIME_SEC", 600.0) or 600.0)
 
     # Prefer content_type from document row when available
     content_type = "application/octet-stream"
@@ -58,8 +61,15 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
 
     os.makedirs(SCRATCH_DIR, exist_ok=True)
     scratch_path = os.path.join(SCRATCH_DIR, f"{job_id}_{display_name}")
+    abandoned = threading.Event()
+    reached_terminal = False
 
     try:
+        storage_key = storage.get_document_storage_key(document_id)
+        if not storage_key:
+            raise RuntimeError(f"No storage_key for document {document_id}")
+
+        log.info("Job %s: claimed → processing", job_id)
         job_store.upsert_job(
             job_id,
             status=job_status_mod.STATUS_PROCESSING,
@@ -71,6 +81,7 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
             user_id=user_id,
             claimed_by=worker_id,
             heartbeat_at=job_store._now(),
+            error_detail=None,
         )
         if user_id is not None:
             storage.ensure_document_owner(document_id, int(user_id))
@@ -93,10 +104,93 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
             "model_usage_chars": {"light": 0, "medium": 0, "large": 0},
         }
 
-        log.info(f"Job {job_id}: Invoking Agentic Graph (worker={worker_id})...")
+        log.info(
+            "Job %s: Invoking Agentic Graph (worker=%s, max_runtime=%.0fs)...",
+            job_id,
+            worker_id,
+            max_runtime,
+        )
         job_store.set_progress(job_id, 10.0, "Running agentic pipeline...")
-        final_state = agentic_graph.invoke(initial_state)
-        log.info(f"Job {job_id} completed successfully.")
+
+        # Keep job + worker heartbeats fresh during long NIM / graph calls,
+        # but stop heartbeating (and fail) if wall-clock budget is exceeded.
+        stop_hb = threading.Event()
+        started = time.monotonic()
+        runtime_exceeded = threading.Event()
+
+        def _heartbeat_loop() -> None:
+            interval = max(5.0, float(settings.WORKER_HEARTBEAT_INTERVAL_SEC))
+            while not stop_hb.wait(interval):
+                if time.monotonic() - started >= max_runtime:
+                    runtime_exceeded.set()
+                    log.error(
+                        "Job %s: wall-clock budget exceeded (%.0fs) — stopping heartbeats",
+                        job_id,
+                        max_runtime,
+                    )
+                    return
+                try:
+                    job_store.touch_job_heartbeat(job_id, worker_id)
+                except Exception as he:
+                    log.warning(f"Job {job_id}: heartbeat failed: {he}")
+
+        hb_thread = threading.Thread(
+            target=_heartbeat_loop,
+            name=f"hb-{job_id[:8]}",
+            daemon=True,
+        )
+        hb_thread.start()
+
+        result_box: Dict[str, Any] = {}
+        error_box: Dict[str, Exception] = {}
+
+        def _invoke_graph() -> None:
+            try:
+                result_box["state"] = agentic_graph.invoke(initial_state)
+            except Exception as ge:
+                error_box["err"] = ge
+
+        graph_thread = threading.Thread(
+            target=_invoke_graph,
+            name=f"graph-{job_id[:8]}",
+            daemon=True,
+        )
+        try:
+            graph_thread.start()
+            # Poll join so we can react to wall-clock / abandon quickly
+            deadline = started + max_runtime
+            while graph_thread.is_alive():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or runtime_exceeded.is_set():
+                    abandoned.set()
+                    raise TimeoutError(
+                        f"Job exceeded max runtime of {max_runtime:.0f}s "
+                        f"(likely hung external API call). Marking failed."
+                    )
+                graph_thread.join(timeout=min(5.0, max(0.1, remaining)))
+
+            if "err" in error_box:
+                raise error_box["err"]
+            if "state" not in result_box:
+                raise RuntimeError("Agentic graph finished without a result state")
+            final_state = result_box["state"]
+        finally:
+            stop_hb.set()
+            hb_thread.join(timeout=2.0)
+
+        if abandoned.is_set():
+            # Late completion after we already decided to fail — do not overwrite.
+            log.warning("Job %s: ignoring late graph result after abandon", job_id)
+            if not reached_terminal:
+                job_store.fail_or_retry_job(
+                    job_id,
+                    error="Job abandoned after runtime limit; late result ignored.",
+                    worker_id=worker_id,
+                )
+                reached_terminal = True
+            return
+
+        log.info("Job %s: pipeline finished → attaching result / complete", job_id)
 
         raw_carbon = dict(final_state.get("carbon_report") or {})
         carbon_fields = {
@@ -142,7 +236,10 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
             user_id=user_id,
             claimed_by=None,
             heartbeat_at=None,
+            error_detail=None,
         )
+        reached_terminal = True
+        log.info("Job %s: processing → complete", job_id)
 
         if settings.ENABLE_UNDERSTANDING:
             def _bg():
@@ -157,10 +254,52 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
             threading.Thread(target=_bg, daemon=True, name=f"understand-{job_id[:8]}").start()
 
     except Exception as e:
-        log.error(f"Job {job_id} FAILED: {e}")
-        job_store.fail_or_retry_job(job_id, error=str(e), worker_id=worker_id)
+        abandoned.set()
+        log.error("Job %s FAILED: %s", job_id, e)
+        try:
+            job_store.fail_or_retry_job(job_id, error=str(e), worker_id=worker_id)
+            reached_terminal = True
+        except Exception as fe:
+            log.exception("Job %s: fail_or_retry_job itself failed: %s", job_id, fe)
+            # Last-resort terminal write so polling can stop.
+            try:
+                job_store.upsert_job(
+                    job_id,
+                    status=job_status_mod.STATUS_ERROR,
+                    progress=100.0,
+                    message=str(e),
+                    error_detail=str(e),
+                    claimed_at=None,
+                    claimed_by=None,
+                    heartbeat_at=None,
+                )
+                reached_terminal = True
+            except Exception:
+                log.exception("Job %s: could not write terminal error status", job_id)
         raise
     finally:
+        if not reached_terminal:
+            # Safety net: never leave the job permanently in processing.
+            try:
+                current = job_store.get_job(job_id) or {}
+                if not job_status_mod.is_terminal(current.get("status")):
+                    log.error(
+                        "Job %s: safety net — still non-terminal (%s); marking error",
+                        job_id,
+                        current.get("status"),
+                    )
+                    job_store.upsert_job(
+                        job_id,
+                        status=job_status_mod.STATUS_ERROR,
+                        progress=100.0,
+                        message="Job ended without a terminal status (internal safety net).",
+                        error_detail="non_terminal_exit",
+                        claimed_at=None,
+                        claimed_by=None,
+                        heartbeat_at=None,
+                    )
+            except Exception as se:
+                log.exception("Job %s: safety-net status write failed: %s", job_id, se)
         try:
             if os.path.isfile(scratch_path):
                 os.remove(scratch_path)

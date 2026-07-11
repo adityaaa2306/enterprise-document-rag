@@ -1,6 +1,8 @@
 # Quick Start Guide
 
-## 🚀 Get Started in 5 Minutes
+## Get Started Locally
+
+You need **three** processes: API, worker, and frontend. The API only queues jobs; the worker runs the LangGraph pipeline.
 
 ### 1. Install Dependencies
 
@@ -9,6 +11,7 @@
 cd backend
 python -m venv .venv
 .venv\Scripts\activate  # Windows
+# source .venv/bin/activate  # macOS/Linux
 pip install -r requirements.txt
 ```
 
@@ -18,9 +21,9 @@ cd frontend
 npm install
 ```
 
-### 2. Set Up Environment
+### 2. Environment
 
-Copy `.env.example` to `.env` in the `backend/` directory and add your NVIDIA API key:
+**Backend** — copy `.env.example` to `.env` if you do not already have one:
 
 ```bash
 cd backend
@@ -28,78 +31,80 @@ copy .env.example .env  # Windows
 # cp .env.example .env  # macOS/Linux
 ```
 
-Edit `.env` and set:
+Set at least:
 ```
 NVIDIA_API_KEY=your_actual_nvidia_api_key
+APP_ENV=development
+OBJECT_STORAGE_BACKEND=local
+CORS_ALLOW_ALL=true
 ```
-(Get one free at https://build.nvidia.com/settings/api-keys)
 
-### 3. Start the Servers
+(Get an NVIDIA key at https://build.nvidia.com/settings/api-keys)
 
-**Terminal 1 - Backend:**
+**Frontend** — create `frontend/.env.local`:
+```
+NEXT_PUBLIC_API_URL=http://localhost:8000
+```
+
+### 3. Start All Three Servers
+
+**Terminal 1 — API (port 8000):**
 ```bash
 cd backend
 .venv\Scripts\activate
-uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-**Terminal 2 - Frontend:**
+**Terminal 2 — Worker (required for document processing):**
+```bash
+cd backend
+.venv\Scripts\activate
+python -m src.worker
+```
+
+**Terminal 3 — Frontend (port 3000):**
 ```bash
 cd frontend
 npm run dev
 ```
 
-### 4. Access the Application
+### 4. Open the App
 
-Open your browser to:
-- **Frontend**: http://localhost:3000
-- **API Docs**: http://localhost:8000/docs
+- Frontend: http://localhost:3000
+- API docs: http://localhost:8000/docs
+- Health: http://localhost:8000/api/health
+- Worker health: http://localhost:8000/api/worker/health
 
-### 5. Create an Account
+### 5. First Document
 
-1. Go to http://localhost:3000/signup
-2. Fill in your details (password must be 8+ chars with uppercase, lowercase, and number)
-3. Click "Create Account"
-4. Login at http://localhost:3000/login
-
-### 6. Process Your First Document
-
-1. Go to "New Job" from the dashboard
-2. Upload a PDF or text file
-3. Select processing mode (Balanced, Eco, or Performance)
-4. Watch the real-time progress
-5. View results and carbon savings!
+1. Sign up at http://localhost:3000/signup
+2. Log in
+3. New Job → upload a PDF → Process
+4. Results page polls until the worker finishes
 
 ---
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
-**Backend won't start?**
-- Make sure virtual environment is activated
-- Check that all dependencies are installed: `pip install -r requirements.txt`
-- Verify Python version is 3.10+
+**`net::ERR_CONNECTION_REFUSED` on `/summarize`**
+- The browser cannot reach the API. Start Terminal 1 (uvicorn on port 8000).
+- Confirm `NEXT_PUBLIC_API_URL` in `frontend/.env.local` is `http://localhost:8000`.
+- Restart `npm run dev` after changing `.env.local`.
 
-**Frontend errors?**
-- Clear node_modules and reinstall: `rm -rf node_modules && npm install`
-- Check Node.js version is 18+
+**Upload succeeds but job stays pending**
+- The worker is not running. Start Terminal 2: `python -m src.worker`.
 
-**Authentication not working?**
-- Restart the backend server after installing auth dependencies
-- Check that `python-jose[cryptography]` and `passlib[bcrypt]` are installed
+**CORS errors in the browser console**
+- Locally set `CORS_ALLOW_ALL=true` or include `http://localhost:3000` in `CORS_ORIGINS`.
 
-**Models not loading?**
-- Verify `NVIDIA_API_KEY` is set correctly in `backend/.env`
-- Confirm the key works at https://build.nvidia.com
+**Models / summarization fail**
+- Verify `NVIDIA_API_KEY` in `backend/.env`.
 
----
-
-## 📖 Next Steps
-
-- Read the full [README.md](README.md) for detailed documentation
-- Check the [API Documentation](http://localhost:8000/docs)
-- Explore the dashboard to see carbon savings metrics
-- Try RAG queries on processed documents
+**Using the Vercel frontend**
+- It must point at a live API (`NEXT_PUBLIC_API_URL`). A sleeping or stopped Render service causes connection failures. Prefer local API+worker for development.
 
 ---
 
-**Need Help?** Check the [Known Issues](README.md#known-issues-and-limitations) section in the main README.
+## Production note
+
+Cloud deploy uses a separate worker service (`python -m src.worker`) alongside the API. See `backend/docs/RENDER_DEPLOYMENT.md` and `backend/docs/PHASE3_DURABLE_WORKER.md`.

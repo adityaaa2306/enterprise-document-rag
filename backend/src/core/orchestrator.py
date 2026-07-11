@@ -146,7 +146,28 @@ def extract_features_node(state: AgentState) -> Dict[str, Any]:
     _set_progress(job_id, 20.0, "Extracting capability features...")
 
     triage_meta = state.get("triage_meta") or {"strategy": settings.TRIAGE_STRATEGY}
-    features = feature_extraction.extract_features(state["chunks"], triage_meta)
+    try:
+        features = feature_extraction.extract_features(state["chunks"], triage_meta)
+        log.info(
+            "Job %s: feature extraction complete via %s",
+            job_id,
+            (features or {}).get("classifier_method"),
+        )
+    except Exception as e:
+        # Optional metadata — never leave the job stuck; continue with defaults.
+        log.warning(
+            "Job %s: feature extraction failed (%s) → using default metadata",
+            job_id,
+            e,
+        )
+        _set_progress(
+            job_id,
+            22.0,
+            f"Feature extraction failed ({type(e).__name__}); using default metadata...",
+        )
+        features = feature_extraction.default_features(
+            state["chunks"], triage_meta, reason=type(e).__name__
+        )
     return {"features": features}
 
 
@@ -319,12 +340,19 @@ def store_for_rag(state: AgentState) -> AgentState:
     log.info(f"Job {job_id}: [8] Storing for RAG...")
     _set_progress(job_id, 90.0, "Indexing for search...")
 
-    storage.store_document_data(
-        job_id=job_id,
-        summary=state["final_summary"],
-        chunks=state["chunks"],
-        routing_decision=state.get("routing_decision"),
-    )
+    try:
+        storage.store_document_data(
+            job_id=job_id,
+            summary=state["final_summary"],
+            chunks=state["chunks"],
+            routing_decision=state.get("routing_decision"),
+        )
+        log.info("Job %s: stored in Chroma / document store", job_id)
+    except Exception as e:
+        # Indexing failure should not orphan the job in processing — surface as
+        # a hard failure so the runner marks error/retry.
+        log.error("Job %s: store_for_rag failed: %s", job_id, e)
+        raise
     return state
 
 
