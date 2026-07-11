@@ -74,6 +74,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tini \
         libmagic1 \
         poppler-utils \
+        libgl1 \
+        libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser \
     && mkdir -p /data/aux /data/chroma /data/object_store /app/temp_uploads \

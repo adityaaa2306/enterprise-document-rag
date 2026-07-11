@@ -42,6 +42,17 @@ def _document_id_from_path(file_path: str) -> str:
     return os.path.splitext(base)[0] or "doc"
 
 
+def _original_name(file_path: str) -> str:
+    base = os.path.basename(file_path)
+    if "_" in base:
+        return base.split("_", 1)[1]
+    return base
+
+
+def _ext(file_path: str) -> str:
+    return os.path.splitext(_original_name(file_path))[1].lower()
+
+
 def _element_content(el: Element) -> tuple[Literal["Title", "Text", "Table", "List", "Other"], str]:
     """
     Map any unstructured element to (type, content).
@@ -78,9 +89,28 @@ def _element_content(el: Element) -> tuple[Literal["Title", "Text", "Table", "Li
     return "Other", raw_text
 
 
+def _texts_to_chunks(texts: List[str], document_id: str, *, source: str) -> List[Chunk]:
+    chunks: List[Chunk] = []
+    for i, part in enumerate(texts[:200]):
+        content = (part or "").strip()
+        if not content:
+            continue
+        chunks.append(
+            Chunk(
+                id=f"{document_id}_chunk_{len(chunks)}",
+                document_id=document_id,
+                chunk_index=len(chunks),
+                type="Text",
+                content=content[:20000],
+            )
+        )
+    if chunks:
+        log.warning("Triage: %s produced %s chunk(s)", source, len(chunks))
+    return chunks
+
+
 def _elements_to_chunks(elements: List[Element], document_id: str) -> List[Chunk]:
     chunks: List[Chunk] = []
-    chunk_index = 0
     skipped_empty = 0
 
     for el in elements:
@@ -90,14 +120,13 @@ def _elements_to_chunks(elements: List[Element], document_id: str) -> List[Chunk
             continue
         chunks.append(
             Chunk(
-                id=f"{document_id}_chunk_{chunk_index}",
+                id=f"{document_id}_chunk_{len(chunks)}",
                 document_id=document_id,
-                chunk_index=chunk_index,
+                chunk_index=len(chunks),
                 type=chunk_type,
                 content=content,
             )
         )
-        chunk_index += 1
 
     if skipped_empty:
         log.info(
@@ -121,6 +150,65 @@ def _partition_safe(
     return list(partition(**kwargs) or [])
 
 
+def _pypdf_fallback(file_path: str, document_id: str) -> List[Chunk]:
+    """
+    Reliable PDF text extraction when unstructured returns nothing.
+
+    This path does NOT use NVIDIA NIM / embeddings — local PyPDF2 only.
+    """
+    try:
+        from PyPDF2 import PdfReader
+    except Exception as e:
+        log.error("PyPDF2 unavailable: %s", e)
+        return []
+
+    try:
+        reader = PdfReader(file_path)
+        pages: List[str] = []
+        for i, page in enumerate(reader.pages):
+            try:
+                text = (page.extract_text() or "").strip()
+            except Exception as pe:
+                log.warning("PyPDF2 page %s extract failed: %s", i, pe)
+                text = ""
+            if text:
+                pages.append(text)
+        if not pages:
+            log.warning(
+                "Triage: PyPDF2 found %s page(s) but no extractable text "
+                "(likely scanned/image PDF) for %s",
+                len(reader.pages),
+                file_path,
+            )
+            return []
+        return _texts_to_chunks(pages, document_id, source="pypdf_fallback")
+    except Exception as e:
+        log.error("Triage: PyPDF2 fallback failed for %s: %s", file_path, e)
+        return []
+
+
+def _docx_fallback(file_path: str, document_id: str) -> List[Chunk]:
+    """Extract paragraphs from .docx without unstructured."""
+    try:
+        import zipfile
+        from xml.etree import ElementTree as ET
+
+        with zipfile.ZipFile(file_path) as zf:
+            xml = zf.read("word/document.xml")
+        root = ET.fromstring(xml)
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        paras = []
+        for node in root.findall(".//w:p", ns):
+            texts = [t.text for t in node.findall(".//w:t", ns) if t.text]
+            line = "".join(texts).strip()
+            if line:
+                paras.append(line)
+        return _texts_to_chunks(paras, document_id, source="docx_fallback")
+    except Exception as e:
+        log.error("Triage: docx fallback failed for %s: %s", file_path, e)
+        return []
+
+
 def _plain_text_fallback(file_path: str, document_id: str) -> List[Chunk]:
     """Last resort for .txt/.md/.csv or when partition yields nothing usable."""
     try:
@@ -128,47 +216,72 @@ def _plain_text_fallback(file_path: str, document_id: str) -> List[Chunk]:
             raw = f.read(2_000_000)
         if not raw:
             return []
-        # Skip obvious binary (NUL in first 1KB)
+        # Skip obvious binary (NUL in first 1KB) — PDFs should use PyPDF2 instead
         sample = raw[:1024]
         if b"\x00" in sample:
             return []
         text = raw.decode("utf-8", errors="ignore").strip()
         if not text:
             return []
-        # Split into rough paragraphs so CRE/summarize still have structure
         parts = [p.strip() for p in text.split("\n\n") if p.strip()]
         if not parts:
             parts = [text]
-        chunks: List[Chunk] = []
-        for i, part in enumerate(parts[:200]):
-            chunks.append(
-                Chunk(
-                    id=f"{document_id}_chunk_{i}",
-                    document_id=document_id,
-                    chunk_index=i,
-                    type="Text",
-                    content=part[:20000],
-                )
-            )
-        log.warning(
-            "Triage: using plain-text fallback (%s chunk(s)) for %s",
-            len(chunks),
-            file_path,
-        )
-        return chunks
+        return _texts_to_chunks(parts, document_id, source="plain_text_fallback")
     except Exception as e:
         log.error("Plain-text fallback failed for %s: %s", file_path, e)
         return []
 
 
+def _format_fallbacks(file_path: str, document_id: str) -> List[Chunk]:
+    ext = _ext(file_path)
+    log.info("Triage: running format fallbacks for ext=%s name=%s", ext, _original_name(file_path))
+
+    if ext == ".pdf" or ext == "":
+        # Also try PDF if extension missing but file looks like PDF
+        chunks = _pypdf_fallback(file_path, document_id)
+        if chunks:
+            return chunks
+        # Detect PDF magic
+        try:
+            with open(file_path, "rb") as f:
+                magic = f.read(5)
+            if magic.startswith(b"%PDF") and ext != ".pdf":
+                chunks = _pypdf_fallback(file_path, document_id)
+                if chunks:
+                    return chunks
+        except Exception:
+            pass
+
+    if ext in (".docx",):
+        chunks = _docx_fallback(file_path, document_id)
+        if chunks:
+            return chunks
+
+    if ext in (".txt", ".md", ".csv", ".json", ".log", ""):
+        chunks = _plain_text_fallback(file_path, document_id)
+        if chunks:
+            return chunks
+
+    # Final attempt: plain text even for unknown types (may no-op on binary)
+    return _plain_text_fallback(file_path, document_id)
+
+
 def triage_document(file_path: str, file_type: str, strategy: str) -> List[Chunk]:
     """
-    Visual / layout-aware document partition → list of Chunk objects.
+    Document → Chunk list.
 
-    Always attempts to recover text from every element type. Falls back to
-    plain-text extraction when unstructured returns nothing usable.
+    Pipeline (no NVIDIA NIM / embeddings here):
+      1. unstructured.partition (layout-aware)
+      2. Format-specific fallbacks (PyPDF2 for PDF, zip/xml for DOCX, utf-8 for text)
+
+    NVIDIA NIM is only used later (feature classification, summarize, embed).
     """
-    log.info("Triaging document: %s (strategy=%s, content_type=%s)", file_path, strategy, file_type)
+    log.info(
+        "Triaging document: %s (strategy=%s, content_type=%s)",
+        file_path,
+        strategy,
+        file_type,
+    )
     document_id = _document_id_from_path(file_path)
 
     if not os.path.isfile(file_path):
@@ -179,7 +292,23 @@ def triage_document(file_path: str, file_type: str, strategy: str) -> List[Chunk
     if size <= 0:
         log.error("Triage: file is empty: %s", file_path)
         return []
-    log.info("Triage: file size=%s bytes", size)
+    log.info(
+        "Triage: file size=%s bytes ext=%s original=%s",
+        size,
+        _ext(file_path),
+        _original_name(file_path),
+    )
+
+    # PDFs: prefer PyPDF2 first. On Render's slim image, unstructured often
+    # crashes with ``libGL.so.1: cannot open shared object file`` (OpenCV).
+    # This path does not use NVIDIA NIM or embeddings.
+    ext = _ext(file_path)
+    if ext == ".pdf":
+        pdf_chunks = _pypdf_fallback(file_path, document_id)
+        if pdf_chunks:
+            log.info("Triage complete via PyPDF2. Extracted %s chunks.", len(pdf_chunks))
+            return pdf_chunks
+        log.warning("Triage: PyPDF2 returned no text; trying unstructured next")
 
     elements: List[Element] = []
     strategies = [strategy or "fast"]
@@ -193,7 +322,6 @@ def triage_document(file_path: str, file_type: str, strategy: str) -> List[Chunk
             log.info("Triage: partition strategy=%s → %s element(s)", strat, len(elements))
             if elements:
                 break
-            # Retry without content_type if MIME may be wrong
             elements = _partition_safe(file_path, content_type=None, strategy=strat)
             log.info(
                 "Triage: partition strategy=%s (no content_type) → %s element(s)",
@@ -210,10 +338,12 @@ def triage_document(file_path: str, file_type: str, strategy: str) -> List[Chunk
 
     if not chunks:
         log.warning(
-            "Triage: no usable chunks after partition (last_error=%s) — trying plain-text fallback",
+            "Triage: unstructured produced no usable chunks (elements=%s last_error=%s) "
+            "— trying format fallbacks (PyPDF2/docx/text). NOT an NIM/API-key issue.",
+            len(elements),
             last_error,
         )
-        chunks = _plain_text_fallback(file_path, document_id)
+        chunks = _format_fallbacks(file_path, document_id)
 
     log.info("Triage complete. Extracted %s smart chunks.", len(chunks))
     return chunks

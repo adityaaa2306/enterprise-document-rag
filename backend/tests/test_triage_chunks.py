@@ -43,3 +43,28 @@ def test_unknown_element_uses_text():
     typ, content = _element_content(el)  # type: ignore[arg-type]
     assert content == "misc caption"
     assert typ == "Other"
+
+
+def test_pdf_uses_pypdf_before_unstructured(tmp_path, monkeypatch):
+    """When PyPDF2 extracts text, triage must not depend on unstructured/libGL."""
+    from src.agents import triage
+
+    pdf_path = tmp_path / "jobid_report.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+    monkeypatch.setattr(
+        triage,
+        "_pypdf_fallback",
+        lambda path, doc_id: triage._texts_to_chunks(
+            ["Page one content about sustainability."], doc_id, source="pypdf_fallback"
+        ),
+    )
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("libGL.so.1: cannot open shared object file")
+
+    monkeypatch.setattr(triage, "_partition_safe", _boom)
+
+    chunks = triage.triage_document(str(pdf_path), "application/pdf", "fast")
+    assert len(chunks) == 1
+    assert "sustainability" in chunks[0].content
