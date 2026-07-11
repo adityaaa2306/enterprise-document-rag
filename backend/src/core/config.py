@@ -153,6 +153,8 @@ class Settings(BaseSettings):
     JOB_MAX_RUNTIME_SEC: float = 600.0
     # Feature extraction LLM/embed probe is optional metadata — never abort the job
     FEATURE_EXTRACTION_OPTIONAL: bool = True
+    # When true, API container also runs `python -m src.worker` (free-tier / portfolio)
+    RUN_EMBEDDED_WORKER: bool = False
 
     # --- Chroma vector store (embedded PersistentClient — NOT remote HttpClient) ---
     # Portfolio / single-service: embeddings on local disk under this path.
