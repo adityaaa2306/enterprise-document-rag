@@ -34,17 +34,24 @@ def test_render_blueprint_exists():
     assert path.is_file()
     text = path.read_text(encoding="utf-8")
     assert "green-agentic-api" in text
-    assert "green-agentic-worker" in text
+    # Portfolio default: single web service + embedded worker (shared Chroma disk)
+    assert "RUN_EMBEDDED_WORKER" in text
+    assert "type: worker" not in text
     assert "green-agentic-chroma" not in text
     assert "healthCheckPath: /api/health" in text
     assert "docker-entrypoint-api.sh" in text
-    assert "docker-entrypoint-worker.sh" in text
     assert "dockerBuildTarget: api" in text
-    assert "dockerBuildTarget: worker" in text
     assert "CHROMA_PERSIST_DIRECTORY" in text
     assert "railway" not in text.lower()
-    assert text.count("JWT_SECRET_KEY") >= 2
+    assert "JWT_SECRET_KEY" in text
     assert "SERVICE_ROLE" in text
+
+    root_blueprint = BACKEND.parent / "render.yaml"
+    assert root_blueprint.is_file()
+    root_text = root_blueprint.read_text(encoding="utf-8")
+    assert "rootDir: backend" in root_text
+    assert "dockerBuildTarget: api" in root_text
+    assert "RUN_EMBEDDED_WORKER" in root_text
 
 
 def test_dockerfile_targets_set_service_role():
