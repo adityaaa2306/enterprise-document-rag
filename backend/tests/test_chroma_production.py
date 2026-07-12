@@ -88,18 +88,19 @@ def test_render_blueprint_uses_embedded_worker():
         assert "type: worker" not in text
 
 
-def test_api_entrypoint_avoids_wait_n():
+def test_api_entrypoint_uses_inprocess_embedded_worker():
     raw = Path(__file__).resolve().parents[1].joinpath(
         "scripts/docker-entrypoint-api.sh"
     ).read_text(encoding="utf-8")
-    # Strip comments — docs may mention wait -n as the anti-pattern
     code = "\n".join(
         line for line in raw.splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     )
+    # Must NOT spawn a second Python worker process (OOM on free tier)
+    assert "python -m src.worker" not in code
     assert "wait -n" not in code
     assert "RUN_EMBEDDED_WORKER" in code
-    assert "_monitor_children" in code
+    assert "exec uvicorn" in code
 
 
 def test_no_http_client_in_chroma_module():

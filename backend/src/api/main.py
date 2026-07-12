@@ -49,10 +49,19 @@ async def lifespan(app: FastAPI):
     1. Validates runtime config (env, JWT, CORS).
     2. Loads the NVIDIA NIM client.
     3. Initializes relational DB; probes Chroma without long blocking waits.
+    4. Optionally starts an in-process embedded worker thread (free-tier).
 
     Critical for Render: uvicorn does not bind PORT until this lifespan
     completes. Embedded Chroma init is local disk only (no network waits).
+
+    RUN_EMBEDDED_WORKER runs the durable worker in a daemon thread inside
+    this process (shared NIM/Chroma memory) — NOT a second Python process,
+    which OOMs free-tier instances and causes 502s during jobs.
     """
+    import threading
+
+    from src.worker.loop import request_shutdown, run_worker_forever
+
     log.info("API Startup: validating configuration...")
     settings.validate_for_runtime()
 
@@ -73,9 +82,27 @@ async def lifespan(app: FastAPI):
     # 3. Relational DB + embedded Chroma (local disk — no remote wait)
     storage.init_database(block_on_chroma=False)
 
+    worker_thread: Optional[threading.Thread] = None
+    if getattr(settings, "RUN_EMBEDDED_WORKER", False):
+        wid = (settings.WORKER_ID or "").strip() or "embedded-api-1"
+        log.info("Starting in-process embedded worker thread (WORKER_ID=%s)", wid)
+        worker_thread = threading.Thread(
+            target=run_worker_forever,
+            kwargs={"worker_id": wid, "embedded": True},
+            name="embedded-durable-worker",
+            daemon=True,
+        )
+        worker_thread.start()
+
     yield
 
     log.info("API Shutdown: draining requests (uvicorn graceful timeout)...")
+    if worker_thread is not None:
+        request_shutdown("api-lifespan")
+        grace = float(getattr(settings, "WORKER_SHUTDOWN_GRACE_SEC", 120) or 120)
+        worker_thread.join(timeout=min(grace, 60.0))
+        if worker_thread.is_alive():
+            log.warning("Embedded worker thread still alive after join timeout")
 
 
 # --- Create FastAPI App ---

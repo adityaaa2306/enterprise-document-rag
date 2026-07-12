@@ -64,16 +64,24 @@ def _install_signal_handlers() -> None:
             log.warning("Could not install handler for %s: %s", sig, e)
 
 
-def run_worker_forever(*, worker_id: Optional[str] = None, once: bool = False) -> None:
+def run_worker_forever(
+    *,
+    worker_id: Optional[str] = None,
+    once: bool = False,
+    embedded: bool = False,
+) -> None:
     """
     Main worker lifecycle.
 
     once=True processes at most one claim cycle (for tests).
-    SIGTERM/SIGINT: finish current job (if any), then exit cleanly.
+    embedded=True: run inside the API process (daemon thread). Skips duplicate
+    signal handlers / model+DB init so free-tier memory stays single-process.
+    SIGTERM/SIGINT (standalone): finish current job (if any), then exit cleanly.
     """
     _shutdown.clear()
     _busy.clear()
-    _install_signal_handlers()
+    if not embedded:
+        _install_signal_handlers()
 
     wid = resolve_worker_id(worker_id)
     poll = float(settings.WORKER_POLL_INTERVAL_SEC)
@@ -82,21 +90,25 @@ def run_worker_forever(*, worker_id: Optional[str] = None, once: bool = False) -
     grace = float(getattr(settings, "WORKER_SHUTDOWN_GRACE_SEC", 120) or 120)
 
     log.info(
-        "Worker starting id=%s poll=%.1fs claim_timeout=%ss max_attempts=%s grace=%.0fs",
+        "Worker starting id=%s mode=%s poll=%.1fs claim_timeout=%ss max_attempts=%s grace=%.0fs",
         wid,
+        "embedded-thread" if embedded else "standalone",
         poll,
         settings.WORKER_CLAIM_TIMEOUT_SEC,
         settings.WORKER_MAX_ATTEMPTS,
         grace,
     )
 
-    from src.memory import storage
+    if not embedded:
+        from src.memory import storage
 
-    log.info("Worker: ensuring database + Chroma are ready...")
-    storage.init_database()  # DB + embedded Chroma PersistentClient
-    from src.agents import models as agent_models
+        log.info("Worker: ensuring database + Chroma are ready...")
+        storage.init_database()  # DB + embedded Chroma PersistentClient
+        from src.agents import models as agent_models
 
-    agent_models.load_all_models()
+        agent_models.load_all_models()
+    else:
+        log.info("Worker: embedded mode — reusing API process DB/Chroma/NIM clients")
 
     job_store.upsert_worker_heartbeat(wid, status="idle", hostname=socket.gethostname())
     last_hb = 0.0

@@ -73,9 +73,17 @@ def test_entrypoint_scripts_exist_and_executable_bits_documented():
     worker = BACKEND / "scripts" / "docker-entrypoint-worker.sh"
     assert api.is_file()
     assert worker.is_file()
-    assert "uvicorn" in api.read_text(encoding="utf-8")
-    assert "python -m src.worker" in worker.read_text(encoding="utf-8")
-    assert "timeout-graceful-shutdown" in api.read_text(encoding="utf-8")
+    api_text = api.read_text(encoding="utf-8")
+    worker_text = worker.read_text(encoding="utf-8")
+    assert "uvicorn" in api_text
+    assert "python -m src.worker" in worker_text
+    assert "timeout-graceful-shutdown" in api_text
+    # Free-tier: embedded worker is in-process via lifespan, not a second process
+    api_code = "\n".join(
+        ln for ln in api_text.splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    )
+    assert "python -m src.worker" not in api_code
 
 
 def test_worker_shutdown_flag(monkeypatch):
