@@ -167,7 +167,7 @@ def upload_and_poll(session: requests.Session, access: str) -> str:
     st = session.get(
         f"{API_URL}/job-status/{job_id}",
         headers={"Authorization": f"Bearer {access}"},
-        timeout=30,
+        timeout=120,
     )
     if st.status_code != 200:
         _fail("job_poll", f"status HTTP {st.status_code}")
@@ -177,11 +177,17 @@ def upload_and_poll(session: requests.Session, access: str) -> str:
     deadline = time.time() + POLL_TIMEOUT_SEC
     last = status
     while time.time() < deadline:
-        st = session.get(
-            f"{API_URL}/job-status/{job_id}",
-            headers={"Authorization": f"Bearer {access}"},
-            timeout=30,
-        )
+        try:
+            st = session.get(
+                f"{API_URL}/job-status/{job_id}",
+                headers={"Authorization": f"Bearer {access}"},
+                timeout=120,
+            )
+        except requests.RequestException as e:
+            # Free-tier cold starts / NIM load can stall the web process briefly
+            print(f"  WARN  job_poll transient: {e}")
+            time.sleep(max(POLL_INTERVAL_SEC, 5.0))
+            continue
         if st.status_code != 200:
             _fail("job_poll", f"HTTP {st.status_code}")
         body = st.json()
