@@ -188,6 +188,10 @@ def upload_and_poll(session: requests.Session, access: str) -> str:
             print(f"  WARN  job_poll transient: {e}")
             time.sleep(max(POLL_INTERVAL_SEC, 5.0))
             continue
+        if st.status_code in (502, 503, 504):
+            print(f"  WARN  job_poll HTTP {st.status_code} (retrying)")
+            time.sleep(max(POLL_INTERVAL_SEC, 5.0))
+            continue
         if st.status_code != 200:
             _fail("job_poll", f"HTTP {st.status_code}")
         body = st.json()
