@@ -48,8 +48,9 @@ class Settings(BaseSettings):
     LIGHT_MODEL_FALLBACK: str = "google/gemma-2-2b-it"
 
     # --- Medium tier (escalation on accuracy failure) ---
-    MEDIUM_MODEL_PRIMARY: str = "google/gemma-4-31b-it"
-    MEDIUM_MODEL_FALLBACK: str = "mistralai/ministral-14b-instruct-2512"
+    # Prefer ministral as primary: gemma-4-31b frequently 504/timeouts on NIM free tier.
+    MEDIUM_MODEL_PRIMARY: str = "mistralai/ministral-14b-instruct-2512"
+    MEDIUM_MODEL_FALLBACK: str = "google/gemma-4-31b-it"
 
     # --- Heavy tier (final compile + RAG answers) ---
     HEAVY_MODEL_PRIMARY: str = "meta/llama-3.3-70b-instruct"
@@ -150,7 +151,8 @@ class Settings(BaseSettings):
     # After SIGTERM: finish current job up to this many seconds, then exit
     WORKER_SHUTDOWN_GRACE_SEC: float = 120.0
     # Hard wall-clock limit for a single claim attempt (stops orphaned "processing")
-    JOB_MAX_RUNTIME_SEC: float = 600.0
+    # Large PDFs with medium/heavy tiers + NIM fallbacks need >10 minutes.
+    JOB_MAX_RUNTIME_SEC: float = 1800.0
     # Feature extraction LLM/embed probe is optional metadata — never abort the job
     FEATURE_EXTRACTION_OPTIONAL: bool = True
     # When true, API process starts durable worker as an in-process thread

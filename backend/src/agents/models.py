@@ -367,11 +367,13 @@ ANSWER:
 # Embeddings (NIM)
 # ---------------------------------------------------------------------------
 
-def embed_texts(texts: List[str]) -> List[List[float]]:
+def embed_texts(texts: List[str], *, input_type: str = "passage") -> List[List[float]]:
     """
     Embed one or more texts via NVIDIA NIM embeddings API.
     Returns a list of embedding vectors (same order as input).
-    Uses content-addressed disk cache when ENABLE_EMBEDDING_CACHE is true.
+
+    ``input_type`` is required for asymmetric NIM models (e.g. nemotron-embed):
+    use ``passage`` for documents/chunks and ``query`` for search queries.
     """
     client = get_nim_client()
     if client is None:
@@ -382,17 +384,18 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
 
     model_id = settings.EMBEDDING_MODEL
     use_cache = bool(getattr(settings, "ENABLE_EMBEDDING_CACHE", True))
+    itype = (input_type or "passage").strip() or "passage"
 
     if use_cache:
         from src.memory import embedding_cache
 
-        cached, miss_indices = embedding_cache.get_many(model_id, texts)
+        cached, miss_indices = embedding_cache.get_many(model_id, texts, input_type=itype)
         if not miss_indices:
             return [v for v in cached]  # type: ignore[misc]
 
         to_embed = [texts[i] for i in miss_indices]
-        fresh = _embed_batch_nim(client, model_id, to_embed)
-        embedding_cache.put_many(model_id, to_embed, fresh)
+        fresh = _embed_batch_nim(client, model_id, to_embed, input_type=itype)
+        embedding_cache.put_many(model_id, to_embed, fresh, input_type=itype)
         out: List[List[float]] = []
         fresh_iter = iter(fresh)
         for i, existing in enumerate(cached):
@@ -402,20 +405,32 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
                 out.append(next(fresh_iter))
         return out
 
-    return _embed_batch_nim(client, model_id, texts)
+    return _embed_batch_nim(client, model_id, texts, input_type=itype)
 
 
-def _embed_batch_nim(client: OpenAI, model_id: str, texts: List[str]) -> List[List[float]]:
+def _embed_batch_nim(
+    client: OpenAI,
+    model_id: str,
+    texts: List[str],
+    *,
+    input_type: str = "passage",
+) -> List[List[float]]:
     """Call NIM embeddings API in batches; preserve input order. Raises NimApiError on transient failures."""
     if not texts:
         return []
     batch_size = 32
     all_embeddings: List[List[float]] = []
     timeout = _nim_timeout()
+    itype = (input_type or "passage").strip() or "passage"
     for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
         try:
-            response = client.embeddings.create(model=model_id, input=batch, timeout=timeout)
+            response = client.embeddings.create(
+                model=model_id,
+                input=batch,
+                timeout=timeout,
+                extra_body={"input_type": itype},
+            )
             sorted_data = sorted(response.data, key=lambda d: d.index)
             all_embeddings.extend([d.embedding for d in sorted_data])
         except Exception as e:

@@ -239,7 +239,7 @@ class RetrievalService:
         if not models.get_embedding_model():
             return [], {}
         try:
-            qvec = models.embed_texts([query])[0]
+            qvec = models.embed_texts([query], input_type="query")[0]
             results = collection.query(
                 query_embeddings=[qvec],
                 n_results=k,

@@ -26,9 +26,11 @@ def _cache_dir() -> str:
     return path
 
 
-def text_hash(model_id: str, text: str) -> str:
+def text_hash(model_id: str, text: str, input_type: str = "passage") -> str:
     h = hashlib.sha256()
     h.update(model_id.encode("utf-8"))
+    h.update(b"\n")
+    h.update((input_type or "passage").encode("utf-8"))
     h.update(b"\n")
     h.update(text.encode("utf-8"))
     return h.hexdigest()
@@ -38,9 +40,9 @@ def _path_for(key: str) -> str:
     return os.path.join(_cache_dir(), f"{key}.json")
 
 
-def get_cached(model_id: str, text: str) -> Optional[List[float]]:
+def get_cached(model_id: str, text: str, input_type: str = "passage") -> Optional[List[float]]:
     global _hits, _misses
-    key = text_hash(model_id, text)
+    key = text_hash(model_id, text, input_type=input_type)
     path = _path_for(key)
     try:
         if not os.path.exists(path):
@@ -64,12 +66,13 @@ def get_cached(model_id: str, text: str) -> Optional[List[float]]:
         return None
 
 
-def put_cached(model_id: str, text: str, embedding: List[float]) -> None:
-    key = text_hash(model_id, text)
+def put_cached(model_id: str, text: str, embedding: List[float], input_type: str = "passage") -> None:
+    key = text_hash(model_id, text, input_type=input_type)
     path = _path_for(key)
     try:
         payload = {
             "model": model_id,
+            "input_type": input_type,
             "embedding": embedding,
             "dim": len(embedding),
         }
@@ -82,23 +85,30 @@ def put_cached(model_id: str, text: str, embedding: List[float]) -> None:
         log.warning(f"Embed cache write failed: {e}")
 
 
-def get_many(model_id: str, texts: List[str]) -> Tuple[List[Optional[List[float]]], List[int]]:
+def get_many(
+    model_id: str, texts: List[str], input_type: str = "passage"
+) -> Tuple[List[Optional[List[float]]], List[int]]:
     """
     Returns (vectors_or_none aligned to texts, list of miss indices).
     """
     out: List[Optional[List[float]]] = []
     misses: List[int] = []
     for i, t in enumerate(texts):
-        v = get_cached(model_id, t)
+        v = get_cached(model_id, t, input_type=input_type)
         out.append(v)
         if v is None:
             misses.append(i)
     return out, misses
 
 
-def put_many(model_id: str, texts: List[str], embeddings: List[List[float]]) -> None:
+def put_many(
+    model_id: str,
+    texts: List[str],
+    embeddings: List[List[float]],
+    input_type: str = "passage",
+) -> None:
     for t, e in zip(texts, embeddings):
-        put_cached(model_id, t, e)
+        put_cached(model_id, t, e, input_type=input_type)
 
 
 def stats() -> Dict[str, int]:
