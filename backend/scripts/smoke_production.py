@@ -141,8 +141,15 @@ def register_login(session: requests.Session) -> Tuple[str, str]:
 
 
 def upload_and_poll(session: requests.Session, access: str) -> str:
-    pdf = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
-    files = {"file": ("smoke.pdf", pdf, "application/pdf")}
+    # Real extractable text (empty PDF shells yield 0 chunks → RAG 404).
+    body = (
+        "Green Agentic Smoke Document\n\n"
+        "This portfolio document describes carbon-aware document intelligence.\n"
+        "The system uses NVIDIA NIM models for summarization and retrieval.\n"
+        "Key topics: triage, chunking, embeddings, hybrid retrieval, and RAG answers.\n"
+        "Smoke verification requires at least one embedded chunk for query matching.\n"
+    ).encode("utf-8")
+    files = {"file": ("smoke.txt", body, "text/plain")}
     r = session.post(
         f"{API_URL}/summarize?mode=automatic",
         headers={"Authorization": f"Bearer {access}"},
