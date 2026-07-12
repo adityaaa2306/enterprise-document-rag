@@ -13,10 +13,13 @@ flowchart TB
   API --> NIM[NVIDIA NIM APIs]
 ```
 
-> **Default topology:** one Web Service with `RUN_EMBEDDED_WORKER=true`.  
-> Worker and API must share the same Chroma persist directory. Render gives each
-> service its **own** disk — a separate Background Worker therefore cannot see
-> embeddings written for RAG on the API. Local `docker compose` is different:
+> **Default topology:** one Web Service with `RUN_EMBEDDED_WORKER=true`.
+> The durable worker runs as an **in-process daemon thread** inside uvicorn
+> (shared NIM + Chroma memory). Do **not** spawn a second `python -m src.worker`
+> process on free tier — that doubles RAM and causes OOM/502 during jobs.
+>
+> A separate Background Worker with its own Render disk **cannot** share
+> PersistentClient embeddings with the API. Local `docker compose` is different:
 > API and worker containers mount the **same** named volume.
 
 ---
