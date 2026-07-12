@@ -164,14 +164,28 @@ def upload_and_poll(session: requests.Session, access: str) -> str:
     _ok("upload_summarize", job_id)
 
     # Job should start as pending (or already processing if worker is fast)
-    st = session.get(
-        f"{API_URL}/job-status/{job_id}",
-        headers={"Authorization": f"Bearer {access}"},
-        timeout=120,
-    )
-    if st.status_code != 200:
-        _fail("job_poll", f"status HTTP {st.status_code}")
-    status = st.json().get("status")
+    status = "pending"
+    for attempt in range(12):
+        try:
+            st = session.get(
+                f"{API_URL}/job-status/{job_id}",
+                headers={"Authorization": f"Bearer {access}"},
+                timeout=120,
+            )
+        except requests.RequestException as e:
+            print(f"  WARN  job_poll_initial transient: {e}")
+            time.sleep(5.0)
+            continue
+        if st.status_code in (502, 503, 504):
+            print(f"  WARN  job_poll_initial HTTP {st.status_code} (retrying)")
+            time.sleep(5.0)
+            continue
+        if st.status_code != 200:
+            _fail("job_poll", f"status HTTP {st.status_code}")
+        status = st.json().get("status") or status
+        break
+    else:
+        print("  WARN  job_poll_initial never got 200 — continuing poll loop")
     _ok("job_poll_initial", status)
 
     deadline = time.time() + POLL_TIMEOUT_SEC
