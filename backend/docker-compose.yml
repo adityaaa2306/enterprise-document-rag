@@ -1,8 +1,11 @@
 # Local stack — embedded Chroma PersistentClient (no separate Chroma service).
 #
+#   cp .env.docker.example .env.docker   # set NVIDIA_API_KEY
 #   docker compose up --build
 #
-# API and Worker share a volume at CHROMA_PERSIST_DIRECTORY so embeddings match.
+# API and Worker share volume chroma_data at CHROMA_PERSIST_DIRECTORY.
+# (Compose can use separate containers because they mount the SAME volume.
+#  Render disks are per-service and do NOT share — use RUN_EMBEDDED_WORKER there.)
 
 name: green-agentic
 
@@ -31,10 +34,12 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - .env.docker
+      - path: .env.docker
+        required: false
     environment:
       APP_ENV: production
       PORT: "8000"
+      JWT_SECRET_KEY: change-me-docker-compose-dev-secret-32chars
       DATABASE_URL: postgresql+psycopg://green:green@postgres:5432/green_agentic
       CHROMA_PERSIST_DIRECTORY: /data/chroma
       VECTOR_DB_PATH: /data/aux
@@ -47,6 +52,8 @@ services:
       PERSIST_JOBS_TO_DB: "true"
       PERSIST_CONVERSATIONS_TO_DB: "true"
       PERSIST_ROUTING_EVENTS_TO_DB: "true"
+      # Compose uses a separate worker service (shared chroma_data volume).
+      RUN_EMBEDDED_WORKER: "false"
     volumes:
       - chroma_data:/data/chroma
       - aux_data:/data/aux
@@ -69,9 +76,11 @@ services:
       dockerfile: Dockerfile
       target: worker
     env_file:
-      - .env.docker
+      - path: .env.docker
+        required: false
     environment:
       APP_ENV: production
+      JWT_SECRET_KEY: change-me-docker-compose-dev-secret-32chars
       DATABASE_URL: postgresql+psycopg://green:green@postgres:5432/green_agentic
       CHROMA_PERSIST_DIRECTORY: /data/chroma
       VECTOR_DB_PATH: /data/aux
@@ -83,6 +92,7 @@ services:
       WORKER_ID: compose-worker-1
       WORKER_POLL_INTERVAL_SEC: "2"
       WORKER_CLAIM_TIMEOUT_SEC: "900"
+      SERVICE_ROLE: worker
     volumes:
       - chroma_data:/data/chroma
       - aux_data:/data/aux

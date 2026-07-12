@@ -2,8 +2,10 @@
 # Multi-stage image for Green Agentic API + durable worker (Render).
 # Build targets: `api` | `worker` (same layers, different CMD).
 #
-# Render Web Service:        dockerBuildTarget = api
+# Render Web Service:        dockerBuildTarget = api  (REQUIRED — last stage is worker)
 # Render Background Worker:  dockerBuildTarget = worker
+#
+# Portfolio default: run API target with RUN_EMBEDDED_WORKER=true (shared Chroma disk).
 #
 # Verify locally:
 #   docker build --target api -t green-api .

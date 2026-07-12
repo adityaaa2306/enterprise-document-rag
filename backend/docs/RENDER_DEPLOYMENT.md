@@ -6,21 +6,18 @@
 ```mermaid
 flowchart TB
   User[Browser] --> Vercel[Vercel — Next.js]
-  Vercel -->|HTTPS Bearer| API[Render Web Service — FastAPI]
+  Vercel -->|HTTPS Bearer| API[Render Web Service — FastAPI + embedded worker]
   API --> Neon[(Neon PostgreSQL)]
   API --> R2[(Cloudflare R2)]
-  API --> Disk[(Embedded Chroma PersistentClient)]
-  Worker[Render Background Worker] --> Neon
-  Worker --> R2
-  Worker --> Disk
+  API --> Disk[(Embedded Chroma on /data)]
   API --> NIM[NVIDIA NIM APIs]
-  Worker --> NIM
 ```
 
-> The application currently uses an embedded Chroma instance for cost-efficient
-> portfolio deployment. The production deployment architecture supports migrating
-> to a standalone Chroma server (`HttpClient`) with no application-level changes
-> beyond restoring the client factory branch.
+> **Default topology:** one Web Service with `RUN_EMBEDDED_WORKER=true`.  
+> Worker and API must share the same Chroma persist directory. Render gives each
+> service its **own** disk — a separate Background Worker therefore cannot see
+> embeddings written for RAG on the API. Local `docker compose` is different:
+> API and worker containers mount the **same** named volume.
 
 ---
 
@@ -30,11 +27,10 @@ flowchart TB
 |-------|--------|
 | Production-ready Dockerfile | Yes — multi-stage `builder` → `runtime` → `api` / `worker` |
 | Multi-stage optimized | Yes — venv copy only; no compilers in runtime; CPU torch |
-| API / Worker separated | Yes — distinct build targets + entrypoints |
-| Image size | Large (torch/transformers/unstructured) but CUDA avoided; BuildKit pip cache |
+| API / Worker | Same image targets; portfolio runs worker **inside** API via `RUN_EMBEDDED_WORKER` |
 | Build caching | `requirements.txt` copied before app code; pip cache mount |
 
-**Local:** `docker compose up --build` (postgres + api + worker; embedded Chroma volume).
+**Local:** `cp .env.docker.example .env.docker` then `docker compose up --build`.
 
 ---
 
@@ -43,25 +39,25 @@ flowchart TB
 | Service | Type | Docker target | Start command | Health |
 |---------|------|---------------|---------------|--------|
 | `green-agentic-api` | **Web Service** | `api` | `/app/scripts/docker-entrypoint-api.sh` | `GET /api/health` |
-| `green-agentic-worker` | **Background Worker** | `worker` | `/app/scripts/docker-entrypoint-worker.sh` | process + DB; app-level `/api/worker/health` |
 
-No separate Chroma service — embeddings use `CHROMA_PERSIST_DIRECTORY` on the service disk.
+Set on the service (UI or Blueprint):
 
-**Root Directory:** `backend` (repo root → set Root Dir to `backend` in each Docker service).
+| Setting | Value |
+|---------|--------|
+| Root Directory | `backend` |
+| Dockerfile Path | `Dockerfile` |
+| Docker Build Context Directory | `.` (relative to Root Directory) |
+| **Docker Build Target** | **`api`** (required — last stage is `worker`) |
+| Docker Command | `/app/scripts/docker-entrypoint-api.sh` |
+| Health Check Path | `/api/health` |
 
-**Build:** Dockerfile · Context `.` · **`dockerBuildTarget`** in `render.yaml`:
-- API → `api`
-- Worker → `worker`
+**Blueprint files:**
 
-Without `dockerBuildTarget`, Render may build the last Dockerfile stage (`worker`) for both services.
+- Repo root `render.yaml` (auto-detect) — `rootDir: backend`
+- `backend/render.yaml` — same content for Root Directory = backend workflows
 
-**Start:** `dockerCommand` in `render.yaml` (or Start Command in UI).
-
-**Readiness (manual / smoke):** `GET /api/ready` — database + Chroma + object storage.
-
-**Startup validation:**
-- **API** — JWT + CORS required (`validate_for_runtime()`).
-- **Worker** — JWT required; **CORS skipped** (`validate_for_runtime(require_cors=False)` / `SERVICE_ROLE=worker`). Worker has no HTTP CORS surface.
+**Readiness (manual / smoke):** `GET /api/ready` — database + Chroma + object storage.  
+**Worker heartbeat:** `GET /api/worker/health` — requires `RUN_EMBEDDED_WORKER=true` (or a live separate worker).
 
 ---
 
@@ -70,13 +66,13 @@ Without `dockerBuildTarget`, Render may build the last Dockerfile stage (`worker
 1. [ ] Neon project → copy pooled `DATABASE_URL` (SSL)
 2. [ ] Cloudflare R2 bucket + API token
 3. [ ] NVIDIA NIM API key
-4. [ ] Render → Blueprint (`backend/render.yaml`) **or** create API (+ optional Worker)
-5. [ ] API Web Service: **`dockerBuildTarget: api`**, health `/api/health`, disk `/data`
-6. [ ] Set `CHROMA_PERSIST_DIRECTORY=/data/chroma` (and `VECTOR_DB_PATH=/data/aux`)
-7. [ ] Worker (optional): **`dockerBuildTarget: worker`**, same Neon + R2 + **same JWT_SECRET_KEY**
-8. [ ] Set `CORS_ORIGINS` on **API** (or `*` for portfolio demos)
-9. [ ] Deploy → `GET https://<api>.onrender.com/api/health` and `/api/ready`
-10. [ ] Vercel: `NEXT_PUBLIC_API_URL=https://<api>.onrender.com`
+4. [ ] Render → Blueprint (`render.yaml` at repo root) **or** create one Web Service
+5. [ ] Confirm **`dockerBuildTarget: api`**
+6. [ ] Set `RUN_EMBEDDED_WORKER=true` and `WORKER_ID=embedded-api-1`
+7. [ ] Set `CHROMA_PERSIST_DIRECTORY=/data/chroma` and `VECTOR_DB_PATH=/data/aux`
+8. [ ] Set `CORS_ORIGINS` to the Vercel origin (or `*` for portfolio demos)
+9. [ ] Deploy → `GET https://<api>.onrender.com/api/health`, `/api/ready`, `/api/worker/health`
+10. [ ] Vercel: Root Directory `frontend`, `NEXT_PUBLIC_API_URL=https://<api>.onrender.com`
 
 ---
 
@@ -88,10 +84,12 @@ Without `dockerBuildTarget`, Render may build the last Dockerfile stage (`worker
 - Prefer your real Vercel origin when you have it: `https://your-app.vercel.app`.
 - `CORS_ALLOW_ALL` is ignored in production — use `CORS_ORIGINS` only.
 
-### Render API (Web Service)
+### Render API (Web Service + embedded worker)
+
 | Variable | Required | Notes |
 |----------|:--------:|-------|
 | `APP_ENV` | ✓ | `production` |
+| `SERVICE_ROLE` | ✓ | `api` |
 | `PORT` | ✓ | Render sets this; entrypoint uses it |
 | `DATABASE_URL` | ✓ | Neon |
 | `JWT_SECRET_KEY` | ✓ | |
@@ -100,29 +98,19 @@ Without `dockerBuildTarget`, Render may build the last Dockerfile stage (`worker
 | `NVIDIA_API_KEY` | ✓ | |
 | `OBJECT_STORAGE_BACKEND` | ✓ | `r2` |
 | `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET` | ✓ | |
-| `CHROMA_PERSIST_DIRECTORY` | ✓ | `/data/chroma` (embedded PersistentClient) |
+| `CHROMA_PERSIST_DIRECTORY` | ✓ | `/data/chroma` |
 | `CHROMA_COLLECTION_NAME` | ✓ | shared collection name |
-| `RUN_MIGRATIONS_ON_STARTUP` | ✓ | `true` on API only |
+| `RUN_MIGRATIONS_ON_STARTUP` | ✓ | `true` |
+| `RUN_EMBEDDED_WORKER` | ✓ | `true` for portfolio |
+| `WORKER_ID` | ✓ | e.g. `embedded-api-1` |
 | `PERSIST_JOBS_TO_DB` | ✓ | `true` |
 | `VECTOR_DB_PATH` | | `/data/aux` (BM25/cache — not embeddings) |
 
-### Render Worker
-Must share Neon, R2, NVIDIA, and **JWT** with the API. Embedded Chroma on the
-Worker disk is **separate** from the API disk unless you later use HttpClient.
+### Free tier notes
 
-| Variable | Required | Notes |
-|----------|:--------:|-------|
-| `APP_ENV` | ✓ | `production` |
-| `SERVICE_ROLE` | ✓ | `worker` (skips CORS validation) |
-| `DATABASE_URL` | ✓ | **Same** Neon URL as API |
-| `JWT_SECRET_KEY` | ✓ | **Same value** as API |
-| `NVIDIA_API_KEY` | ✓ | Same as API |
-| `OBJECT_STORAGE_BACKEND` | ✓ | `r2` |
-| `R2_*` | ✓ | Same as API |
-| `CHROMA_PERSIST_DIRECTORY` | ✓ | `/data/chroma` |
-| `RUN_MIGRATIONS_ON_STARTUP` | ✓ | `false` |
-| `WORKER_ID` | ✓ | Unique per replica |
-| `CORS_ORIGINS` | | Optional; not validated on worker |
+- No persistent disk: vectors are lost on restart/redeploy (re-ingest after wake).
+- Service sleeps after ~15 minutes idle; first request cold-starts.
+- Background Worker plans are paid — embedded worker avoids that cost.
 
 ---
 
@@ -130,18 +118,15 @@ Worker disk is **separate** from the API disk unless you later use HttpClient.
 
 | Service | Build | Start | `SERVICE_ROLE` |
 |---------|-------|-------|----------------|
-| API | `docker build --target api` · Render `dockerBuildTarget: api` | `/app/scripts/docker-entrypoint-api.sh` | `api` |
-| Worker | `docker build --target worker` · Render `dockerBuildTarget: worker` | `/app/scripts/docker-entrypoint-worker.sh` | `worker` |
+| API (+ embedded worker) | `docker build --target api` · Render `dockerBuildTarget: api` | `/app/scripts/docker-entrypoint-api.sh` | `api` |
 
 Verify targets locally:
 ```bash
 docker build --target api -t green-api .
-docker build --target worker -t green-worker .
 docker inspect green-api --format "{{index .Config.Env}}"   # includes SERVICE_ROLE=api
-docker inspect green-worker --format "{{json .Config.Cmd}}" # docker-entrypoint-worker.sh
 ```
 
-API entrypoint runs `alembic upgrade head` when `RUN_MIGRATIONS_ON_STARTUP=true`.
+API entrypoint runs `alembic upgrade head` when `RUN_MIGRATIONS_ON_STARTUP=true`, then binds uvicorn, then starts the embedded worker after `/api/health` succeeds.
 
 ---
 
@@ -159,15 +144,15 @@ API entrypoint runs `alembic upgrade head` when `RUN_MIGRATIONS_ON_STARTUP=true`
 
 | File | Role |
 |------|------|
+| `render.yaml` (repo root) | Blueprint (auto-detect) |
+| `backend/render.yaml` | Blueprint when Root Dir = backend |
 | `backend/Dockerfile` | Multi-stage api/worker |
-| `backend/render.yaml` | Blueprint |
-| `backend/docker-compose.yml` | Local parity |
+| `backend/docker-compose.yml` | Local parity (shared volume) |
 | `backend/docs/RENDER_DEPLOYMENT.md` | This guide |
 | `backend/.env.production.example` | Env template |
-| `backend/scripts/migrate_render.sh` | Optional migrate helper |
-| `backend/scripts/migrate_neon.sh` | Neon migrate helper |
-
-**Removed:** `railway.toml`, `railway.worker.toml`, `scripts/migrate_railway.sh`
+| `backend/.env.docker.example` | Compose secrets template |
+| `backend/scripts/docker-entrypoint-api.sh` | API + optional embedded worker |
+| `backend/scripts/smoke_production.py` | E2E smoke |
 
 ---
 

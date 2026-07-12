@@ -107,4 +107,11 @@ npm run dev
 
 ## Production note
 
-Cloud deploy uses a separate worker service (`python -m src.worker`) alongside the API. See `backend/docs/RENDER_DEPLOYMENT.md` and `backend/docs/PHASE3_DURABLE_WORKER.md`.
+**Supported cloud topology (embedded Chroma):** one Render Web Service with
+`RUN_EMBEDDED_WORKER=true` so the API and worker share `/data/chroma`.
+
+A separate Background Worker with its own Render disk **breaks RAG** (worker
+writes vectors the API cannot read). Local `docker compose` is fine with
+separate containers because they mount the same named volume.
+
+See `backend/docs/RENDER_DEPLOYMENT.md` and repo-root `render.yaml`.

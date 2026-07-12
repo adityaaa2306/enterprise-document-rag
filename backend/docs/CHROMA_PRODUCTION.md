@@ -39,9 +39,11 @@ flowchart LR
 - **Free tier (no disk):** filesystem is ephemeral — vectors are lost on
   restart/redeploy. Fine for demos; re-ingest after redeploy.
 
-API and Worker on **separate** services each get their **own** disk — they do
-**not** share embeddings unless you use a single process or later switch to
-`HttpClient` against a shared Chroma server.
+**Critical:** API and Worker on **separate** Render services each get their
+**own** disk — they do **not** share embeddings. For portfolio deploys set
+`RUN_EMBEDDED_WORKER=true` on the API Web Service so write and read share one
+filesystem. Local Compose can still use two containers because they mount the
+same named volume.
 
 ## Switching back to HttpClient later
 

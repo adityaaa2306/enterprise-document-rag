@@ -76,6 +76,32 @@ def test_compose_uses_embedded_chroma_volume():
     assert "HttpClient" not in text
 
 
+def test_render_blueprint_uses_embedded_worker():
+    """Portfolio Render path must share Chroma via embedded worker (no split disks)."""
+    root = Path(__file__).resolve().parents[2]
+    for rel in ("render.yaml", "backend/render.yaml"):
+        text = (root / rel).read_text(encoding="utf-8")
+        assert "dockerBuildTarget: api" in text
+        assert "RUN_EMBEDDED_WORKER" in text
+        assert 'value: "true"' in text or "value: 'true'" in text
+        # Separate worker service would use a different disk — not in default blueprint
+        assert "type: worker" not in text
+
+
+def test_api_entrypoint_avoids_wait_n():
+    raw = Path(__file__).resolve().parents[1].joinpath(
+        "scripts/docker-entrypoint-api.sh"
+    ).read_text(encoding="utf-8")
+    # Strip comments — docs may mention wait -n as the anti-pattern
+    code = "\n".join(
+        line for line in raw.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+    assert "wait -n" not in code
+    assert "RUN_EMBEDDED_WORKER" in code
+    assert "_monitor_children" in code
+
+
 def test_no_http_client_in_chroma_module():
     text = Path(__file__).resolve().parents[1].joinpath("src/memory/chroma.py").read_text(encoding="utf-8")
     assert "wait_for_chroma" not in text

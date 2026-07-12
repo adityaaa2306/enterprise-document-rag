@@ -1,12 +1,21 @@
-# Render Blueprint — same as repository-root render.yaml
-# Prefer deploying via repo-root Blueprint (auto-detect).
-# If this file is selected as Blueprint Path, paths are relative to backend/.
+# Render Blueprint — Green Agentic (portfolio / production-ready default)
 #
-# Supported topology: single Web Service + RUN_EMBEDDED_WORKER=true
-# (shared embedded Chroma on the service filesystem).
+# Canonical location: repository root (Render auto-detects ./render.yaml).
+# A copy lives at backend/render.yaml for dashboards that set Root Directory=backend.
 #
-# Do NOT add a separate Background Worker while using PersistentClient —
-# Render disks are not shared; RAG would write on worker and miss on API.
+# Supported topology (embedded Chroma PersistentClient):
+#   Vercel (Next.js)
+#     → Render Web Service (API + optional embedded worker)
+#       → Neon Postgres · Cloudflare R2 · NVIDIA NIM
+#       → Chroma on /data/chroma (same disk as API)
+#
+# WHY single web service by default:
+#   Worker writes embeddings; API reads them for RAG. Separate Render disks
+#   do NOT share files — a separate Background Worker with its own disk
+#   breaks retrieval. Use RUN_EMBEDDED_WORKER=true so both share /data.
+#
+# Optional separate Background Worker is documented in
+# backend/docs/RENDER_DEPLOYMENT.md (only valid after HttpClient / shared Chroma).
 
 services:
   - type: web
@@ -14,7 +23,7 @@ services:
     runtime: docker
     plan: free
     region: oregon
-    rootDir: .
+    rootDir: backend
     dockerfilePath: ./Dockerfile
     dockerContext: .
     dockerBuildTarget: api
