@@ -149,14 +149,26 @@ class ContextAssembler:
         tier: str = "heavy",
         query: Optional[str] = None,
     ) -> ContextPack:
+        import time
+
+        from src.monitoring.query_latency import STAGE_CONTEXT_ASSEMBLE
+
+        t0 = time.perf_counter()
         budget = self.token_budget if self.token_budget is not None else budget_for_tier(tier)
         norms = _normalize(passages)
         if not norms:
+            assemble_ms = round((time.perf_counter() - t0) * 1000.0, 3)
             return ContextPack(
                 context_text="",
                 tokens_used=0,
                 tokens_budget=budget,
-                stats={"input": 0, "after_dedupe": 0, "after_merge": 0, "packed": 0},
+                stats={
+                    "input": 0,
+                    "after_dedupe": 0,
+                    "after_merge": 0,
+                    "packed": 0,
+                    "latency_ms": {STAGE_CONTEXT_ASSEMBLE: assemble_ms},
+                },
             )
 
         after_dedupe = self._dedupe(norms)
@@ -189,6 +201,7 @@ class ContextAssembler:
 
         context_text = self._format(packed)
         tokens_used = estimate_tokens(context_text)
+        assemble_ms = round((time.perf_counter() - t0) * 1000.0, 3)
         return ContextPack(
             context_text=context_text,
             passages=packed,
@@ -202,6 +215,7 @@ class ContextAssembler:
                 "packed": len(packed),
                 "tier": tier,
                 "query_len": len(query or ""),
+                "latency_ms": {STAGE_CONTEXT_ASSEMBLE: assemble_ms},
             },
         )
 

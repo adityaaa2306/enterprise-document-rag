@@ -8,19 +8,33 @@ import { TopBar } from "@/components/top-bar"
 import { LiveFeed } from "@/components/live-feed"
 import { Card } from "@/components/ui/card"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { Leaf, Zap, Star, Copy, Download } from "lucide-react"
+import { Leaf, Zap, Star, Copy, Download, Info } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { apiFetch } from "@/lib/api"
 import {
   ProcessingInsightsPanel,
   type ProcessingInsightsData,
 } from "@/components/processing-insights"
+import {
+  CarbonComparisonDashboard,
+  type ComparisonModelRow,
+  type OurSystemCarbon,
+  type CarbonSummaryCards,
+  type ChartBarRow,
+  type CarbonBreakdown,
+} from "@/components/carbon-comparison-dashboard"
+import { MarkdownContent } from "@/components/markdown-content"
+import { AnswerSources, type RetrievedChunkMeta } from "@/components/answer-sources"
+import { AnswerMetaFooter } from "@/components/answer-meta-footer"
+import { DeveloperDetails } from "@/components/developer-details"
+import { unwrapOuterMarkdownFence } from "@/lib/utils"
+import { resolveFrontierComparison } from "@/lib/frontier-carbon-compare"
 
 /** Poll every 3s (within the 2–5s target range). */
 const POLL_INTERVAL_MS = 3000
 /** Stop polling after this wall-clock budget so the UI never spins forever. */
 const POLL_TIMEOUT_MS = Number(
-  process.env.NEXT_PUBLIC_JOB_POLL_TIMEOUT_MS || 15 * 60 * 1000,
+  process.env.NEXT_PUBLIC_JOB_POLL_TIMEOUT_MS || 45 * 60 * 1000,
 )
 
 const TERMINAL_STATUSES = new Set([
@@ -69,6 +83,12 @@ interface CarbonData {
   compute_location: string
   local_grid_gco2_kwh: number
   message: string
+  baseline_energy_kwh?: number
+  actual_energy_kwh?: number
+  grid_zone?: string | null
+  grid_datetime?: string | null
+  breakdown?: CarbonBreakdown | null
+  methodology?: string | null
 }
 
 interface JobResult {
@@ -78,6 +98,12 @@ interface JobResult {
   final_summary: string
   carbon_data: CarbonData
   processing_insights?: ProcessingInsightsData | null
+  comparison_models?: ComparisonModelRow[] | null
+  our_system?: OurSystemCarbon | null
+  summary_cards?: CarbonSummaryCards | null
+  badges?: string[] | null
+  chart_bars?: ChartBarRow[] | null
+  methodology?: string | null
 }
 
 interface ChatMessage {
@@ -90,6 +116,10 @@ interface ChatMessage {
     entities_used?: string[] | null
     missing_context?: string[] | null
     sources?: string[]
+    retrieved_chunks?: RetrievedChunkMeta[] | null
+    knowledge_sources?: string[] | null
+    skill?: string | null
+    latency_ms?: number | null
   }
 }
 
@@ -211,7 +241,10 @@ function ResultsContent() {
 
   const fetchResult = async () => {
     try {
-      const response = await apiFetch(`/job-result/${jobId}`)
+      const response = await apiFetch(
+        `/job-result/${jobId}?_ts=${Date.now()}`,
+        { cache: "no-store" },
+      )
       if (response.ok) {
         const data: JobResult = await response.json()
         setResult(data)
@@ -219,7 +252,7 @@ function ResultsContent() {
           {
             role: "assistant",
             content:
-              "Your document is ready! I've read the summary and can now answer your questions.",
+              "Your document is ready. I've read the summary and can answer questions about it.",
           },
         ])
       }
@@ -230,18 +263,21 @@ function ResultsContent() {
 
   const handleCopy = () => {
     if (result?.final_summary) {
-      navigator.clipboard.writeText(result.final_summary)
+      navigator.clipboard.writeText(unwrapOuterMarkdownFence(result.final_summary))
       alert("Summary copied to clipboard!")
     }
   }
 
   const handleDownload = () => {
     if (result?.final_summary) {
-      const blob = new Blob([result.final_summary], { type: "text/plain" })
+      const blob = new Blob(
+        [unwrapOuterMarkdownFence(result.final_summary)],
+        { type: "text/markdown" },
+      )
       const url = URL.createObjectURL(blob)
       const a = document.createElement("a")
       a.href = url
-      a.download = `summary-${result.filename || "document"}.txt`
+      a.download = `summary-${result.filename || "document"}.md`
       document.body.appendChild(a)
       a.click()
       document.body.removeChild(a)
@@ -257,6 +293,7 @@ function ResultsContent() {
     setChatMessages((prev) => [...prev, { role: "user", content: userMsg }])
     setChatInput("")
     setIsChatLoading(true)
+    const startedAt = performance.now()
 
     try {
       const response = await apiFetch("/rag-query", {
@@ -268,8 +305,14 @@ function ResultsContent() {
         }),
       })
 
+      const latencyMs = Math.round(performance.now() - startedAt)
+
       if (response.ok) {
         const data = await response.json()
+        const sources: string[] = Array.isArray(data.sources) ? data.sources : []
+        const retrievedChunks: RetrievedChunkMeta[] = Array.isArray(data.retrieved_chunks)
+          ? data.retrieved_chunks
+          : []
         setChatMessages((prev) => [
           ...prev,
           {
@@ -281,7 +324,11 @@ function ResultsContent() {
               model_used: data.model_used,
               entities_used: data.entities_used,
               missing_context: data.missing_context,
-              sources: data.sources,
+              sources,
+              retrieved_chunks: retrievedChunks,
+              knowledge_sources: data.knowledge_sources,
+              skill: data.skill,
+              latency_ms: latencyMs,
             },
           },
         ])
@@ -306,6 +353,8 @@ function ResultsContent() {
     result?.processing_insights?.routing_preference,
   )
 
+  const frontier = result ? resolveFrontierComparison(result) : null
+
   const showLiveFeed = !isComplete && !jobFailed && !pollTimedOut
   const showFailure = jobFailed || pollTimedOut
 
@@ -326,14 +375,14 @@ function ResultsContent() {
                 transition={{ delay: 0.2 }}
                 className="lg:col-span-1 space-y-4"
               >
-                <Card className="p-6 bg-gradient-to-br from-card to-card/50 border-border/50 sticky top-20">
+                <Card className="p-6 bg-gradient-to-br from-card to-card/50 border-border/50">
                   <h3 className="text-lg font-semibold mb-4">Job Report Card</h3>
 
                   {result ? (
                     <div className="space-y-4">
                       <div>
                         <p className="text-xs text-muted-foreground mb-1">Job ID</p>
-                        <p className="font-mono text-sm">{result.job_id}</p>
+                        <p className="font-mono text-sm break-all">{result.job_id}</p>
                       </div>
 
                       <div>
@@ -341,40 +390,142 @@ function ResultsContent() {
                         <p className="font-medium">{preferenceLabel}</p>
                       </div>
 
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2">
-                          <Leaf className="w-4 h-4 text-green-400" />
-                          <span className="text-sm text-muted-foreground">Carbon Saved</span>
-                        </div>
-                        <p className="text-2xl font-bold ml-6">
-                          {result.carbon_data.carbon_saved_grams?.toFixed(4) || "0.0000"}g CO2e
-                        </p>
-                      </div>
+                      {(() => {
+                        const cd = result.carbon_data
+                        const bd = cd.breakdown
+                        const fmtTok = (n?: number) =>
+                          n != null ? Number(n).toLocaleString() : "—"
+                        const fmtKwh = (n?: number) =>
+                          n != null ? `${Number(n).toFixed(4)} kWh` : "—"
+                        const fmtG = (n?: number, d = 1) =>
+                          n != null ? `${Number(n).toFixed(d)} g` : "—"
+                        const intensity =
+                          bd?.grid_carbon_intensity_gco2_kwh ?? cd.local_grid_gco2_kwh
+                        const zone = bd?.grid_zone || cd.grid_zone || cd.compute_location
+                        const updated =
+                          bd?.grid_updated_at || bd?.grid_datetime || cd.grid_datetime
+                        const rows: [string, string][] = [
+                          ["Input Tokens", fmtTok(bd?.input_tokens)],
+                          ["Retrieved Context", fmtTok(bd?.retrieved_context_tokens)],
+                          ["Generated Tokens", fmtTok(bd?.generated_tokens)],
+                          ["Effective Tokens", fmtTok(bd?.effective_tokens)],
+                          [
+                            "Baseline Energy",
+                            fmtKwh(bd?.baseline_energy_kwh ?? cd.baseline_energy_kwh),
+                          ],
+                          [
+                            "Optimized Energy",
+                            fmtKwh(bd?.optimized_energy_kwh ?? cd.actual_energy_kwh),
+                          ],
+                          [
+                            "Grid Intensity",
+                            intensity != null
+                              ? `${Number(intensity).toFixed(0)} gCO₂e/kWh`
+                              : "—",
+                          ],
+                          [
+                            "Baseline CO₂",
+                            fmtG(bd?.baseline_co2e_g ?? cd.baseline_cost_gco2e),
+                          ],
+                          [
+                            "Actual CO₂",
+                            fmtG(bd?.actual_co2e_g ?? cd.actual_cost_gco2e),
+                          ],
+                          [
+                            "Carbon Saved",
+                            fmtG(bd?.carbon_saved_g ?? cd.carbon_saved_grams),
+                          ],
+                          [
+                            "Reduction",
+                            `${Number(bd?.reduction_percent ?? cd.efficiency_percent ?? 0).toFixed(1)}%`,
+                          ],
+                          ["Region", String(zone || "—")],
+                          ["Last Updated", String(updated || "—")],
+                        ]
+                        return (
+                          <>
+                            <div className="grid grid-cols-2 gap-3">
+                              <div className="rounded-lg border border-border/40 px-3 py-2">
+                                <div className="flex items-center gap-1.5 mb-1">
+                                  <Leaf className="w-3.5 h-3.5 text-green-400" />
+                                  <span className="text-xs text-muted-foreground">
+                                    Carbon Saved
+                                  </span>
+                                </div>
+                                <p className="text-xl font-bold tabular-nums">
+                                  {fmtG(cd.carbon_saved_grams)}
+                                </p>
+                              </div>
+                              <div className="rounded-lg border border-border/40 px-3 py-2">
+                                <div className="flex items-center gap-1.5 mb-1">
+                                  <Zap className="w-3.5 h-3.5 text-blue-400" />
+                                  <span className="text-xs text-muted-foreground">
+                                    Reduction
+                                  </span>
+                                </div>
+                                <p className="text-xl font-bold tabular-nums">
+                                  {Number(cd.efficiency_percent ?? 0).toFixed(1)}%
+                                </p>
+                              </div>
+                              <div className="rounded-lg border border-border/40 px-3 py-2">
+                                <div className="flex items-center gap-1.5 mb-1">
+                                  <Star className="w-3.5 h-3.5 text-amber-400" />
+                                  <span className="text-xs text-muted-foreground">
+                                    Baseline CO₂
+                                  </span>
+                                </div>
+                                <p className="text-lg font-semibold tabular-nums">
+                                  {fmtG(cd.baseline_cost_gco2e)}
+                                </p>
+                              </div>
+                              <div className="rounded-lg border border-border/40 px-3 py-2">
+                                <div className="flex items-center gap-1.5 mb-1">
+                                  <Leaf className="w-3.5 h-3.5 text-emerald-400" />
+                                  <span className="text-xs text-muted-foreground">
+                                    Actual CO₂
+                                  </span>
+                                </div>
+                                <p className="text-lg font-semibold tabular-nums">
+                                  {fmtG(cd.actual_cost_gco2e)}
+                                </p>
+                              </div>
+                            </div>
 
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2">
-                          <Star className="w-4 h-4 text-amber-400" />
-                          <span className="text-sm text-muted-foreground">Baseline Cost</span>
-                        </div>
-                        <p className="text-2xl font-bold ml-6">
-                          {result.carbon_data.baseline_cost_gco2e?.toFixed(4) || "0.0000"}g CO2e
-                        </p>
-                      </div>
+                            <div className="space-y-1.5 pt-1">
+                              <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                                Energy → grid → CO₂e
+                              </p>
+                              {rows.map(([label, value]) => (
+                                <div
+                                  key={label}
+                                  className="flex items-baseline justify-between gap-3 text-sm"
+                                >
+                                  <span className="text-muted-foreground shrink-0">
+                                    {label}
+                                  </span>
+                                  <span className="font-medium tabular-nums text-right break-all">
+                                    {value}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
 
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2">
-                          <Zap className="w-4 h-4 text-blue-400" />
-                          <span className="text-sm text-muted-foreground">Efficiency</span>
-                        </div>
-                        <p className="text-2xl font-bold ml-6">
-                          {result.carbon_data.efficiency_percent?.toFixed(0) || "0"}%
-                        </p>
-                      </div>
-
-                      <div>
-                        <p className="text-xs text-muted-foreground mb-2">Compute Location</p>
-                        <p className="text-sm">{result.carbon_data.compute_location || "Unknown"}</p>
-                      </div>
+                            {(cd.methodology || result.methodology) && (
+                              <div className="rounded-lg border border-border/40 bg-muted/20 px-3 py-2.5 space-y-1.5">
+                                <div className="flex items-center gap-1.5">
+                                  <Info className="w-3.5 h-3.5 text-muted-foreground" />
+                                  <p className="text-xs font-medium text-muted-foreground">
+                                    Methodology
+                                  </p>
+                                </div>
+                                <p className="text-xs text-muted-foreground leading-relaxed">
+                                  {cd.methodology || result.methodology}
+                                </p>
+                              </div>
+                            )}
+                          </>
+                        )
+                      })()}
                     </div>
                   ) : showFailure ? (
                     <div className="text-sm text-red-400 space-y-2">
@@ -417,7 +568,7 @@ function ResultsContent() {
                     </TabsList>
 
                     <TabsContent value="summary" className="space-y-4">
-                      <Card className="p-6 bg-card/50 border-border/50">
+                      <Card className="p-6 md:p-8 bg-card/50 border-border/50">
                         <div className="flex gap-4 mb-6">
                           <Button
                             size="sm"
@@ -438,82 +589,73 @@ function ResultsContent() {
                             Download
                           </Button>
                         </div>
-                        <div className="prose prose-invert max-w-none">
-                          <div className="text-sm leading-relaxed whitespace-pre-wrap text-foreground">
-                            {result?.final_summary}
-                          </div>
+                        <div className="mx-auto w-full max-w-3xl">
+                          <MarkdownContent content={result?.final_summary || ""} />
                         </div>
                       </Card>
                     </TabsContent>
 
                     <TabsContent value="chat" className="space-y-4">
-                      <Card className="p-6 bg-card/50 border-border/50 h-[600px] flex flex-col">
-                        <div className="flex-1 overflow-y-auto mb-4 space-y-4 p-2">
+                      <Card className="p-4 md:p-6 bg-card/50 border-border/50 h-[680px] flex flex-col">
+                        <div className="flex-1 overflow-y-auto mb-4 space-y-4 p-1 md:p-2">
                           {chatMessages.map((msg, idx) => (
                             <div
                               key={idx}
                               className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
                             >
                               <div
-                                className={`max-w-[85%] rounded-lg p-3 space-y-2 ${
+                                className={`w-full rounded-xl p-3 md:p-4 space-y-1 ${
                                   msg.role === "user"
-                                    ? "bg-primary text-primary-foreground"
-                                    : "bg-muted"
+                                    ? "max-w-[85%] bg-primary text-primary-foreground"
+                                    : "max-w-[95%] bg-muted/70"
                                 }`}
                               >
-                                <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
-                                {msg.role === "assistant" && msg.meta ? (
-                                  <div className="pt-2 border-t border-border/40 space-y-1.5 text-xs text-muted-foreground">
-                                    {msg.meta.model_used ? (
-                                      <p>
-                                        Model:{" "}
-                                        <span className="text-foreground/80">{msg.meta.model_used}</span>
-                                      </p>
+                                {msg.role === "user" ? (
+                                  <p className="text-sm whitespace-pre-wrap leading-relaxed">
+                                    {msg.content}
+                                  </p>
+                                ) : (
+                                  <>
+                                    <MarkdownContent content={msg.content} compact />
+                                    {msg.meta ? (
+                                      <>
+                                        <AnswerSources
+                                          sources={msg.meta.sources}
+                                          retrievedChunks={msg.meta.retrieved_chunks}
+                                        />
+                                        <AnswerMetaFooter
+                                          modelUsed={msg.meta.model_used}
+                                          confidence={msg.meta.confidence}
+                                          latencyMs={msg.meta.latency_ms}
+                                          documentsRetrieved={
+                                            msg.meta.sources?.length ??
+                                            msg.meta.retrieved_chunks?.length ??
+                                            null
+                                          }
+                                          carbonSavedGrams={
+                                            result?.carbon_data?.carbon_saved_grams
+                                          }
+                                        />
+                                        <DeveloperDetails
+                                          reasoningPath={msg.meta.reasoning_path}
+                                          retrievedChunks={msg.meta.retrieved_chunks}
+                                          modelUsed={msg.meta.model_used}
+                                          skill={msg.meta.skill}
+                                          confidence={msg.meta.confidence}
+                                          latencyMs={msg.meta.latency_ms}
+                                          entitiesUsed={msg.meta.entities_used}
+                                          missingContext={msg.meta.missing_context}
+                                          knowledgeSources={msg.meta.knowledge_sources}
+                                          documentsRetrieved={
+                                            msg.meta.sources?.length ??
+                                            msg.meta.retrieved_chunks?.length ??
+                                            null
+                                          }
+                                        />
+                                      </>
                                     ) : null}
-                                    {msg.meta.confidence != null ? (
-                                      <p>
-                                        Confidence:{" "}
-                                        <span className="text-foreground/80">
-                                          {(msg.meta.confidence * 100).toFixed(0)}%
-                                        </span>
-                                      </p>
-                                    ) : null}
-                                    {msg.meta.reasoning_path && msg.meta.reasoning_path.length > 0 ? (
-                                      <div>
-                                        <p className="mb-0.5">Reasoning path</p>
-                                        <ul className="list-disc pl-4 space-y-0.5">
-                                          {msg.meta.reasoning_path.map((step, i) => (
-                                            <li key={i}>{step}</li>
-                                          ))}
-                                        </ul>
-                                      </div>
-                                    ) : null}
-                                    {msg.meta.entities_used && msg.meta.entities_used.length > 0 ? (
-                                      <p>
-                                        Entities:{" "}
-                                        <span className="text-foreground/80">
-                                          {msg.meta.entities_used.join(", ")}
-                                        </span>
-                                      </p>
-                                    ) : null}
-                                    {msg.meta.missing_context &&
-                                    msg.meta.missing_context.length > 0 ? (
-                                      <p className="text-amber-300/90">
-                                        Missing context: {msg.meta.missing_context.join("; ")}
-                                      </p>
-                                    ) : null}
-                                    {msg.meta.sources && msg.meta.sources.length > 0 ? (
-                                      <div>
-                                        <p className="mb-0.5">Sources</p>
-                                        <ul className="list-disc pl-4 space-y-0.5">
-                                          {msg.meta.sources.slice(0, 2).map((s, i) => (
-                                            <li key={i}>{s.substring(0, 150)}…</li>
-                                          ))}
-                                        </ul>
-                                      </div>
-                                    ) : null}
-                                  </div>
-                                ) : null}
+                                  </>
+                                )}
                               </div>
                             </div>
                           ))}
@@ -539,6 +681,25 @@ function ResultsContent() {
                 )}
               </motion.div>
             </div>
+
+            {frontier?.summary_cards && frontier.comparison_models?.length ? (
+              <div className="mt-2 mb-4">
+                <CarbonComparisonDashboard
+                  comparisonModels={frontier.comparison_models}
+                  ourSystem={frontier.our_system}
+                  summaryCards={frontier.summary_cards}
+                  badges={frontier.badges}
+                  chartBars={frontier.chart_bars}
+                  methodology={
+                    frontier.methodology ||
+                    result?.methodology ||
+                    result?.carbon_data?.methodology
+                  }
+                  breakdown={result?.carbon_data?.breakdown || null}
+                  carbonData={result?.carbon_data || null}
+                />
+              </div>
+            ) : null}
           </motion.div>
         </main>
       </div>

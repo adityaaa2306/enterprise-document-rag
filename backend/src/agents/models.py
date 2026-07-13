@@ -1,6 +1,7 @@
 import logging
+import re
 import time
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 
 import httpx
 import requests
@@ -12,6 +13,27 @@ log = logging.getLogger(__name__)
 
 # Global registry — clients/models loaded once at startup
 models_registry: Dict[str, Any] = {}
+
+
+_OUTER_MD_FENCE_RE = re.compile(
+    r"^```(?:markdown|md|gfm)?\s*\r?\n([\s\S]*?)\r?\n```\s*$",
+    re.IGNORECASE,
+)
+_OUTER_MD_FENCE_LOOSE_RE = re.compile(
+    r"^```(?:markdown|md|gfm)?\s*\r?\n([\s\S]*?)```\s*$",
+    re.IGNORECASE,
+)
+
+
+def strip_outer_markdown_fence(text: str) -> str:
+    """Unwrap a whole-document ```markdown ... ``` wrapper if present."""
+    s = (text or "").strip()
+    if not s.startswith("```"):
+        return text or ""
+    m = _OUTER_MD_FENCE_RE.match(s) or _OUTER_MD_FENCE_LOOSE_RE.match(s)
+    if m:
+        return m.group(1).rstrip()
+    return text or ""
 
 
 class NimApiError(RuntimeError):
@@ -27,9 +49,13 @@ class NimApiError(RuntimeError):
 # NIM client bootstrap
 # ---------------------------------------------------------------------------
 
-def _nim_timeout() -> httpx.Timeout:
-    read = float(getattr(settings, "NIM_HTTP_TIMEOUT_SEC", 90.0) or 90.0)
-    connect = float(getattr(settings, "NIM_CONNECT_TIMEOUT_SEC", 10.0) or 10.0)
+def _nim_timeout(*, read_override: Optional[float] = None) -> httpx.Timeout:
+    read = float(
+        read_override
+        if read_override is not None
+        else (getattr(settings, "NIM_HTTP_TIMEOUT_SEC", 90.0) or 90.0)
+    )
+    connect = float(getattr(settings, "NIM_CONNECT_TIMEOUT_SEC", 15.0) or 15.0)
     return httpx.Timeout(read, connect=connect)
 
 
@@ -123,65 +149,255 @@ def _classify_nim_exception(exc: BaseException, *, model_id: str) -> Exception:
 # Within-tier chat fallback
 # ---------------------------------------------------------------------------
 
+def _http_status_from_exc(exc: BaseException) -> Optional[int]:
+    if isinstance(exc, NimApiError) and exc.status_code is not None:
+        return int(exc.status_code)
+    if isinstance(exc, APIStatusError):
+        return int(getattr(exc, "status_code", 0) or 0) or None
+    err = str(exc)
+    for code in (429, 504, 503, 502, 500):
+        if str(code) in err:
+            return code
+    if isinstance(exc, (APITimeoutError, httpx.TimeoutException)):
+        return 408  # request timeout (synthetic)
+    return None
+
+
 def call_chat_with_fallback(
     model_ids: List[str],
     messages: List[Dict[str, str]],
     *,
     temperature: float = 0.5,
     max_tokens: int = 2000,
-    max_retries_per_model: int = 2,
-) -> Tuple[str, Optional[str]]:
+    max_retries_per_model: Optional[int] = None,
+    return_timing: bool = False,
+    timeout: Optional[httpx.Timeout] = None,
+    call_meta: Optional[Dict[str, Any]] = None,
+) -> Union[Tuple[str, Optional[str]], Tuple[str, Optional[str], Dict[str, Any]]]:
     """
     Try each model in order. On rate-limit / HTTP / empty errors, fall through
     to the next model. Returns (text, model_id_used) or raises if all fail.
 
+    When ``return_timing=True``, uses the streaming API only to measure
+    time-to-first-token vs time-to-last-token (client still gets a full
+    blocking response upstream). Returns
+    ``(text, model_id, {"ttft_ms", "ttlt_ms", "mode"})``.
+
+    When ``call_meta`` dict is provided, it is filled with diagnostic fields:
+    attempt log, retry_count, http_status on last failure, call_ms, model_id.
+
     Timeouts, connection errors, and HTTP 5xx are classified as NimApiError
-    so callers can soft-fail optional steps or hard-fail essential ones.
+    and retried on the same model before falling through.
     """
     client = get_nim_client()
     if client is None:
         raise RuntimeError("NVIDIA NIM client is not configured (missing NVIDIA_API_KEY).")
 
-    last_error: Optional[Exception] = None
-    timeout = _nim_timeout()
+    if max_retries_per_model is None:
+        max_retries_per_model = int(getattr(settings, "NIM_TRANSIENT_RETRIES", 3) or 3)
+    max_retries_per_model = max(1, int(max_retries_per_model))
 
-    for model_id in model_ids:
+    last_error: Optional[Exception] = None
+    req_timeout = timeout or _nim_timeout()
+    t_call0 = time.perf_counter()
+    attempts_log: List[Dict[str, Any]] = []
+    retry_count = 0
+    last_http_status: Optional[int] = None
+
+    # De-dupe while preserving order
+    seen: set = set()
+    ordered_ids: List[str] = []
+    for mid in model_ids or []:
+        if mid and mid not in seen:
+            seen.add(mid)
+            ordered_ids.append(mid)
+
+    for model_id in ordered_ids:
         for attempt in range(max_retries_per_model):
+            t_attempt = time.perf_counter()
             try:
-                completion = client.chat.completions.create(
-                    model=model_id,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    timeout=timeout,
-                )
-                text = (completion.choices[0].message.content or "").strip()
+                if return_timing:
+                    text, timing = _chat_completion_with_ttft(
+                        client,
+                        model_id=model_id,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        timeout=req_timeout,
+                    )
+                else:
+                    completion = client.chat.completions.create(
+                        model=model_id,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        timeout=req_timeout,
+                    )
+                    text = (completion.choices[0].message.content or "").strip()
+                    timing = None
                 if not text:
                     raise ValueError(f"Empty response from {model_id}")
+                attempt_ms = (time.perf_counter() - t_attempt) * 1000.0
+                attempts_log.append(
+                    {
+                        "model_id": model_id,
+                        "attempt": attempt + 1,
+                        "ok": True,
+                        "duration_ms": round(attempt_ms, 1),
+                        "http_status": 200,
+                        "error": None,
+                    }
+                )
                 log.info(f"Chat succeeded with model '{model_id}'")
+                if call_meta is not None:
+                    call_meta.update(
+                        {
+                            "model_id": model_id,
+                            "retry_count": retry_count,
+                            "attempt_count": len(attempts_log),
+                            "http_status": None,
+                            "call_ms": round((time.perf_counter() - t_call0) * 1000.0, 1),
+                            "attempts": attempts_log,
+                            "success": True,
+                        }
+                    )
+                if return_timing:
+                    return text, model_id, timing or {}
                 return text, model_id
             except Exception as e:
                 classified = _classify_nim_exception(e, model_id=model_id)
                 last_error = classified if isinstance(classified, Exception) else e
                 err_str = str(e)
-                is_rate_limit = "429" in err_str or "rate" in err_str.lower()
-                if is_rate_limit and attempt < max_retries_per_model - 1:
-                    wait = 3 * (attempt + 1)
+                http_status = _http_status_from_exc(classified)
+                if http_status is None:
+                    http_status = _http_status_from_exc(e)
+                last_http_status = http_status
+                attempt_ms = (time.perf_counter() - t_attempt) * 1000.0
+                attempts_log.append(
+                    {
+                        "model_id": model_id,
+                        "attempt": attempt + 1,
+                        "ok": False,
+                        "duration_ms": round(attempt_ms, 1),
+                        "http_status": http_status,
+                        "error": f"{type(classified).__name__}: {str(classified)[:180]}",
+                    }
+                )
+                is_rate_limit = (
+                    http_status == 429
+                    or "429" in err_str
+                    or "rate" in err_str.lower()
+                )
+                transient = is_transient_nim_error(classified) or is_rate_limit
+
+                if transient and attempt < max_retries_per_model - 1:
+                    retry_count += 1
+                    wait = (3 * (attempt + 1)) if is_rate_limit else (2 ** attempt)
                     log.warning(
-                        f"Rate limit on {model_id}. Retrying in {wait}s "
-                        f"(attempt {attempt + 1}/{max_retries_per_model})..."
+                        "Transient NIM error on %s (%s). Retrying in %ss "
+                        "(attempt %s/%s)...",
+                        model_id,
+                        type(classified).__name__,
+                        wait,
+                        attempt + 1,
+                        max_retries_per_model,
                     )
                     time.sleep(wait)
                     continue
+
                 log.warning(
                     f"Model '{model_id}' failed ({type(classified).__name__}): {classified}. "
                     f"Trying next fallback if any."
                 )
                 break  # next model
 
+    if call_meta is not None:
+        call_meta.update(
+            {
+                "model_id": None,
+                "retry_count": retry_count,
+                "attempt_count": len(attempts_log),
+                "http_status": last_http_status,
+                "call_ms": round((time.perf_counter() - t_call0) * 1000.0, 1),
+                "attempts": attempts_log,
+                "success": False,
+                "error": str(last_error)[:300] if last_error else None,
+            }
+        )
+
     raise RuntimeError(
-        f"All models failed ({model_ids}). Last error: {last_error}"
+        f"All models failed ({ordered_ids}). Last error: {last_error}"
     ) from last_error
+
+
+def _chat_completion_with_ttft(
+    client: OpenAI,
+    *,
+    model_id: str,
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    timeout: httpx.Timeout,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Stream the completion solely to separate TTFT from TTLT.
+    Accumulates the full text; does not change the upstream response shape.
+    Falls back to a blocking call if streaming is unsupported.
+    """
+    t0 = time.perf_counter()
+    ttft_ms: Optional[float] = None
+    parts: List[str] = []
+    try:
+        stream = client.chat.completions.create(
+            model=model_id,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            stream=True,
+        )
+        for chunk in stream:
+            try:
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+            except (IndexError, AttributeError):
+                delta = None
+            if delta:
+                if ttft_ms is None:
+                    ttft_ms = (time.perf_counter() - t0) * 1000.0
+                parts.append(delta)
+        text = "".join(parts).strip()
+        ttlt_ms = (time.perf_counter() - t0) * 1000.0
+        if ttft_ms is None:
+            # Empty deltas until end, or provider buffered — TTFT ≈ TTLT
+            ttft_ms = ttlt_ms
+        return text, {
+            "ttft_ms": round(ttft_ms, 3),
+            "ttlt_ms": round(ttlt_ms, 3),
+            "mode": "stream_measure",
+        }
+    except Exception as e:
+        # Streaming unsupported / failed — fall back to blocking (TTFT == TTLT)
+        log.warning(
+            "Streaming TTFT measure failed for %s (%s); using blocking call.",
+            model_id,
+            type(e).__name__,
+        )
+        t1 = time.perf_counter()
+        completion = client.chat.completions.create(
+            model=model_id,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+        text = (completion.choices[0].message.content or "").strip()
+        elapsed = (time.perf_counter() - t1) * 1000.0
+        return text, {
+            "ttft_ms": round(elapsed, 3),
+            "ttlt_ms": round(elapsed, 3),
+            "mode": "blocking_ttft_equals_ttlt",
+            "stream_error": str(e)[:200],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -189,8 +405,10 @@ def call_chat_with_fallback(
 # ---------------------------------------------------------------------------
 
 _SUMMARIZE_SYSTEM = (
-    "You are an expert summarization model. Provide a concise, factual summary. "
-    "Do not add preamble, introduction, or conversational fluff."
+    "You are an expert summarization model. Provide a concise, factual summary "
+    "in clean GitHub-Flavored Markdown (headings, bullets, bold where helpful). "
+    "Do not add preamble, introduction, or conversational fluff. "
+    "Never wrap the whole answer in a code fence. Never output HTML."
 )
 
 
@@ -212,16 +430,35 @@ def run_tier_summarizer(
     state: dict,
     tier: str = "light",
     model_ids: Optional[List[str]] = None,
+    call_meta: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Summarize with an explicit tier (and optional model chain from the router).
     """
     if get_nim_client() is None:
         log.warning("Summarizer unavailable (NIM client not configured).")
+        if call_meta is not None:
+            call_meta.update(
+                {
+                    "success": False,
+                    "error": "NIM client not configured",
+                    "model_id": None,
+                    "retry_count": 0,
+                    "attempt_count": 0,
+                    "http_status": None,
+                    "call_ms": 0.0,
+                    "attempts": [],
+                }
+            )
         return "Error: Summarizer not loaded."
 
     chain = model_ids or _models_for_tier(tier)
-    prompt = f"Summarize the following text factually and concisely.\n\nTEXT:\n{text}\n\nSUMMARY:"
+    prompt = (
+        "Summarize the following text factually and concisely in GitHub-Flavored Markdown.\n"
+        "Use short paragraphs and bullets when helpful. Do not wrap the whole answer in a "
+        "code fence.\n\n"
+        f"TEXT:\n{text}\n\nSUMMARY:"
+    )
     max_tokens = {"light": 300, "medium": 500, "heavy": 800}.get((tier or "light").lower(), 300)
     try:
         result, used = call_chat_with_fallback(
@@ -232,6 +469,7 @@ def run_tier_summarizer(
             ],
             temperature=0.3,
             max_tokens=max_tokens,
+            call_meta=call_meta,
         )
         key = _usage_key(tier)
         state.setdefault("model_usage_chars", {"light": 0, "medium": 0, "large": 0})
@@ -243,6 +481,19 @@ def run_tier_summarizer(
         return result
     except Exception as e:
         log.error(f"Error in {tier} summarizer: {e}")
+        if call_meta is not None and not call_meta.get("attempts"):
+            call_meta.update(
+                {
+                    "success": False,
+                    "error": str(e)[:300],
+                    "model_id": None,
+                    "retry_count": call_meta.get("retry_count", 0),
+                    "attempt_count": call_meta.get("attempt_count", 0),
+                    "http_status": call_meta.get("http_status"),
+                    "call_ms": call_meta.get("call_ms", 0.0),
+                    "attempts": call_meta.get("attempts") or [],
+                }
+            )
         return "Summary generation failed."
 
 
@@ -256,22 +507,75 @@ def run_medium_summarizer(text: str, state: dict) -> str:
     return run_tier_summarizer(text, state, tier="medium")
 
 
-def run_compile_with_models(
-    text_of_summaries: str,
-    state: dict,
-    model_ids: Optional[List[str]] = None,
-) -> str:
-    """Compile chunk summaries using router-selected compile chain."""
-    if get_nim_client() is None:
-        log.warning("Compile model unavailable. Falling back to medium summarizer.")
-        return run_medium_summarizer(text_of_summaries, state)
+_COMPILE_SYSTEM = (
+    "You are a helpful assistant that writes polished "
+    "GitHub-Flavored Markdown summaries."
+)
 
-    chain = model_ids or settings.heavy_models()
-    prompt = f"""
+_FAILED_SUMMARY_MARKERS = (
+    "summary generation failed",
+    "error: summarizer not loaded",
+    "final summary generation failed",
+)
+
+
+def _is_usable_summary(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    low = t.lower()
+    return not any(m in low for m in _FAILED_SUMMARY_MARKERS)
+
+
+def _normalize_compile_summaries(
+    text_of_summaries: Union[str, List[str]],
+) -> List[str]:
+    if isinstance(text_of_summaries, list):
+        raw = [str(s or "") for s in text_of_summaries]
+    else:
+        raw = [p.strip() for p in str(text_of_summaries or "").split("\n\n") if p.strip()]
+    usable = [s.strip() for s in raw if _is_usable_summary(s)]
+    return usable
+
+
+def _compile_model_chains(primary: Optional[List[str]]) -> List[List[str]]:
+    """Ordered unique model chains: primary tier → medium → light."""
+    chains: List[List[str]] = []
+    for chain in (
+        list(primary or []) or list(settings.heavy_models()),
+        list(settings.medium_models()),
+        list(settings.light_models()),
+    ):
+        cleaned: List[str] = []
+        seen: set = set()
+        for mid in chain:
+            if mid and mid not in seen:
+                seen.add(mid)
+                cleaned.append(mid)
+        if cleaned and cleaned not in chains:
+            chains.append(cleaned)
+    return chains
+
+
+def _build_compile_prompt(text_of_summaries: str, *, intermediate: bool = False) -> str:
+    if intermediate:
+        return f"""
+You are an expert editor. Synthesize the following partial summaries into one
+coherent intermediate summary in GitHub-Flavored Markdown.
+Use only the information present. Do not invent facts. Never wrap the whole
+answer in a code fence. Never output HTML.
+
+PARTIAL SUMMARIES:
+{text_of_summaries}
+
+INTERMEDIATE SUMMARY:
+""".strip()
+
+    return f"""
 You are an expert editor. You will be given a large collection of
 small, disconnected summaries from a document.
 Your job is to synthesize these summaries into a single,
-coherent, well-written executive summary.
+coherent, well-written executive summary in GitHub-Flavored Markdown.
 
 CRITICAL INSTRUCTIONS:
 - STRICTLY use ONLY the information present in the summaries below
@@ -280,37 +584,221 @@ CRITICAL INSTRUCTIONS:
 - Synthesize the provided summaries into a cohesive narrative
 - Be concise, accurate, and factual
 - If the summaries are about a specific topic, stay focused on that topic only
+- Use ## headings, bullet lists, and tables when they improve clarity
+- Never wrap the entire answer in a triple-backtick code fence
+- Never output HTML
+
+Suggested structure:
+## Summary
+## Key Findings
+## Details
+## Metrics
+(use a Markdown table if metrics appear in the source)
 
 SUMMARIES:
 {text_of_summaries}
 
 EXECUTIVE SUMMARY:
-"""
+""".strip()
+
+
+def _compile_timeout() -> httpx.Timeout:
+    read = float(getattr(settings, "NIM_COMPILE_TIMEOUT_SEC", 180.0) or 180.0)
+    return _nim_timeout(read_override=read)
+
+
+def _call_compile_llm(
+    text_of_summaries: str,
+    chain: List[str],
+    *,
+    intermediate: bool = False,
+) -> Tuple[str, Optional[str]]:
+    messages = [
+        {"role": "system", "content": _COMPILE_SYSTEM},
+        {
+            "role": "user",
+            "content": _build_compile_prompt(text_of_summaries, intermediate=intermediate),
+        },
+    ]
+    # One retry only — long compile prompts must fall through quickly if a model stalls.
+    return call_chat_with_fallback(
+        chain,
+        messages,
+        temperature=0.5,
+        max_tokens=1600 if intermediate else 2000,
+        max_retries_per_model=1,
+        timeout=_compile_timeout(),
+    )
+
+
+def _estimate_compile_tokens(text: str) -> int:
     try:
-        result, used = call_chat_with_fallback(
-            chain,
-            [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.5,
-            max_tokens=2000,
+        from src.chunking.service import estimate_tokens
+
+        return int(estimate_tokens(text) or 0)
+    except Exception:
+        return max(1, len(text or "") // 4)
+
+
+def _hierarchical_compile(
+    summaries: List[str],
+    chains: List[List[str]],
+    state: dict,
+) -> str:
+    """
+    Batch large summary sets into intermediate compiles, then final compile.
+    Falls through model chains on each step.
+    """
+    batch_size = max(3, int(getattr(settings, "COMPILE_BATCH_SIZE", 8) or 8))
+    max_tokens = int(getattr(settings, "COMPILE_MAX_INPUT_TOKENS", 10000) or 10000)
+
+    working = list(summaries)
+    round_idx = 0
+    while True:
+        joined = "\n\n".join(working)
+        tokens = _estimate_compile_tokens(joined)
+        if len(working) <= batch_size and tokens <= max_tokens:
+            break
+        if len(working) <= 2:
+            break
+
+        round_idx += 1
+        log.info(
+            "Compile hierarchical round %s: %s summaries (~%s tokens) → batches of %s",
+            round_idx,
+            len(working),
+            tokens,
+            batch_size,
         )
-        state.setdefault("model_usage_chars", {"light": 0, "medium": 0, "large": 0})
-        state["model_usage_chars"]["large"] = state["model_usage_chars"].get("large", 0) + len(
-            text_of_summaries
+        next_level: List[str] = []
+        batch_total = (len(working) + batch_size - 1) // batch_size
+        for bi, i in enumerate(range(0, len(working), batch_size), start=1):
+            batch = working[i : i + batch_size]
+            batch_text = "\n\n".join(batch)
+            last_err: Optional[Exception] = None
+            produced = False
+            job_id = state.get("job_id")
+            if job_id:
+                try:
+                    from db import jobs as jobs_db
+
+                    jobs_db.set_progress(
+                        job_id,
+                        min(90.0, 82.0 + (8.0 * bi / max(batch_total, 1))),
+                        f"Compiling summary batches... ({bi}/{batch_total})",
+                    )
+                except Exception:
+                    pass
+            log.info(
+                "Compile round %s batch %s/%s (~%s tokens) models=%s",
+                round_idx,
+                bi,
+                batch_total,
+                _estimate_compile_tokens(batch_text),
+                [c[0] for c in chains if c],
+            )
+            for chain in chains:
+                try:
+                    text, used = _call_compile_llm(batch_text, chain, intermediate=True)
+                    next_level.append(text)
+                    produced = True
+                    state.setdefault("model_usage_chars", {"light": 0, "medium": 0, "large": 0})
+                    state["model_usage_chars"]["large"] = (
+                        state["model_usage_chars"].get("large", 0) + len(batch_text)
+                    )
+                    if used:
+                        state.setdefault("models_used", [])
+                        if used not in state["models_used"]:
+                            state["models_used"].append(used)
+                    break
+                except Exception as e:
+                    last_err = e
+                    log.warning("Intermediate compile batch failed on %s: %s", chain, e)
+            if not produced:
+                # Keep raw batch text so final pass still has content
+                log.error(
+                    "Intermediate compile dropped to raw batch after failures: %s",
+                    last_err,
+                )
+                next_level.append(batch_text)
+        working = next_level
+
+    final_text = "\n\n".join(working)
+    last_error: Optional[Exception] = None
+    for chain in chains:
+        try:
+            result, used = _call_compile_llm(final_text, chain, intermediate=False)
+            state.setdefault("model_usage_chars", {"light": 0, "medium": 0, "large": 0})
+            state["model_usage_chars"]["large"] = (
+                state["model_usage_chars"].get("large", 0) + len(final_text)
+            )
+            if used:
+                state.setdefault("models_used", [])
+                if used not in state["models_used"]:
+                    state["models_used"].append(used)
+            return result
+        except Exception as e:
+            last_error = e
+            log.warning("Final compile chain %s failed: %s", chain, e)
+
+    raise RuntimeError(f"All compile chains failed. Last error: {last_error}") from last_error
+
+
+def run_compile_with_models(
+    text_of_summaries: Union[str, List[str]],
+    state: dict,
+    model_ids: Optional[List[str]] = None,
+) -> str:
+    """
+    Compile chunk summaries using the router-selected chain, with:
+    - hierarchical batching for large documents
+    - cross-tier fallback (primary → medium → light)
+    - longer NIM timeout + transient retries
+    """
+    if get_nim_client() is None:
+        log.warning("Compile model unavailable. Falling back to medium summarizer.")
+        joined = (
+            "\n\n".join(text_of_summaries)
+            if isinstance(text_of_summaries, list)
+            else str(text_of_summaries or "")
         )
-        if used:
-            state.setdefault("models_used", [])
-            if used not in state["models_used"]:
-                state["models_used"].append(used)
-        return result
+        return run_medium_summarizer(joined, state)
+
+    summaries = _normalize_compile_summaries(text_of_summaries)
+    if not summaries:
+        return (
+            "Unable to generate a final summary because no usable chunk summaries "
+            "were produced. Please retry the upload."
+        )
+
+    chains = _compile_model_chains(model_ids)
+    log.info(
+        "Compile starting: summaries=%s tokens≈%s primary_models=%s",
+        len(summaries),
+        _estimate_compile_tokens("\n\n".join(summaries)),
+        [c[0] for c in chains if c],
+    )
+
+    try:
+        return strip_outer_markdown_fence(
+            _hierarchical_compile(summaries, chains, state)
+        )
     except Exception as e:
         log.error(f"Error in compile: {e}")
+        # Last-resort: stitch usable chunk summaries so the job still has content
+        stitched = "\n\n".join(f"- {s}" for s in summaries[:40])
+        if stitched.strip():
+            log.warning("Returning stitched chunk-summary fallback after compile failure")
+            return (
+                "## Summary\n\n"
+                "The executive compile step could not reach NVIDIA NIM heavy models, "
+                "so this is a stitched fallback from chunk summaries:\n\n"
+                f"{stitched}"
+            )
         return f"Final summary generation failed: {e}"
 
 
-def run_large_model_compile(text_of_summaries: str, state: dict) -> str:
+def run_large_model_compile(text_of_summaries: Union[str, List[str]], state: dict) -> str:
     """Heavy-tier: compile chunk summaries into one executive summary."""
     return run_compile_with_models(text_of_summaries, state, settings.heavy_models())
 
@@ -334,6 +822,8 @@ def run_large_model_rag(
     prompt = f"""
 You are an expert Q&A assistant. Answer the user's query *only* based on
 the provided context. Be concise and factual.
+Reply in clean GitHub-Flavored Markdown (headings, bullets, tables when useful).
+Never wrap the entire answer in a code fence. Never output HTML.
 
 CONTEXT:
 {context_str}
@@ -347,7 +837,13 @@ ANSWER:
         result, _ = call_chat_with_fallback(
             settings.heavy_models(),
             [
-                {"role": "system", "content": "You are a helpful assistant."},
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a helpful assistant that answers in "
+                        "GitHub-Flavored Markdown."
+                    ),
+                },
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
@@ -357,7 +853,7 @@ ANSWER:
             sources = [chunk.content for chunk in context_chunks]
         else:
             sources = [context_str] if context_str else []
-        return result, sources
+        return strip_outer_markdown_fence(result), sources
     except Exception as e:
         log.error(f"Error in RAG model: {e}")
         return "Failed to generate answer.", []

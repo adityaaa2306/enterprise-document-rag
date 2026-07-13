@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Dict, List
 
+from src.agents.prompting import MARKDOWN_OUTPUT_RULES
 from src.agents.skills.registry import SkillSpec, register
 from src.context.assembler import ContextPack
 
@@ -10,9 +11,16 @@ from src.context.assembler import ContextPack
 def build_messages(query: str, pack: ContextPack) -> List[Dict[str, str]]:
     context = pack.context_text or ""
     user = f"""From the context, extract a chronological timeline relevant to the query.
-Use bullet points with dates/order when available. If dates are missing, order by
-narrative sequence and note uncertainty. Cite [n] markers. If insufficient evidence,
-say so.
+Use a Markdown numbered or bulleted list with dates/order when available. If dates are
+missing, order by narrative sequence and note uncertainty. Cite [n] markers. If
+insufficient evidence, say so.
+
+{MARKDOWN_OUTPUT_RULES}
+
+Prefer:
+## Timeline
+1. **Date/Order** — event description [n]
+## Notes
 
 QUERY:
 {query}
@@ -26,7 +34,7 @@ TIMELINE:"""
             "role": "system",
             "content": (
                 "You extract timelines from provided context only. "
-                "Do not invent dates or events."
+                "Do not invent dates or events. Always reply in GitHub-Flavored Markdown."
             ),
         },
         {"role": "user", "content": user},

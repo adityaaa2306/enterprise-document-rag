@@ -48,9 +48,9 @@ def test_title_creates_section_parents():
         _El("Title", "Methods"),
         _El("Text", "Second body under methods with enough tokens here too."),
     ]
-    chunks, parents, meta = ChunkingService(max_tokens=500, sim_threshold=0.0).build(
-        elements, document_id="doc2"
-    )
+    chunks, parents, meta = ChunkingService(
+        max_tokens=500, sim_threshold=0.0, title_as_chunk=True
+    ).build(elements, document_id="doc2")
     assert meta["section_count"] >= 2
     titles = {p.title for p in parents}
     assert "Introduction" in titles
@@ -79,16 +79,44 @@ def test_token_budget_splits_long_section():
 def test_similarity_split_with_lexical_fallback():
     elements = [
         _El("Title", "Topics"),
-        _El("Text", "Quantum entanglement photon polarization experiment results."),
-        _El("Text", "Chocolate cake recipe flour sugar butter oven temperature."),
+        _El("Text", "Quantum entanglement photon polarization experiment results. " * 40),
+        _El("Text", "Chocolate cake recipe flour sugar butter oven temperature. " * 40),
     ]
-    # High threshold → force split on low overlap
-    chunks, _, _ = ChunkingService(max_tokens=2000, sim_threshold=0.5).build(
-        elements, document_id="doc4"
-    )
+    # High threshold + low min fill → force split on low overlap once buffer is full enough
+    chunks, _, _ = ChunkingService(
+        max_tokens=2000,
+        sim_threshold=0.5,
+        min_tokens_before_sim_split=50,
+        title_as_chunk=True,
+    ).build(elements, document_id="doc4")
     body = [c for c in chunks if c.type != "Title"]
     assert len(body) >= 2
     assert _lexical_overlap(body[0].content, body[1].content) < 0.5
+
+
+def test_tiny_elements_do_not_explode_chunk_count():
+    """Regression: unstructured can emit thousands of short fragments."""
+    elements = [_El("Text", f"Short fragment number {i} about topic alpha.") for i in range(3000)]
+    chunks, _, meta = ChunkingService(max_tokens=800, max_chunk_count=48).build(
+        elements, document_id="doc-explosion"
+    )
+    assert len(chunks) <= 48
+    assert meta["chunk_count"] <= 48
+    assert meta["raw_chunk_count"] >= meta["chunk_count"]
+    assert all(c.content.strip() for c in chunks)
+
+
+def test_titles_fold_into_body_by_default():
+    elements = [
+        _El("Title", "Introduction"),
+        _El("Text", "First body under introduction with enough tokens here."),
+    ]
+    chunks, parents, _ = ChunkingService(max_tokens=500, sim_threshold=0.0).build(
+        elements, document_id="doc-title-fold"
+    )
+    assert any(p.title == "Introduction" for p in parents)
+    assert not any(c.type == "Title" for c in chunks)
+    assert any("Introduction" in c.content for c in chunks)
 
 
 def test_adaptive_chunk_has_content_for_downstream():
@@ -105,6 +133,9 @@ def test_flag_defaults():
     assert hasattr(settings, "USE_ADAPTIVE_CHUNKING")
     assert hasattr(settings, "CHUNK_MAX_TOKENS")
     assert hasattr(settings, "CHUNK_SIM_THRESHOLD")
+    assert hasattr(settings, "CHUNK_MAX_COUNT")
+    assert settings.CHUNK_MAX_COUNT <= 128
+    assert settings.CHUNK_MAX_TOKENS >= 512
 
 
 if __name__ == "__main__":

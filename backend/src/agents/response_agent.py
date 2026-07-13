@@ -199,21 +199,44 @@ class ResponseAgent:
                     debug={"nim_missing": True},
                 )
 
-            text, model_used = models.call_chat_with_fallback(
+            from src.monitoring.query_latency import (
+                STAGE_LLM_TTFT,
+                STAGE_LLM_TTLT,
+                STAGE_LLM_TOTAL,
+            )
+
+            text, model_used, llm_timing = models.call_chat_with_fallback(
                 model_ids,
                 messages,
                 temperature=skill.temperature,
                 max_tokens=skill.max_tokens,
+                return_timing=True,
             )
+            ttft = float(llm_timing.get("ttft_ms") or 0.0)
+            ttlt = float(llm_timing.get("ttlt_ms") or ttft)
             return ResponseResult(
-                answer=text,
+                answer=models.strip_outer_markdown_fence(text),
                 skill=skill_key,
                 intent=intent,
                 model_used=model_used,
                 tier=tier,
                 sources=pack.source_texts,
                 pack=pack,
-                debug={"model_chain": model_ids, "routing_used": bool(rd)},
+                debug={
+                    "model_chain": model_ids,
+                    "routing_used": bool(rd),
+                    "latency": {
+                        "stages_ms": {
+                            STAGE_LLM_TTFT: round(ttft, 3),
+                            STAGE_LLM_TTLT: round(ttlt, 3),
+                            STAGE_LLM_TOTAL: round(ttlt, 3),
+                        },
+                        "meta": {
+                            "llm_timing_mode": llm_timing.get("mode"),
+                            "stream_error": llm_timing.get("stream_error"),
+                        },
+                    },
+                },
             )
         except Exception as e:
             log.error(f"ResponseAgent generation failed: {e}")

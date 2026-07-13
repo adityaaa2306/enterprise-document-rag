@@ -2,14 +2,21 @@
 
 import { useEffect, useState } from "react"
 import { motion } from "framer-motion"
+import { useRouter } from "next/navigation"
 import { Sidebar } from "@/components/sidebar"
 import { TopBar } from "@/components/top-bar"
+import { Button } from "@/components/ui/button"
 import { API_BASE_URL } from "@/config"
-import { CheckCircle2, XCircle, Server } from "lucide-react"
+import { apiLogout } from "@/lib/api"
+import { useCurrentUser } from "@/hooks/use-current-user"
+import { CheckCircle2, XCircle, Server, User, LogOut, Mail } from "lucide-react"
 
 export default function SettingsPage() {
+  const router = useRouter()
+  const { user, loading: userLoading } = useCurrentUser()
   const [apiOk, setApiOk] = useState<boolean | null>(null)
   const [apiDetail, setApiDetail] = useState<string>("")
+  const [loggingOut, setLoggingOut] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -35,6 +42,16 @@ export default function SettingsPage() {
     }
   }, [])
 
+  const handleLogout = async () => {
+    setLoggingOut(true)
+    try {
+      await apiLogout(true)
+      router.push("/login")
+    } finally {
+      setLoggingOut(false)
+    }
+  }
+
   return (
     <div className="flex">
       <Sidebar />
@@ -46,6 +63,50 @@ export default function SettingsPage() {
             <p className="text-muted-foreground mb-8">
               Connection and account details for this portfolio deployment.
             </p>
+
+            <section className="rounded-lg border border-border bg-card p-6 space-y-4 mb-6">
+              <div className="flex items-start gap-3">
+                <User className="w-5 h-5 text-primary mt-0.5" />
+                <div className="min-w-0 flex-1">
+                  <h2 className="font-medium mb-1">Account</h2>
+                  <p className="text-sm text-muted-foreground">
+                    Your signed-in email for this browser session.
+                  </p>
+                </div>
+              </div>
+
+              <div className="pt-3 border-t border-border space-y-4">
+                <div className="rounded-lg bg-muted/40 border border-border px-4 py-3 space-y-1">
+                  <p className="text-xs text-muted-foreground">Email</p>
+                  {userLoading ? (
+                    <p className="text-sm text-muted-foreground">Loading account…</p>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <Mail className="w-4 h-4 text-muted-foreground shrink-0" />
+                      <span className="break-all font-medium text-foreground">
+                        {user?.email || "Not signed in"}
+                      </span>
+                    </div>
+                  )}
+                  {user?.full_name ? (
+                    <p className="text-sm text-muted-foreground pl-6 pt-1">
+                      {user.full_name}
+                    </p>
+                  ) : null}
+                </div>
+
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={handleLogout}
+                  disabled={loggingOut || userLoading}
+                  className="w-full sm:w-auto border-border text-destructive hover:text-destructive hover:bg-destructive/10"
+                >
+                  <LogOut className="w-4 h-4" />
+                  {loggingOut ? "Signing out…" : "Log out"}
+                </Button>
+              </div>
+            </section>
 
             <section className="rounded-lg border border-border bg-card p-6 space-y-4">
               <div className="flex items-start gap-3">
@@ -76,11 +137,6 @@ export default function SettingsPage() {
                 )}
               </div>
             </section>
-
-            <p className="text-xs text-muted-foreground mt-6">
-              Auth uses Bearer tokens stored in this browser. Use Log out in the
-              sidebar to clear the session.
-            </p>
           </motion.div>
         </main>
       </div>

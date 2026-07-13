@@ -4,13 +4,24 @@ RetrievalService — hybrid dense + BM25 → RRF → NIM rerank → parent expan
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.core.config import settings
 from src.agents import models
 from src.retrieval.bm25 import load_index, build_and_save
 from src.retrieval.rrf import reciprocal_rank_fusion
+from src.monitoring.query_latency import (
+    QueryLatencyTracker,
+    STAGE_BM25,
+    STAGE_DENSE,
+    STAGE_PARENT_EXPAND,
+    STAGE_QUERY_EMBED,
+    STAGE_RERANK,
+    STAGE_RETRIEVAL_TOTAL,
+    STAGE_RRF,
+)
 
 log = logging.getLogger(__name__)
 
@@ -55,17 +66,24 @@ class RetrievalService:
     ) -> RetrievalResult:
         top_k = top_k if top_k is not None else settings.RAG_TOP_K
         use_seed = settings.ENABLE_GRAPH_SEED if graph_seed is None else bool(graph_seed)
+        lat = QueryLatencyTracker()
+        t_retrieval = time.perf_counter()
 
         if not settings.ENABLE_HYBRID_RETRIEVAL:
-            return self._dense_only(query, document_id, top_k, graph_seed=use_seed)
+            return self._dense_only(
+                query, document_id, top_k, graph_seed=use_seed, lat=lat
+            )
 
         dense_k = settings.RAG_DENSE_K
         sparse_k = settings.RAG_SPARSE_K
         rrf_k = settings.RAG_RRF_K
         rerank_n = settings.RAG_RERANK_N
 
-        dense_ids, dense_map = self._dense_search(query, document_id, dense_k)
-        sparse_ids, sparse_map = self._sparse_search(query, document_id, sparse_k)
+        dense_ids, dense_map = self._dense_search(
+            query, document_id, dense_k, lat=lat
+        )
+        with lat.stage(STAGE_BM25):
+            sparse_ids, sparse_map = self._sparse_search(query, document_id, sparse_k)
 
         seed_ids: List[str] = []
         seed_map: Dict[str, str] = {}
@@ -76,7 +94,8 @@ class RetrievalService:
         if seed_ids:
             ranked_lists.append(seed_ids)
 
-        fused = reciprocal_rank_fusion(ranked_lists, k=60, top_n=rrf_k)
+        with lat.stage(STAGE_RRF):
+            fused = reciprocal_rank_fusion(ranked_lists, k=60, top_n=rrf_k)
         fused_ids = [doc_id for doc_id, _ in fused]
 
         # Build candidate passages (prefer text from either map)
@@ -102,12 +121,17 @@ class RetrievalService:
         if not candidates:
             # Fall back to dense-only if BM25 missing / empty
             log.warning("Hybrid fusion empty; falling back to dense-only")
-            return self._dense_only(query, document_id, top_k, graph_seed=use_seed)
+            return self._dense_only(
+                query, document_id, top_k, graph_seed=use_seed, lat=lat
+            )
 
         # Rerank top fused
         to_rerank = candidates[: max(rerank_n, top_k)]
         passages_text = [c.content for c in to_rerank]
-        reranked_texts = models.rerank(query, passages_text, top_k=min(top_k, len(passages_text)))
+        with lat.stage(STAGE_RERANK):
+            reranked_texts = models.rerank(
+                query, passages_text, top_k=min(top_k, len(passages_text))
+            )
 
         # Map back preserving first occurrence
         by_text = {}
@@ -135,7 +159,15 @@ class RetrievalService:
             )
 
         if settings.ENABLE_PARENT_EXPAND:
-            ranked = self._parent_expand(document_id, ranked, max_extra=settings.RAG_PARENT_EXPAND_MAX)
+            with lat.stage(STAGE_PARENT_EXPAND):
+                ranked = self._parent_expand(
+                    document_id, ranked, max_extra=settings.RAG_PARENT_EXPAND_MAX
+                )
+        else:
+            lat.set(STAGE_PARENT_EXPAND, 0.0)
+
+        lat.set(STAGE_RETRIEVAL_TOTAL, (time.perf_counter() - t_retrieval) * 1000.0)
+        lat.add_meta(retrieval_mode="hybrid")
 
         limit = top_k + (settings.RAG_PARENT_EXPAND_MAX if settings.ENABLE_PARENT_EXPAND else 0)
         debug = {
@@ -146,6 +178,7 @@ class RetrievalService:
             "graph_seed": bool(seed_ids),
             "fused_ids": fused_ids[:10],
             "returned": [p.chunk_id for p in ranked[:limit]],
+            "latency": lat.as_dict(),
         }
         return RetrievalResult(passages=ranked[:limit], debug=debug)
 
@@ -192,8 +225,19 @@ class RetrievalService:
         document_id: str,
         top_k: int,
         graph_seed: bool = False,
+        lat: Optional[QueryLatencyTracker] = None,
     ) -> RetrievalResult:
-        ids, id_to_text = self._dense_search(query, document_id, max(top_k, settings.RAG_CANDIDATE_K))
+        lat = lat or QueryLatencyTracker()
+        t_retrieval = time.perf_counter()
+        # Zero sparse/RRF when this path is used so breakdown tables stay aligned
+        if STAGE_BM25 not in lat.stages:
+            lat.set(STAGE_BM25, 0.0)
+        if STAGE_RRF not in lat.stages:
+            lat.set(STAGE_RRF, 0.0)
+
+        ids, id_to_text = self._dense_search(
+            query, document_id, max(top_k, settings.RAG_CANDIDATE_K), lat=lat
+        )
         seed_ids: List[str] = []
         if graph_seed and settings.ENABLE_GRAPH_SEED:
             seed_ids, seed_map = self._graph_seed(query, document_id)
@@ -203,14 +247,22 @@ class RetrievalService:
                     ids = [cid] + [i for i in ids if i != cid]
 
         if not ids:
+            lat.set(STAGE_RETRIEVAL_TOTAL, (time.perf_counter() - t_retrieval) * 1000.0)
+            lat.add_meta(retrieval_mode="dense_only", empty=True)
             return RetrievalResult(
                 passages=[],
-                debug={"mode": "dense_only", "empty": True, "seed_ids": seed_ids},
+                debug={
+                    "mode": "dense_only",
+                    "empty": True,
+                    "seed_ids": seed_ids,
+                    "latency": lat.as_dict(),
+                },
             )
 
         texts = [id_to_text[i] for i in ids if i in id_to_text]
         id_by_text = {id_to_text[i]: i for i in ids if i in id_to_text}
-        reranked = models.rerank(query, texts, top_k=top_k)
+        with lat.stage(STAGE_RERANK):
+            reranked = models.rerank(query, texts, top_k=top_k)
         passages = []
         for i, text in enumerate(reranked):
             cid = id_by_text.get(text, f"unknown_{i}")
@@ -226,28 +278,60 @@ class RetrievalService:
                 )
             )
         if settings.ENABLE_PARENT_EXPAND:
-            passages = self._parent_expand(document_id, passages, max_extra=settings.RAG_PARENT_EXPAND_MAX)
+            with lat.stage(STAGE_PARENT_EXPAND):
+                passages = self._parent_expand(
+                    document_id, passages, max_extra=settings.RAG_PARENT_EXPAND_MAX
+                )
+        else:
+            lat.set(STAGE_PARENT_EXPAND, 0.0)
+
+        lat.set(STAGE_RETRIEVAL_TOTAL, (time.perf_counter() - t_retrieval) * 1000.0)
+        lat.add_meta(retrieval_mode="dense_only")
         return RetrievalResult(
             passages=passages,
-            debug={"mode": "dense_only", "seed_ids": seed_ids[:10], "graph_seed": bool(seed_ids)},
+            debug={
+                "mode": "dense_only",
+                "seed_ids": seed_ids[:10],
+                "graph_seed": bool(seed_ids),
+                "latency": lat.as_dict(),
+            },
         )
 
     def _dense_search(
-        self, query: str, document_id: str, k: int
-    ) -> tuple[List[str], Dict[str, str]]:
+        self,
+        query: str,
+        document_id: str,
+        k: int,
+        lat: Optional[QueryLatencyTracker] = None,
+    ) -> Tuple[List[str], Dict[str, str]]:
         collection = _storage()._get_documents_collection()
         if not models.get_embedding_model():
+            if lat is not None:
+                lat.set(STAGE_QUERY_EMBED, 0.0)
+                lat.set(STAGE_DENSE, 0.0)
             return [], {}
         try:
+            t_embed = time.perf_counter()
             qvec = models.embed_texts([query], input_type="query")[0]
+            if lat is not None:
+                lat.set(STAGE_QUERY_EMBED, (time.perf_counter() - t_embed) * 1000.0)
+
+            t_dense = time.perf_counter()
             results = collection.query(
                 query_embeddings=[qvec],
                 n_results=k,
                 where={"document_id": document_id},
                 include=["documents", "metadatas"],
             )
+            if lat is not None:
+                lat.set(STAGE_DENSE, (time.perf_counter() - t_dense) * 1000.0)
         except Exception as e:
             log.error(f"Dense search failed: {e}")
+            if lat is not None:
+                if STAGE_QUERY_EMBED not in lat.stages:
+                    lat.set(STAGE_QUERY_EMBED, 0.0)
+                if STAGE_DENSE not in lat.stages:
+                    lat.set(STAGE_DENSE, 0.0)
             return [], {}
 
         ids = (results.get("ids") or [[]])[0]
@@ -318,6 +402,11 @@ class RetrievalService:
             for pid in dict.fromkeys(parent_ids):  # unique, order-preserving
                 if len(extras) >= max_extra:
                     break
+                # Inherit best score from a hit that belongs to this parent
+                parent_score = 0.0
+                for hit in passages:
+                    if getattr(hit, "parent_id", None) == pid:
+                        parent_score = max(parent_score, float(getattr(hit, "score", 0.0) or 0.0))
                 siblings = (
                     db.query(storage.ChunkModel)
                     .filter(
@@ -334,7 +423,7 @@ class RetrievalService:
                         RetrievedPassage(
                             chunk_id=sib.id,
                             content=sib.text or "",
-                            score=0.0,
+                            score=max(0.0, parent_score * 0.85),
                             rank=len(passages) + len(extras),
                             parent_id=sib.parent_id,
                             section_path=sib.section_path,

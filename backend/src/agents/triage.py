@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -17,6 +18,12 @@ from unstructured.documents.elements import (
 )
 
 log = logging.getLogger(__name__)
+
+_HEADING_NUMBERED = re.compile(
+    r"^(?:(?:chapter|section|part)\s+)?\d+(?:\.\d+)*\.?\s+\S+",
+    re.IGNORECASE,
+)
+_HEADING_MARKDOWN = re.compile(r"^#{1,3}\s+\S+")
 
 
 class Chunk(BaseModel):
@@ -89,23 +96,110 @@ def _element_content(el: Element) -> tuple[Literal["Title", "Text", "Table", "Li
     return "Other", raw_text
 
 
+def _looks_like_heading(line: str) -> bool:
+    """Heuristic title detection for PDF/plain-text fallbacks (no layout model)."""
+    s = (line or "").strip()
+    if not s or len(s) < 4 or len(s) > 100:
+        return False
+    if s.endswith((".", ",", ";")):
+        return False
+    if _HEADING_MARKDOWN.match(s) or _HEADING_NUMBERED.match(s):
+        return True
+    words = s.split()
+    if len(words) > 14:
+        return False
+    letters = [c for c in s if c.isalpha()]
+    if not letters:
+        return False
+    upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+    if upper_ratio >= 0.78 and len(s) <= 80:
+        return True
+    # Title Case short lines (e.g. "Retrieval Techniques")
+    if (
+        len(words) <= 10
+        and all(w[:1].isupper() for w in words if w[:1].isalpha())
+        and not s.endswith(".")
+    ):
+        return True
+    return False
+
+
+def _append_chunk(
+    chunks: List[Chunk],
+    *,
+    document_id: str,
+    chunk_type: str,
+    content: str,
+) -> None:
+    content = (content or "").strip()
+    if not content:
+        return
+    chunks.append(
+        Chunk(
+            id=f"{document_id}_chunk_{len(chunks)}",
+            document_id=document_id,
+            chunk_index=len(chunks),
+            type=chunk_type,  # type: ignore[arg-type]
+            content=content[:20000],
+        )
+    )
+
+
 def _texts_to_chunks(texts: List[str], document_id: str, *, source: str) -> List[Chunk]:
+    """
+    Convert plain text blocks into typed chunks.
+
+    When a block looks like a multi-line page, scan for heading lines and emit
+    Title elements so adaptive chunking can build real section paths (instead of
+    dumping the whole PDF under a single default parent).
+    """
     chunks: List[Chunk] = []
-    for i, part in enumerate(texts[:200]):
+    for part in texts[:200]:
         content = (part or "").strip()
         if not content:
             continue
-        chunks.append(
-            Chunk(
-                id=f"{document_id}_chunk_{len(chunks)}",
+        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+        if len(lines) >= 4 and any(_looks_like_heading(ln) for ln in lines[:40]):
+            body_buf: List[str] = []
+            for ln in lines:
+                if _looks_like_heading(ln):
+                    if body_buf:
+                        _append_chunk(
+                            chunks,
+                            document_id=document_id,
+                            chunk_type="Text",
+                            content="\n".join(body_buf),
+                        )
+                        body_buf = []
+                    _append_chunk(
+                        chunks,
+                        document_id=document_id,
+                        chunk_type="Title",
+                        content=ln.lstrip("#").strip(),
+                    )
+                else:
+                    body_buf.append(ln)
+            if body_buf:
+                _append_chunk(
+                    chunks,
+                    document_id=document_id,
+                    chunk_type="Text",
+                    content="\n".join(body_buf),
+                )
+        else:
+            _append_chunk(
+                chunks,
                 document_id=document_id,
-                chunk_index=len(chunks),
-                type="Text",
+                chunk_type="Text",
                 content=content[:20000],
             )
-        )
     if chunks:
-        log.warning("Triage: %s produced %s chunk(s)", source, len(chunks))
+        log.warning(
+            "Triage: %s produced %s chunk(s) (%s titles)",
+            source,
+            len(chunks),
+            sum(1 for c in chunks if c.type == "Title"),
+        )
     return chunks
 
 

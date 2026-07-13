@@ -13,6 +13,52 @@ class CarbonData(BaseModel):
     baseline_cost_gco2e: float = 0.0
     actual_cost_gco2e: float = 0.0
     efficiency_percent: float = 0.0
+    # Workflow energy → Electricity Maps path
+    baseline_energy_kwh: float = 0.0
+    actual_energy_kwh: float = 0.0
+    grid_zone: Optional[str] = None
+    grid_datetime: Optional[str] = None
+    grid_source: Optional[str] = None
+    breakdown: Optional[dict] = None
+    methodology: Optional[str] = None
+
+
+class FrontierComparisonModel(BaseModel):
+    model: str
+    relative_factor: float = 1.0
+    estimated_gco2e: float
+    saved_gco2e: float
+    reduction_percent: float
+
+
+class OurSystemCarbon(BaseModel):
+    name: str
+    tagline: Optional[str] = None
+    carbon: float
+
+
+class CarbonSummaryCards(BaseModel):
+    actual_emissions_gco2e: float
+    carbon_saved_gco2e: float
+    reduction_percent: float
+    heavy_model_baseline_gco2e: float
+
+
+class ChartBar(BaseModel):
+    model: str
+    estimated_gco2e: float
+    is_ours: bool = False
+
+
+class CarbonComparisonPayload(BaseModel):
+    """Visualization layer derived from workflow carbon accounting."""
+    comparison_models: List[FrontierComparisonModel] = []
+    our_system: OurSystemCarbon
+    summary_cards: CarbonSummaryCards
+    badges: List[str] = []
+    chart_bars: List[ChartBar] = []
+    methodology: str = ""
+    breakdown: Optional[dict] = None
 
 # This is the response model when a job is FIRST submitted
 class SummarizeJobResponse(BaseModel):
@@ -62,6 +108,16 @@ class SummaryResponse(BaseModel):
     carbon_data: CarbonData
     job_id: str
     processing_insights: Optional[ProcessingInsights] = None
+    # Diagnostic stage + per-chunk timings (optional)
+    ingestion_latency: Optional[dict] = None
+    # Visualization layer — does not alter scheduler carbon accounting
+    comparison_models: Optional[List[FrontierComparisonModel]] = None
+    our_system: Optional[OurSystemCarbon] = None
+    summary_cards: Optional[CarbonSummaryCards] = None
+    badges: Optional[List[str]] = None
+    chart_bars: Optional[List[ChartBar]] = None
+    methodology: Optional[str] = None
+    carbon_comparison: Optional[CarbonComparisonPayload] = None
 
 # This is the request model for the /rag-query endpoint
 class RagQueryRequest(BaseModel):
@@ -91,6 +147,9 @@ class RagQueryResponse(BaseModel):
     model: Optional[dict] = None
     routing_ref: Optional[str] = None
     conversation_id: Optional[str] = None
+    # Query-path stage timing (ms). Present when instrumentation is enabled.
+    # Shape: {"stages_ms": {...}, "meta": {...}}
+    latency: Optional[dict] = None
 
 
 class ChatRequest(BaseModel):

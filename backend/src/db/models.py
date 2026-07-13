@@ -83,6 +83,9 @@ class DocumentModel(Base):
     processing_time_seconds = Column(Float, default=0.0)
     total_chunks = Column(Integer, default=0)
     efficiency_percent = Column(Float, default=0.0)
+    # Explicit emissions (preferred over deriving from saved/efficiency alone)
+    actual_cost_gco2e = Column(Float, default=0.0)
+    baseline_cost_gco2e = Column(Float, default=0.0)
 
     # Full flexible routing blob (JSONB on Postgres)
     routing_json = Column(FlexibleJSON, nullable=True)

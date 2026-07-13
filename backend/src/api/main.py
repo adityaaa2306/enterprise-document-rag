@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, HTTPException, Request, Depends, Response
+from fastapi import FastAPI, UploadFile, HTTPException, Request, Depends, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
@@ -14,6 +14,7 @@ from src.api.schemas import (
     ChatRequest, ProcessingInsights,
     RefreshRequest, LogoutRequest,
 )
+from src.core.frontier_carbon_compare import build_frontier_comparison
 from src.db import jobs as job_store
 from src.core.config import settings
 from src.core import job_status as job_status_mod
@@ -289,6 +290,9 @@ def get_job_result(
 
     Convention: ``document_id`` in the result equals ``job_id`` and is the key
     to use for ``POST /rag-query``.
+
+    Attaches a visualization-only frontier carbon comparison derived from the
+    already-computed ``carbon_data`` (does not alter scheduler accounting).
     """
     assert_document_owner(int(current_user["id"]), job_id)
     status = job_store.get_job(job_id)
@@ -301,7 +305,55 @@ def get_job_result(
             detail=f"Job is not yet complete (status={current}).",
         )
 
-    return SummaryResponse(**status["result"])
+    result = dict(status["result"] or {})
+    carbon = result.get("carbon_data") if isinstance(result.get("carbon_data"), dict) else {}
+    carbon = dict(carbon)
+
+    # Sanitize legacy chunk×grams baselines before building comparison bars.
+    try:
+        baseline = float(carbon.get("baseline_cost_gco2e") or 0.0)
+        energy = float(carbon.get("baseline_energy_kwh") or 0.0)
+        intensity = float(carbon.get("local_grid_gco2_kwh") or 0.0)
+        bd = carbon.get("breakdown") if isinstance(carbon.get("breakdown"), dict) else {}
+        if energy <= 0:
+            energy = float(bd.get("baseline_energy_kwh") or 0.0)
+        if intensity <= 0:
+            intensity = float(bd.get("grid_carbon_intensity_gco2_kwh") or 0.0)
+        if baseline > 150 and energy > 0 and intensity > 0:
+            rebuilt = energy * intensity
+            if 0 < rebuilt < baseline:
+                carbon["baseline_cost_gco2e"] = rebuilt
+                if isinstance(bd, dict):
+                    bd = dict(bd)
+                    bd["baseline_co2e_g"] = round(rebuilt, 4)
+                    carbon["breakdown"] = bd
+                actual = float(carbon.get("actual_cost_gco2e") or 0.0)
+                saved = max(0.0, rebuilt - actual)
+                carbon["carbon_saved_grams"] = saved
+                carbon["efficiency_percent"] = (
+                    round(min(100.0, (saved / rebuilt) * 100.0), 1) if rebuilt > 0 else 0.0
+                )
+                result["carbon_data"] = carbon
+    except (TypeError, ValueError):
+        pass
+
+    comparison = build_frontier_comparison(carbon)
+    result["comparison_models"] = comparison["comparison_models"]
+    result["our_system"] = comparison["our_system"]
+    result["summary_cards"] = comparison["summary_cards"]
+    result["badges"] = comparison["badges"]
+    result["chart_bars"] = comparison["chart_bars"]
+    result["methodology"] = comparison["methodology"]
+    result["carbon_comparison"] = comparison
+    # Ensure breakdown/methodology live on carbon_data for the UI
+    if isinstance(result.get("carbon_data"), dict):
+        cd = dict(result["carbon_data"])
+        if comparison.get("breakdown") and not cd.get("breakdown"):
+            cd["breakdown"] = comparison["breakdown"]
+        if comparison.get("methodology") and not cd.get("methodology"):
+            cd["methodology"] = comparison["methodology"]
+        result["carbon_data"] = cd
+    return SummaryResponse(**result)
 
 
 @app.post("/rag-query", response_model=RagQueryResponse)
@@ -361,7 +413,17 @@ def _run_rag_query(
     persist_conversation: bool = False,
     user_id: Optional[int] = None,
 ) -> RagQueryResponse:
+    import time
+
+    from src.monitoring.query_latency import (
+        STAGE_CONTEXT_ASSEMBLE,
+        STAGE_LLM_TOTAL,
+        log_query_latency,
+        merge_latency,
+    )
+
     log.info(f"RAG Query: Doc ID {document_id}, Query: {query}")
+    t_request = time.perf_counter()
 
     prior_entities: List[str] = []
     mem = None
@@ -384,6 +446,8 @@ def _run_rag_query(
         pack = None
         context_chunks = None
         retrieval_debug: Dict[str, Any] = {}
+        retrieval_latency: Dict[str, Any] = {}
+        assemble_latency: Dict[str, Any] = {}
 
         if settings.USE_CONTEXT_ASSEMBLER or settings.USE_RESPONSE_AGENT:
             from src.retrieval.service import RetrievalService
@@ -394,11 +458,15 @@ def _run_rag_query(
                 document_id=document_id,
             )
             retrieval_debug = dict(retrieval.debug or {})
+            retrieval_latency = dict(retrieval_debug.get("latency") or {})
             pack = ContextAssembler().pack(
                 retrieval.passages,
                 tier=assemble_tier,
                 query=query,
             )
+            assemble_ms = (pack.stats or {}).get("latency_ms") or {}
+            if assemble_ms:
+                assemble_latency = {"stages_ms": dict(assemble_ms), "meta": {}}
             if not pack.passages and not pack.context_text:
                 raise HTTPException(
                     status_code=404,
@@ -434,6 +502,7 @@ def _run_rag_query(
         sources: List[str] = []
         tier = "heavy"
         response_debug: Dict[str, Any] = {}
+        llm_latency: Dict[str, Any] = {}
 
         if settings.USE_RESPONSE_AGENT:
             from src.agents.response_agent import ResponseAgent
@@ -457,19 +526,53 @@ def _run_rag_query(
             model_used = result.model_used
             tier = result.tier
             response_debug = dict(result.debug or {})
+            llm_latency = dict(response_debug.get("latency") or {})
             pack = result.pack or pack
         elif pack is not None:
+            t_llm = time.perf_counter()
             answer, _ = models.run_large_model_rag(
                 query=query,
                 context_str=pack.context_text,
             )
+            llm_ms = round((time.perf_counter() - t_llm) * 1000.0, 3)
+            llm_latency = {
+                "stages_ms": {
+                    "llm_ttft_ms": llm_ms,
+                    "llm_ttlt_ms": llm_ms,
+                    STAGE_LLM_TOTAL: llm_ms,
+                },
+                "meta": {"llm_timing_mode": "blocking_ttft_equals_ttlt"},
+            }
             sources = pack.source_texts
         else:
+            t_llm = time.perf_counter()
             answer, _sources = models.run_large_model_rag(
                 query=query,
                 context_chunks=context_chunks,
             )
+            llm_ms = round((time.perf_counter() - t_llm) * 1000.0, 3)
+            llm_latency = {
+                "stages_ms": {
+                    "llm_ttft_ms": llm_ms,
+                    "llm_ttlt_ms": llm_ms,
+                    STAGE_LLM_TOTAL: llm_ms,
+                },
+                "meta": {"llm_timing_mode": "blocking_ttft_equals_ttlt"},
+            }
             sources = [chunk.content for chunk in context_chunks]
+
+        total_ms = (time.perf_counter() - t_request) * 1000.0
+        latency = merge_latency(
+            retrieval_latency,
+            assemble_latency,
+            llm_latency,
+            total_ms=total_ms,
+        )
+        # Ensure assemble key present even if pack path skipped timing
+        if STAGE_CONTEXT_ASSEMBLE not in (latency.get("stages_ms") or {}):
+            latency.setdefault("stages_ms", {})[STAGE_CONTEXT_ASSEMBLE] = 0.0
+        latency.setdefault("meta", {})["document_id"] = document_id
+        log_query_latency(document_id=document_id, query=query, latency=latency)
 
         resp_kwargs: Dict[str, Any] = {
             "document_id": document_id,
@@ -479,6 +582,7 @@ def _run_rag_query(
             "skill": skill,
             "model_used": model_used,
             "conversation_id": conversation_id,
+            "latency": latency,
         }
 
         entities_used: List[str] = []
@@ -642,12 +746,37 @@ def get_document_graph(
         raise HTTPException(status_code=500, detail="Error fetching document graph.")
 
 @app.get("/dashboard-stats")
-def get_dashboard_stats(current_user: Dict[str, Any] = Depends(get_current_user)):
+def get_dashboard_stats(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    range: str = Query("30d"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+):
     """
     Get aggregated statistics for the dashboard (current user only).
+
+    Includes a static ``methodology`` note for the carbon comparison visualization
+    layer. Per-document ``comparison_models`` / ``summary_cards`` are attached on
+    ``GET /job-result/{job_id}`` from already-computed ``carbon_data``.
+
+    Actual = sum of green-agent costs from completed jobs.
+    Baseline = ChatGPT/frontier published estimate scaled by document chunks.
     """
     try:
-        return storage.get_dashboard_stats(user_id=int(current_user["id"]))
+        from src.core.frontier_carbon_compare import METHODOLOGY_TEXT
+
+        stats = storage.get_dashboard_stats(
+            user_id=int(current_user["id"]),
+            range_key=range,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if isinstance(stats, dict):
+            stats = dict(stats)
+            stats.setdefault("methodology", METHODOLOGY_TEXT)
+            stats.setdefault("comparison_models", [])
+            stats.setdefault("summary_cards", None)
+        return stats
     except Exception as e:
         log.error(f"Error fetching dashboard stats: {e}")
         raise HTTPException(status_code=500, detail="Error fetching dashboard stats.")

@@ -65,4 +65,115 @@ def test_nim_client_uses_timeout(monkeypatch):
     monkeypatch.setattr(models, "OpenAI", FakeOpenAI)
     models.load_nim_client()
     assert captured.get("timeout") is not None
-    assert captured.get("max_retries") == 0
+    assert captured.get("max_retries") == settings.NIM_SDK_MAX_RETRIES
+
+
+def test_call_chat_retries_transient_connection_errors(monkeypatch):
+    from src.agents import models
+
+    class FakeCompletions:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionError("Connection error.")
+            return type(
+                "Resp",
+                (),
+                {
+                    "choices": [
+                        type(
+                            "Choice",
+                            (),
+                            {"message": type("Msg", (), {"content": "ok summary"})()},
+                        )()
+                    ]
+                },
+            )()
+
+    class FakeClient:
+        def __init__(self):
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+    monkeypatch.setattr(models, "get_nim_client", lambda: FakeClient())
+    monkeypatch.setattr(models.time, "sleep", lambda *_a, **_k: None)
+
+    text, used = models.call_chat_with_fallback(
+        ["meta/llama-3.3-70b-instruct"],
+        [{"role": "user", "content": "hi"}],
+        max_retries_per_model=3,
+    )
+    assert text == "ok summary"
+    assert used == "meta/llama-3.3-70b-instruct"
+
+
+def test_compile_falls_back_to_medium_when_heavy_fails(monkeypatch):
+    from src.agents import models
+
+    calls = []
+
+    def fake_chat(model_ids, messages, **kwargs):
+        calls.append(list(model_ids))
+        if model_ids and model_ids[0].startswith("meta/llama-3.3"):
+            raise RuntimeError("All models failed (heavy)")
+        return "## Summary\n\nMedium worked.", model_ids[0]
+
+    monkeypatch.setattr(models, "get_nim_client", lambda: object())
+    monkeypatch.setattr(models, "call_chat_with_fallback", fake_chat)
+    monkeypatch.setattr(models.settings, "COMPILE_MAX_INPUT_TOKENS", 100000)
+    monkeypatch.setattr(models.settings, "COMPILE_BATCH_SIZE", 50)
+
+    out = models.run_compile_with_models(
+        ["Chunk summary A about carbon routing.", "Chunk summary B about RAG."],
+        {"model_usage_chars": {"light": 0, "medium": 0, "large": 0}},
+        models.settings.heavy_models(),
+    )
+    assert "Medium worked" in out
+    assert len(calls) >= 2
+    assert calls[0][0].startswith("meta/llama-3.3")
+    # Second attempt must be a lower tier (not the heavy primary).
+    assert calls[1][0] != calls[0][0]
+
+
+def test_compile_stitches_fallback_when_all_tiers_fail(monkeypatch):
+    from src.agents import models
+
+    def boom(*_a, **_k):
+        raise RuntimeError("All models failed")
+
+    monkeypatch.setattr(models, "get_nim_client", lambda: object())
+    monkeypatch.setattr(models, "call_chat_with_fallback", boom)
+
+    out = models.run_compile_with_models(
+        ["Alpha finding from document.", "Beta finding from document."],
+        {},
+        ["meta/llama-3.3-70b-instruct"],
+    )
+    assert "stitched fallback" in out.lower()
+    assert "Alpha finding" in out
+    assert not out.startswith("Final summary generation failed")
+
+
+def test_compile_skips_failed_chunk_summaries(monkeypatch):
+    from src.agents import models
+
+    captured = {}
+
+    def fake_chat(model_ids, messages, **kwargs):
+        captured["user"] = messages[-1]["content"]
+        return "## Summary\nok", model_ids[0]
+
+    monkeypatch.setattr(models, "get_nim_client", lambda: object())
+    monkeypatch.setattr(models, "call_chat_with_fallback", fake_chat)
+    monkeypatch.setattr(models.settings, "COMPILE_MAX_INPUT_TOKENS", 100000)
+
+    out = models.run_compile_with_models(
+        ["Good summary about scope.", "Summary generation failed.", ""],
+        {},
+        ["mistralai/ministral-14b-instruct-2512"],
+    )
+    assert out.startswith("## Summary")
+    assert "Good summary about scope" in captured["user"]
+    assert "Summary generation failed" not in captured["user"]

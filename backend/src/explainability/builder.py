@@ -21,6 +21,8 @@ class RetrievedChunkRef:
     score: float = 0.0
     parent_section: Optional[str] = None
     citation: Optional[int] = None
+    preview: Optional[str] = None
+    rank: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -106,20 +108,57 @@ class ExplainabilityBuilder:
         )
 
     def _retrieved_chunks(self, pack: Optional[ContextPack]) -> List[RetrievedChunkRef]:
+        """One explainability row per packed passage (not per merged chunk_id)."""
         if not pack:
             return []
+        passages = list(pack.passages or [])
         out: List[RetrievedChunkRef] = []
-        for p in pack.passages:
-            for cid in p.chunk_ids or []:
-                out.append(
-                    RetrievedChunkRef(
-                        id=cid,
-                        score=float(p.score or 0.0),
-                        parent_section=p.section_path,
-                        citation=p.citation,
-                    )
+        for i, p in enumerate(passages):
+            ids = [cid for cid in (p.chunk_ids or []) if cid]
+            primary_id = ids[0] if ids else f"passage_{p.citation or i + 1}"
+            preview = (p.content or "").strip()
+            if len(preview) > 280:
+                preview = preview[:277].rstrip() + "…"
+            out.append(
+                RetrievedChunkRef(
+                    id=primary_id,
+                    score=self._display_relevance(float(p.score or 0.0), i, len(passages)),
+                    parent_section=self._section_label(p.section_path, p.content),
+                    citation=p.citation if p.citation is not None else i + 1,
+                    preview=preview or None,
+                    rank=i,
                 )
+            )
         return out
+
+    @staticmethod
+    def _section_label(section_path: Optional[str], content: Optional[str]) -> Optional[str]:
+        raw = (section_path or "").strip()
+        if raw and raw.lower() not in ("(preamble)", "preamble"):
+            return raw
+        # Derive a readable label from the passage when PDF triage left everything as preamble
+        text = (content or "").strip()
+        if not text:
+            return "Document"
+        for line in text.splitlines():
+            line = line.strip()
+            if len(line) >= 8:
+                return line[:120] + ("…" if len(line) > 120 else "")
+        return text[:120] + ("…" if len(text) > 120 else "")
+
+    @staticmethod
+    def _display_relevance(raw_score: float, rank: int, total: int) -> float:
+        """
+        Map retrieval scores to a UI-friendly 0–1 relevance.
+        Hybrid RRF scores are ~0.01–0.05; parent_expand often 0.0 — those are not
+        cosine similarities and must not be compared to 0.45/0.75 thresholds as-is.
+        """
+        if raw_score >= 0.15:
+            return max(0.0, min(1.0, round(raw_score, 4)))
+        # Rank-based fallback for RRF / zero scores (top passage ≈ High)
+        if total <= 1:
+            return 0.88
+        return round(max(0.42, 0.95 - (0.12 * rank)), 4)
 
     def _entities_used(
         self,
@@ -200,9 +239,11 @@ class ExplainabilityBuilder:
             return 0.15
         base = 0.45
         if retrieved:
-            base += min(0.30, 0.06 * len(retrieved))
+            base += min(0.25, 0.08 * len(retrieved))
+            avg_rel = sum(float(c.score or 0.0) for c in retrieved) / max(len(retrieved), 1)
+            base += min(0.20, avg_rel * 0.22)
         if pack and pack.stats.get("packed"):
-            base += 0.10
+            base += 0.08
         if missing:
             base -= 0.08 * len(missing)
         return max(0.0, min(1.0, round(base, 3)))

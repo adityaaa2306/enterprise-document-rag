@@ -204,6 +204,13 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
             "baseline_cost_gco2e": float(raw_carbon.get("baseline_cost_gco2e") or 0.0),
             "actual_cost_gco2e": float(raw_carbon.get("actual_cost_gco2e") or 0.0),
             "efficiency_percent": float(raw_carbon.get("efficiency_percent") or 0.0),
+            "baseline_energy_kwh": float(raw_carbon.get("baseline_energy_kwh") or 0.0),
+            "actual_energy_kwh": float(raw_carbon.get("actual_energy_kwh") or 0.0),
+            "grid_zone": raw_carbon.get("grid_zone"),
+            "grid_datetime": raw_carbon.get("grid_datetime"),
+            "grid_source": raw_carbon.get("grid_source"),
+            "breakdown": raw_carbon.get("breakdown") if isinstance(raw_carbon.get("breakdown"), dict) else None,
+            "methodology": raw_carbon.get("methodology"),
         }
 
         insights = build_processing_insights(
@@ -229,6 +236,7 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
                 "carbon_data": carbon_fields,
                 "job_id": job_id,
                 "processing_insights": insights,
+                "ingestion_latency": final_state.get("ingestion_latency"),
             },
             routing_decision=final_state.get("routing_decision"),
             latency_ms=final_state.get("job_latency_ms"),

@@ -45,19 +45,26 @@ def test_conversation_ttl_and_prior_entities():
 
 def test_envelope_builder_from_pack():
     pack = ContextPack(
-        context_text="[1]\nAcme announced a policy.",
+        context_text="[1]\nAcme announced a policy.\n\n[2]\nMore detail here.",
         passages=[
             PackedPassage(
                 content="Acme announced a policy.",
-                chunk_ids=["doc_0"],
-                score=0.9,
-                section_path="1/Intro",
+                chunk_ids=["doc_0", "doc_0b"],  # merged siblings — must not fan out
+                score=0.02,  # RRF-like raw score
+                section_path="(preamble)",
                 citation=1,
-            )
+            ),
+            PackedPassage(
+                content="More detail here about the policy rollout.",
+                chunk_ids=["doc_1"],
+                score=0.015,
+                section_path="2. Methods",
+                citation=2,
+            ),
         ],
         tokens_used=40,
         tokens_budget=6000,
-        stats={"packed": 1},
+        stats={"packed": 2},
     )
     env = ExplainabilityBuilder().build(
         answer="Acme announced a policy in the intro.",
@@ -76,7 +83,16 @@ def test_envelope_builder_from_pack():
     )
     assert isinstance(env, AnswerEnvelope)
     assert env.confidence > 0.4
+    # One row per packed passage (not per chunk_id)
+    assert len(env.retrieved_chunks) == 2
     assert env.retrieved_chunks[0].id == "doc_0"
+    assert env.retrieved_chunks[0].citation == 1
+    assert env.retrieved_chunks[0].preview and "Acme" in env.retrieved_chunks[0].preview
+    # Preamble replaced with a readable label from content
+    assert env.retrieved_chunks[0].parent_section != "(preamble)"
+    # RRF-like scores mapped into display relevance (not raw 0.02)
+    assert env.retrieved_chunks[0].score >= 0.75
+    assert env.retrieved_chunks[1].parent_section == "2. Methods"
     assert "acme" in env.entities_used
     assert "retrieve" in env.reasoning_path
     assert "graph_seed" in env.reasoning_path
@@ -87,6 +103,7 @@ def test_envelope_builder_from_pack():
     d = env.to_dict()
     assert "reasoning_path" in d
     assert d["retrieved_chunks"][0]["id"] == "doc_0"
+    assert d["retrieved_chunks"][0].get("preview")
 
 
 def test_envelope_missing_context_on_refusal():

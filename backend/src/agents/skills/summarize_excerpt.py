@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Dict, List
 
+from src.agents.prompting import MARKDOWN_OUTPUT_RULES
 from src.agents.skills.registry import SkillSpec, register
 from src.context.assembler import ContextPack
 
@@ -11,6 +12,13 @@ def build_messages(query: str, pack: ContextPack) -> List[Dict[str, str]]:
     context = pack.context_text or ""
     user = f"""Summarize the following context to answer the user's request.
 Stay faithful to the source text. Be concise. Use citation markers [n] when useful.
+
+{MARKDOWN_OUTPUT_RULES}
+
+Prefer a short Markdown structure such as:
+## Summary
+## Key Points
+## Details
 
 USER REQUEST:
 {query}
@@ -24,7 +32,7 @@ SUMMARY:"""
             "role": "system",
             "content": (
                 "You are an expert summarizer. Produce a faithful, concise summary "
-                "of the provided context only."
+                "of the provided context only. Always reply in GitHub-Flavored Markdown."
             ),
         },
         {"role": "user", "content": user},

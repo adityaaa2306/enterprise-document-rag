@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Dict, List
 
+from src.agents.prompting import MARKDOWN_OUTPUT_RULES
 from src.agents.skills.registry import SkillSpec, register
 from src.context.assembler import ContextPack
 
@@ -12,6 +13,14 @@ def build_messages(query: str, pack: ContextPack) -> List[Dict[str, str]]:
     user = f"""Answer the user's query *only* based on the provided context.
 Be concise and factual. If the context is insufficient, say so clearly.
 Cite evidence using the bracket numbers from the context when helpful (e.g. [1]).
+
+{MARKDOWN_OUTPUT_RULES}
+
+Suggested structure when useful:
+## Summary
+## Key Findings
+## Details
+## Sources
 
 CONTEXT:
 {context}
@@ -25,7 +34,7 @@ ANSWER:"""
             "role": "system",
             "content": (
                 "You are an expert Q&A assistant. Use only the provided context. "
-                "Do not invent facts."
+                "Do not invent facts. Always reply in GitHub-Flavored Markdown."
             ),
         },
         {"role": "user", "content": user},

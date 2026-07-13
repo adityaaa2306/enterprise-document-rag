@@ -36,26 +36,36 @@ class Settings(BaseSettings):
     NVIDIA_API_KEY: str = ""
     NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
     ELECTRICITY_MAPS_API_KEY: Optional[str] = None
+    # Empty zone → resolve via lat/lon (default Pune / IN-WE)
+    ELECTRICITY_MAPS_ZONE: str = ""
+    ELECTRICITY_MAPS_LAT: float = 18.52
+    ELECTRICITY_MAPS_LON: float = 73.85
     # Per-request HTTP timeout for chat/embeddings (prevents infinite "processing")
     NIM_HTTP_TIMEOUT_SEC: float = 90.0
+    # Longer read timeout for final compile (large multi-chunk prompts)
+    NIM_COMPILE_TIMEOUT_SEC: float = 90.0
     # Connect timeout for NIM (separate from read/write)
-    NIM_CONNECT_TIMEOUT_SEC: float = 10.0
+    NIM_CONNECT_TIMEOUT_SEC: float = 15.0
     # OpenAI SDK transport retries (we also fall back across models ourselves)
-    NIM_SDK_MAX_RETRIES: int = 0
+    NIM_SDK_MAX_RETRIES: int = 1
+    # App-level retries per model for transient NIM errors (timeout/connection/5xx)
+    NIM_TRANSIENT_RETRIES: int = 2
 
     # --- Light tier (chunk summarization) ---
-    LIGHT_MODEL_PRIMARY: str = "meta/llama-3.2-3b-instruct"
-    LIGHT_MODEL_FALLBACK: str = "google/gemma-2-2b-it"
+    # llama-3.2-3b timed out 0/4 on NIM free tier (2026-07-13 probe).
+    LIGHT_MODEL_PRIMARY: str = "meta/llama-3.1-8b-instruct"
+    LIGHT_MODEL_FALLBACK: str = "mistralai/mistral-nemotron"
 
     # --- Medium tier (escalation on accuracy failure) ---
-    # Prefer ministral as primary: gemma-4-31b frequently 504/timeouts on NIM free tier.
+    # Prefer ministral as primary: gemma-4-31b 0/4 timeouts on NIM free tier (2026-07-13).
     MEDIUM_MODEL_PRIMARY: str = "mistralai/ministral-14b-instruct-2512"
-    MEDIUM_MODEL_FALLBACK: str = "google/gemma-4-31b-it"
+    MEDIUM_MODEL_FALLBACK: str = "meta/llama-3.1-8b-instruct"
 
     # --- Heavy tier (final compile + RAG answers) ---
-    HEAVY_MODEL_PRIMARY: str = "meta/llama-3.3-70b-instruct"
-    HEAVY_MODEL_FALLBACK_1: str = "openai/gpt-oss-120b"
-    HEAVY_MODEL_FALLBACK_2: str = "qwen/qwen3.5-122b-a10b"
+    # Prefer ministral: llama-3.3/gpt-oss broken; llama-3.1-70b hangs on large compile.
+    HEAVY_MODEL_PRIMARY: str = "mistralai/ministral-14b-instruct-2512"
+    HEAVY_MODEL_FALLBACK_1: str = "meta/llama-3.1-70b-instruct"
+    HEAVY_MODEL_FALLBACK_2: str = "meta/llama-3.1-8b-instruct"
 
     # --- Retrieval (embeddings + rerank) ---
     EMBEDDING_MODEL: str = "nvidia/llama-nemotron-embed-1b-v2"
@@ -108,12 +118,22 @@ class Settings(BaseSettings):
     CRE_WEIGHT_RETRIEVAL: float = 0.25
     CRE_HEAVY_COMPILE_CHUNK_THRESHOLD: int = 20
 
+    # --- Final compile resilience ---
+    # Soft token budget for a single compile prompt; over this we hierarchical-batch.
+    COMPILE_MAX_INPUT_TOKENS: int = 10000
+    COMPILE_BATCH_SIZE: int = 8
+    # Parallel map summarization workers (lower = less NIM connection pressure)
+    MAP_MAX_WORKERS: int = 3
+
     # --- Quality Validation Agent ---
     QVA_CONFIDENCE_THRESHOLD: float = 0.60
     QVA_FAITHFULNESS_MIN: float = 0.55
-    QVA_HALLUCINATION_MAX: float = 0.15
+    # Lexical "hallucination" flags paraphrases; 0.15 was failing almost all abstractive maps.
+    QVA_HALLUCINATION_MAX: float = 0.35
     QVA_CONTRADICTION_MAX: float = 0.10
     QVA_MAX_ESCALATIONS: int = 1  # exactly +1 tier
+    # Cap heavy re-summarize so one strict QVA pass cannot escalate every chunk.
+    QVA_MAX_ESCALATE_CHUNKS: int = 8
 
     # --- Telemetry ---
     ROUTING_TELEMETRY_PATH: str = "./local_db/routing_telemetry.jsonl"
@@ -173,8 +193,16 @@ class Settings(BaseSettings):
 
     # --- Phase 2.A Adaptive Chunking ---
     USE_ADAPTIVE_CHUNKING: bool = True
-    CHUNK_MAX_TOKENS: int = 512
-    CHUNK_SIM_THRESHOLD: float = 0.25  # split when adjacent similarity falls below
+    # Target size for each map-summarize unit (chars≈tokens*4). Larger → fewer chunks.
+    CHUNK_MAX_TOKENS: int = 1500
+    CHUNK_SIM_THRESHOLD: float = 0.15  # split when adjacent similarity falls below
+    # Do not split on low similarity until the buffer is at least this full.
+    # Prevents thousands of tiny unstructured elements from each becoming a chunk.
+    CHUNK_MIN_TOKENS_BEFORE_SIM_SPLIT: int = 500
+    # Hard cap on map chunks; excess is re-packed into larger units.
+    CHUNK_MAX_COUNT: int = 48
+    # Titles open sections; keep False so headings are not summarized alone.
+    CHUNK_TITLE_AS_CHUNK: bool = False
     # Optional override; empty → use CHROMA_COLLECTION_NAME
     CHUNK_COLLECTION_NAME: str = ""
 

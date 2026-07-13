@@ -191,6 +191,7 @@ def validate_chunks(chunks: List[Any], summaries: List[str]) -> ValidationVerdic
             "chunk_count": pair_count,
             "fail_ratio": round(fail_ratio, 4),
             "failed_indices": [i for i, v in enumerate(verdicts) if not v.passed],
+            "chunk_confidences": [round(v.confidence, 4) for v in verdicts],
         },
     )
 

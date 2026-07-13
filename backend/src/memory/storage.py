@@ -361,6 +361,8 @@ def store_document_data(
     selected_model = routing_payload.get("selected_model") if routing_payload else None
     crs = routing_payload.get("crs") if routing_payload else None
 
+    has_carbon = bool(carbon_meta)
+
     # 1. Store the summary and carbon stats
     try:
         db = _session()
@@ -368,10 +370,15 @@ def store_document_data(
 
         if doc:
             doc.summary = summary
-            doc.carbon_saved_grams = carbon_meta.get("carbon_saved_grams", 0.0)
-            doc.processing_time_seconds = carbon_meta.get("processing_time_seconds", 0.0)
-            doc.total_chunks = carbon_meta.get("total_chunks", 0)
-            doc.efficiency_percent = carbon_meta.get("efficiency_percent", 0.0)
+            if has_carbon:
+                doc.carbon_saved_grams = float(carbon_meta.get("carbon_saved_grams") or 0.0)
+                doc.processing_time_seconds = float(
+                    carbon_meta.get("processing_time_seconds") or 0.0
+                )
+                doc.total_chunks = int(carbon_meta.get("total_chunks") or 0)
+                doc.efficiency_percent = float(carbon_meta.get("efficiency_percent") or 0.0)
+                doc.actual_cost_gco2e = float(carbon_meta.get("actual_cost_gco2e") or 0.0)
+                doc.baseline_cost_gco2e = float(carbon_meta.get("baseline_cost_gco2e") or 0.0)
             if user_id is not None and doc.user_id is None:
                 doc.user_id = int(user_id)
             if routing_payload is not None:
@@ -385,10 +392,14 @@ def store_document_data(
                 id=document_id,
                 summary=summary,
                 user_id=int(user_id) if user_id is not None else None,
-                carbon_saved_grams=carbon_meta.get("carbon_saved_grams", 0.0),
-                processing_time_seconds=carbon_meta.get("processing_time_seconds", 0.0),
-                total_chunks=carbon_meta.get("total_chunks", 0),
-                efficiency_percent=carbon_meta.get("efficiency_percent", 0.0),
+                carbon_saved_grams=float(carbon_meta.get("carbon_saved_grams") or 0.0),
+                processing_time_seconds=float(
+                    carbon_meta.get("processing_time_seconds") or 0.0
+                ),
+                total_chunks=int(carbon_meta.get("total_chunks") or 0),
+                efficiency_percent=float(carbon_meta.get("efficiency_percent") or 0.0),
+                actual_cost_gco2e=float(carbon_meta.get("actual_cost_gco2e") or 0.0),
+                baseline_cost_gco2e=float(carbon_meta.get("baseline_cost_gco2e") or 0.0),
                 routing_json=routing_payload,
                 selected_model=selected_model,
                 crs=float(crs) if crs is not None else None,
@@ -607,49 +618,259 @@ def list_documents(user_id: Optional[int] = None) -> List[Dict[str, Any]]:
         log.error(f"Failed to list documents: {e}")
         return []
 
-def get_dashboard_stats(user_id: Optional[int] = None) -> Dict[str, Any]:
+def get_dashboard_stats(
+    user_id: Optional[int] = None,
+    *,
+    range_key: str = "30d",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> Dict[str, Any]:
     """
-    Aggregates data for the dashboard (scoped to user_id when provided).
+    Aggregates dashboard analytics (scoped to user_id when provided).
+
+    Date labels are unique calendar days (YYYY-MM-DD → "Jul 13"), not one row
+    per document — which previously caused repeated "Jul 13" tick labels.
+
+    Actual emissions come from completed jobs (actual_cost_gco2e).
+    Baseline emissions use the ChatGPT/frontier published estimate
+    (baseline_cost_gco2e), backfilled from job results or chunk counts when
+    older rows lack explicit fields.
     """
+    from datetime import timedelta, timezone
+    from collections import defaultdict
+
+    empty = {
+        "total_carbon_saved": 0.0,
+        "total_carbon_consumed": 0.0,
+        "total_baseline_carbon": 0.0,
+        "total_docs": 0,
+        "avg_efficiency": 0.0,
+        "carbon_trend": [],
+        "energy_trend": [],
+        "range": range_key or "30d",
+        "start_date": None,
+        "end_date": None,
+        "point_count": 0,
+        "empty_state_message": None,
+    }
+
+    def _resolve_doc_carbon(d: DocumentModel) -> Optional[Dict[str, float]]:
+        """Return actual/baseline/saved/eff for a completed document, or None.
+
+        Uses stored workflow accounting (energy × Electricity Maps). Does not
+        invent grams from chunk counts.
+        """
+        chunks = int(getattr(d, "total_chunks", 0) or 0)
+        actual = float(getattr(d, "actual_cost_gco2e", 0.0) or 0.0)
+        baseline = float(getattr(d, "baseline_cost_gco2e", 0.0) or 0.0)
+        saved = float(d.carbon_saved_grams or 0.0)
+        eff = float(d.efficiency_percent or 0.0)
+
+        if (chunks <= 0 or actual <= 0 or baseline <= 0) and d.id:
+            try:
+                from src.db import jobs as job_store
+
+                job = job_store.get_job(d.id) or {}
+                status = str(job.get("status") or "").lower()
+                if status in ("error", "failed", "cancelled", "canceled"):
+                    return None
+                result = job.get("result") if isinstance(job.get("result"), dict) else {}
+                carbon = (
+                    result.get("carbon_data")
+                    if isinstance(result.get("carbon_data"), dict)
+                    else {}
+                )
+                if carbon:
+                    chunks = int(carbon.get("total_chunks") or chunks or 0)
+                    if actual <= 0:
+                        actual = float(carbon.get("actual_cost_gco2e") or 0.0)
+                    if baseline <= 0:
+                        baseline = float(carbon.get("baseline_cost_gco2e") or 0.0)
+                    if saved == 0:
+                        saved = float(carbon.get("carbon_saved_grams") or 0.0)
+                    if eff == 0:
+                        eff = float(carbon.get("efficiency_percent") or 0.0)
+            except Exception:
+                pass
+
+        if chunks <= 0:
+            return None
+        if actual <= 0 and baseline <= 0 and saved == 0:
+            return None
+
+        if baseline <= 0 and saved > 0 and eff > 0:
+            baseline = saved / (eff / 100.0)
+        if actual <= 0 and baseline > 0:
+            actual = max(0.0, baseline - max(0.0, saved))
+        if baseline > 0:
+            saved = max(0.0, baseline - actual)
+            eff = min(100.0, (saved / baseline) * 100.0)
+        else:
+            return None
+
+        return {
+            "chunks": float(chunks),
+            "actual": float(actual),
+            "baseline": float(baseline),
+            "saved": float(saved),
+            "efficiency": float(eff),
+        }
+
     try:
         db = _session()
         q = db.query(DocumentModel)
         if user_id is not None:
             q = q.filter(DocumentModel.user_id == int(user_id))
         docs = q.all()
-        
-        total_docs = len(docs)
-        total_carbon_saved = sum([d.carbon_saved_grams or 0.0 for d in docs])
-        avg_efficiency = sum([d.efficiency_percent or 0.0 for d in docs]) / total_docs if total_docs > 0 else 0
-        
-        trends = []
-        
-        sorted_docs = sorted(docs, key=lambda x: x.saved_at if x.saved_at else datetime.min)
-        
-        for d in sorted_docs:
-            if d.saved_at:
-                trends.append({
-                    "date": d.saved_at.strftime("%b %d"),
-                    "savings": d.carbon_saved_grams,
-                    "baseline": (d.carbon_saved_grams / (d.efficiency_percent/100)) if d.efficiency_percent and d.efficiency_percent > 0 else 0
-                })
-        
+
+        now = datetime.now(timezone.utc)
+        key = (range_key or "30d").strip().lower()
+
+        def _parse_day(value: Optional[str]) -> Optional[datetime]:
+            if not value:
+                return None
+            try:
+                return datetime.strptime(value[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except Exception:
+                return None
+
+        start_dt: Optional[datetime] = None
+        end_dt: Optional[datetime] = now
+
+        if key == "today":
+            start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif key == "7d":
+            start_dt = now - timedelta(days=7)
+        elif key == "90d":
+            start_dt = now - timedelta(days=90)
+        elif key == "custom":
+            start_dt = _parse_day(start_date)
+            parsed_end = _parse_day(end_date)
+            if parsed_end is not None:
+                end_dt = parsed_end.replace(hour=23, minute=59, second=59, microsecond=999999)
+            if start_dt is None and parsed_end is None:
+                start_dt = now - timedelta(days=30)
+        else:
+            key = "30d"
+            start_dt = now - timedelta(days=30)
+
+        def _aware(dt: Optional[datetime]) -> Optional[datetime]:
+            if dt is None:
+                return None
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt
+
+        filtered = []
+        for d in docs:
+            saved_at = _aware(d.saved_at)
+            if saved_at is None:
+                continue
+            if start_dt is not None and saved_at < _aware(start_dt):
+                continue
+            if end_dt is not None and saved_at > _aware(end_dt):
+                continue
+            filtered.append(d)
+
+        grid = float(getattr(settings, "LOCAL_GRID_INTENSITY", 700.0) or 700.0)
+
+        daily: Dict[str, Dict[str, float]] = defaultdict(
+            lambda: {
+                "saved": 0.0,
+                "baseline": 0.0,
+                "actual": 0.0,
+                "efficiency_sum": 0.0,
+                "docs": 0.0,
+                "processing_seconds": 0.0,
+            }
+        )
+
+        resolved_rows: List[Dict[str, float]] = []
+        for d in filtered:
+            carbon = _resolve_doc_carbon(d)
+            if carbon is None:
+                continue
+            saved_at = _aware(d.saved_at)
+            assert saved_at is not None
+            day_key = saved_at.strftime("%Y-%m-%d")
+            bucket = daily[day_key]
+            bucket["saved"] += carbon["saved"]
+            bucket["baseline"] += carbon["baseline"]
+            bucket["actual"] += carbon["actual"]
+            bucket["efficiency_sum"] += carbon["efficiency"]
+            bucket["docs"] += 1.0
+            bucket["processing_seconds"] += float(d.processing_time_seconds or 0.0)
+            resolved_rows.append(carbon)
+
+        carbon_trend = []
+        energy_trend = []
+        for day_key in sorted(daily.keys()):
+            bucket = daily[day_key]
+            docs_n = int(bucket["docs"])
+            avg_eff = (bucket["efficiency_sum"] / docs_n) if docs_n else 0.0
+            day_dt = datetime.strptime(day_key, "%Y-%m-%d")
+            label = day_dt.strftime("%b %d")
+            actual = bucket["actual"]
+            baseline = bucket["baseline"]
+            saved = bucket["saved"]
+            energy_kwh = (actual / grid) if grid > 0 else 0.0
+
+            carbon_trend.append(
+                {
+                    "date": label,
+                    "date_iso": day_key,
+                    "savings": round(saved, 4),
+                    "carbon_saved": round(saved, 4),
+                    "baseline": round(baseline, 4),
+                    "actual": round(actual, 4),
+                    "efficiency": round(avg_eff, 2),
+                    "docs_processed": docs_n,
+                }
+            )
+            energy_trend.append(
+                {
+                    "date": label,
+                    "date_iso": day_key,
+                    "energy_consumed_kwh": round(energy_kwh, 6),
+                    "estimated_co2e": round(actual, 4),
+                    "docs_processed": docs_n,
+                    "processing_seconds": round(bucket["processing_seconds"], 2),
+                }
+            )
+
+        total_docs = len(resolved_rows)
+        total_carbon_saved = sum(row["saved"] for row in resolved_rows)
+        total_baseline = sum(row["baseline"] for row in resolved_rows)
+        total_actual = sum(row["actual"] for row in resolved_rows)
+        avg_efficiency = (
+            sum(row["efficiency"] for row in resolved_rows) / total_docs if total_docs else 0.0
+        )
+
+        point_count = len(carbon_trend)
+        empty_msg = None
+        if total_docs <= 1 or point_count < 2:
+            empty_msg = "More analytics will appear as additional documents are processed."
+
         db.close()
-        
+
         return {
-            "total_carbon_saved": total_carbon_saved,
+            "total_carbon_saved": round(total_carbon_saved, 4),
+            "total_carbon_consumed": round(total_actual, 4),
+            "total_baseline_carbon": round(total_baseline, 4),
             "total_docs": total_docs,
-            "avg_efficiency": avg_efficiency,
-            "carbon_trend": trends[-7:] if len(trends) > 7 else trends
+            "avg_efficiency": round(avg_efficiency, 2),
+            "carbon_trend": carbon_trend,
+            "energy_trend": energy_trend,
+            "range": key,
+            "start_date": start_dt.date().isoformat() if start_dt else None,
+            "end_date": end_dt.date().isoformat() if end_dt else None,
+            "point_count": point_count,
+            "empty_state_message": empty_msg,
         }
     except Exception as e:
         log.error(f"Failed to get dashboard stats: {e}")
-        return {
-            "total_carbon_saved": 0, 
-            "total_docs": 0, 
-            "avg_efficiency": 0, 
-            "carbon_trend": []
-        }
+        return empty
+
 
 # -----------------------------------------------------------
 # USER MANAGEMENT FUNCTIONS
