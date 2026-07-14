@@ -409,31 +409,36 @@ def get_job_status(
 ):
     """
     Endpoint for the frontend to poll for job status.
+
+    Loads status columns only (no ``result_json``) so polls stay cheap.
+    Response schema is unchanged — ``JobStatus`` never included the result blob.
     """
     assert_document_owner(int(current_user["id"]), job_id)
-    status_dict = job_store.get_job(job_id)
+    status_dict = job_store.get_job(job_id, include_result=False)
     if not status_dict:
         raise HTTPException(status_code=404, detail="Job not found.")
 
     # Heal race: result already persisted but a late heartbeat left status=processing.
+    # Only hydrate the full row when progress claims completion while status lags.
     status = str(status_dict.get("status") or "pending")
-    if (
-        status == job_status_mod.STATUS_PROCESSING
-        and isinstance(status_dict.get("result"), dict)
-        and status_dict["result"].get("final_summary")
-        and float(status_dict.get("progress") or 0.0) >= 100.0
-    ):
-        job_store.upsert_job(
-            job_id,
-            status=job_status_mod.STATUS_COMPLETE,
-            progress=100.0,
-            message="Job complete. Results are ready.",
-            result=status_dict.get("result"),
-            claimed_by=None,
-            heartbeat_at=None,
-        )
-        status_dict = job_store.get_job(job_id) or status_dict
-        status = str(status_dict.get("status") or status)
+    progress = float(status_dict.get("progress") or 0.0)
+    if status == job_status_mod.STATUS_PROCESSING and progress >= 100.0:
+        full = job_store.get_job(job_id, include_result=True) or status_dict
+        if (
+            isinstance(full.get("result"), dict)
+            and full["result"].get("final_summary")
+        ):
+            job_store.upsert_job(
+                job_id,
+                status=job_status_mod.STATUS_COMPLETE,
+                progress=100.0,
+                message="Job complete. Results are ready.",
+                result=full.get("result"),
+                claimed_by=None,
+                heartbeat_at=None,
+            )
+            status_dict = job_store.get_job(job_id, include_result=False) or full
+            status = str(status_dict.get("status") or status)
 
     try:
         return _job_status_payload(job_id, status_dict)

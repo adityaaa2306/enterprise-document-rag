@@ -43,6 +43,11 @@ type Props = {
   idlePollMs?: number
   /** When true and no currentJobId, open the latest history job once. */
   autoSelectLatest?: boolean
+  /**
+   * When true (e.g. Results page owns /job-status polling), only refresh
+   * queue/history infrequently to avoid duplicate request storms.
+   */
+  deferPolling?: boolean
 }
 
 const ACTIVE_POLL_MS = 2500
@@ -68,6 +73,7 @@ export function JobQueuePanel({
   pollMs = ACTIVE_POLL_MS,
   idlePollMs = IDLE_POLL_MS,
   autoSelectLatest = false,
+  deferPolling = false,
 }: Props) {
   const router = useRouter()
   const [queue, setQueue] = useState<QueueSnapshot | null>(null)
@@ -132,9 +138,11 @@ export function JobQueuePanel({
         typeof document !== "undefined" && document.visibilityState === "hidden"
       const delay = hidden
         ? Math.max(idlePollMs, 60000)
-        : needsFastPollRef.current
-          ? pollMs
-          : idlePollMs
+        : deferPolling
+          ? Math.max(idlePollMs, 20000)
+          : needsFastPollRef.current
+            ? pollMs
+            : idlePollMs
       timer = setTimeout(tick, delay)
     }
 
@@ -166,7 +174,7 @@ export function JobQueuePanel({
       if (timer) clearTimeout(timer)
       document.removeEventListener("visibilitychange", onVisibility)
     }
-  }, [refresh, pollMs, idlePollMs])
+  }, [refresh, pollMs, idlePollMs, deferPolling])
 
   const openJob = (jobId: string) => {
     rememberJobId(jobId)

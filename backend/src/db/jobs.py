@@ -142,26 +142,67 @@ def set_understanding(job_id: str, value: str) -> None:
     upsert_job(job_id, understanding=value)
 
 
-def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+def get_job(job_id: str, *, include_result: bool = True) -> Optional[Dict[str, Any]]:
     """
     Read job status.
 
     When durable DB mode is on, refresh from Postgres/SQLite so a separate API
     process sees worker updates. In the embedded-worker process, never clobber a
     fresher in-memory progress/message with a stale DB row (throttle window).
+
+    Pass ``include_result=False`` for polling endpoints (``/job-status``) so the
+    large ``result_json`` blob is not deserialized on every tick. Response shape
+    for callers that ignore ``result`` is unchanged.
     """
     mem = JOB_STATUSES.get(job_id)
     if _db_enabled():
         try:
+            from sqlalchemy.orm import load_only
+
             from src.db.models import JobModel
             from src.db.session import get_session
 
             db = get_session()
             try:
-                row = db.get(JobModel, job_id)
+                if include_result:
+                    row = db.get(JobModel, job_id)
+                else:
+                    row = (
+                        db.execute(
+                            select(JobModel)
+                            .where(JobModel.id == job_id)
+                            .options(
+                                load_only(
+                                    JobModel.id,
+                                    JobModel.user_id,
+                                    JobModel.status,
+                                    JobModel.progress,
+                                    JobModel.message,
+                                    JobModel.filename,
+                                    JobModel.job_mode,
+                                    JobModel.claimed_by,
+                                    JobModel.attempt_count,
+                                    JobModel.error_detail,
+                                    JobModel.available_at,
+                                    JobModel.heartbeat_at,
+                                    JobModel.created_at,
+                                    JobModel.updated_at,
+                                    JobModel.completed_at,
+                                )
+                            )
+                        )
+                        .scalars()
+                        .first()
+                    )
                 if not row:
+                    if not include_result and mem:
+                        light = dict(mem)
+                        light.pop("result", None)
+                        light.pop("understanding", None)
+                        light.pop("routing_decision", None)
+                        return light
                     return mem
-                status = _row_to_status(row)
+                status = _row_to_status(row, include_result=include_result)
                 if mem and str(mem.get("status") or "") in (
                     job_status_mod.STATUS_PROCESSING,
                     job_status_mod.STATUS_PENDING,
@@ -179,14 +220,33 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
                             status["partial"] = mem.get("partial")
                         if mem.get("status"):
                             status["status"] = mem.get("status")
-                JOB_STATUSES[job_id] = status
+                # Keep in-memory result when this read intentionally skipped it.
+                if not include_result and mem and mem.get("result") is not None:
+                    cached = dict(mem)
+                    cached.update(status)
+                    cached["result"] = mem["result"]
+                    JOB_STATUSES[job_id] = cached
+                else:
+                    JOB_STATUSES[job_id] = status
                 return status
             finally:
                 db.close()
         except Exception as e:
             log.error(f"Failed to load job {job_id} from DB: {e}")
+            if not include_result and mem:
+                light = dict(mem)
+                light.pop("result", None)
+                light.pop("understanding", None)
+                light.pop("routing_decision", None)
+                return light
             return mem
 
+    if not include_result and mem:
+        light = dict(mem)
+        light.pop("result", None)
+        light.pop("understanding", None)
+        light.pop("routing_decision", None)
+        return light
     return mem
 
 

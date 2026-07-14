@@ -1,15 +1,13 @@
 "use client"
 
+import dynamic from "next/dynamic"
 import { motion } from "framer-motion"
-import { useState, useEffect, Suspense, useCallback } from "react"
+import { useState, useEffect, Suspense, useCallback, useRef } from "react"
 import { useSearchParams, useRouter } from "next/navigation"
 import { Sidebar } from "@/components/sidebar"
 import { TopBar } from "@/components/top-bar"
 import { LiveFeed } from "@/components/live-feed"
 import { JobQueuePanel } from "@/components/job-queue-panel"
-import { JobResultsPanel } from "@/components/job-results-panel"
-import { ExpandableSummary } from "@/components/expandable-summary"
-import { DocumentChat } from "@/components/document-chat"
 import { Card } from "@/components/ui/card"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { apiFetch } from "@/lib/api"
@@ -17,6 +15,35 @@ import { getLastJobId, rememberJobId } from "@/lib/job-session"
 import type { ProcessingInsightsData } from "@/components/processing-insights"
 import { unwrapOuterMarkdownFence } from "@/lib/utils"
 import { stripSummaryMetrics } from "@/lib/strip-summary-metrics"
+import {
+  ResultsPanelSkeleton,
+  SummarySkeleton,
+  ChatSkeleton,
+} from "@/components/loading-skeletons"
+
+const JobResultsPanel = dynamic(
+  () =>
+    import("@/components/job-results-panel").then((m) => ({
+      default: m.JobResultsPanel,
+    })),
+  { ssr: false, loading: () => <ResultsPanelSkeleton /> },
+)
+
+const ExpandableSummary = dynamic(
+  () =>
+    import("@/components/expandable-summary").then((m) => ({
+      default: m.ExpandableSummary,
+    })),
+  { ssr: false, loading: () => <SummarySkeleton /> },
+)
+
+const DocumentChat = dynamic(
+  () =>
+    import("@/components/document-chat").then((m) => ({
+      default: m.DocumentChat,
+    })),
+  { ssr: false, loading: () => <ChatSkeleton /> },
+)
 
 /** Poll every 1.5s; skip ticks while a request is in flight (avoids stampede). */
 const POLL_INTERVAL_MS = 1500
@@ -36,6 +63,9 @@ const TERMINAL_STATUSES = new Set([
   "cancelled",
   "canceled",
 ])
+
+/** Session cache so revisiting Results with the same job_id skips a duplicate fetch. */
+const resultCache = new Map<string, JobResult>()
 
 function normalizeStatus(raw: string | undefined | null): string {
   return (raw || "").trim().toLowerCase()
@@ -97,6 +127,8 @@ function ResultsContent() {
   const [liveStage, setLiveStage] = useState<string | null>(null)
   const [chunkProgress, setChunkProgress] = useState<string | null>(null)
   const [result, setResult] = useState<JobResult | null>(null)
+  const [resultLoading, setResultLoading] = useState(false)
+  const fetchGen = useRef(0)
 
   // Restore last job when visiting /results without query (sidebar nav)
   useEffect(() => {
@@ -122,6 +154,7 @@ function ResultsContent() {
       setFailureMessage(null)
       setLogs([])
       setResult(null)
+      setResultLoading(false)
       setLiveProgress(0)
       setLiveStage(null)
       setChunkProgress(null)
@@ -130,9 +163,44 @@ function ResultsContent() {
     [router],
   )
 
+  const fetchResult = useCallback(async (id: string) => {
+    const cached = resultCache.get(id)
+    if (cached) {
+      setResult(cached)
+      setResultLoading(false)
+      return
+    }
+    const gen = ++fetchGen.current
+    setResultLoading(true)
+    try {
+      const response = await apiFetch(`/job-result/${id}?_ts=${Date.now()}`, {
+        cache: "no-store",
+      })
+      if (gen !== fetchGen.current) return
+      if (response.ok) {
+        const data: JobResult = await response.json()
+        resultCache.set(id, data)
+        setResult(data)
+      }
+    } catch (error) {
+      console.error("Error fetching result:", error)
+    } finally {
+      if (gen === fetchGen.current) setResultLoading(false)
+    }
+  }, [])
+
   useEffect(() => {
     if (!jobId) return
     rememberJobId(jobId)
+
+    // Instant path: cached completed result → paint immediately, skip poll loop.
+    const cached = resultCache.get(jobId)
+    if (cached) {
+      setIsComplete(true)
+      setResult(cached)
+      setLiveProgress(100)
+      return
+    }
 
     let cancelled = false
     let pollInterval: ReturnType<typeof setInterval> | undefined
@@ -218,19 +286,13 @@ function ResultsContent() {
                     : ""
                 }`
               : data.message || `Status: ${data.status}`
-          appendLog(
-            detail,
-            isErrorStatus(data.status) ? "error" : "info",
-          )
+          appendLog(detail, isErrorStatus(data.status) ? "error" : "info")
 
           if (isSuccessStatus(data.status)) {
             setIsComplete(true)
             stopPolling()
-            fetchResult()
-          } else if (
-            isErrorStatus(data.status) ||
-            isTerminalStatus(data.status)
-          ) {
+            void fetchResult(jobId)
+          } else if (isErrorStatus(data.status) || isTerminalStatus(data.status)) {
             setJobFailed(true)
             setFailureMessage(data.message || "Job failed.")
             stopPolling()
@@ -238,8 +300,6 @@ function ResultsContent() {
         }
       } catch (error) {
         console.error("Polling error:", error)
-        // Keep polling on transient network errors until POLL_TIMEOUT_MS.
-        // Show a heartbeat so the UI does not look frozen when the API is busy.
         appendLog("Waiting for status (API busy or reconnecting)…", "info")
       } finally {
         inFlight = false
@@ -253,22 +313,7 @@ function ResultsContent() {
       cancelled = true
       stopPolling()
     }
-  }, [jobId])
-
-  const fetchResult = async () => {
-    try {
-      const response = await apiFetch(
-        `/job-result/${jobId}?_ts=${Date.now()}`,
-        { cache: "no-store" },
-      )
-      if (response.ok) {
-        const data: JobResult = await response.json()
-        setResult(data)
-      }
-    } catch (error) {
-      console.error("Error fetching result:", error)
-    }
-  }
+  }, [jobId, fetchResult])
 
   const handleCopy = () => {
     if (result?.final_summary) {
@@ -301,6 +346,8 @@ function ResultsContent() {
   const summaryMarkdown = result?.final_summary
     ? stripSummaryMetrics(unwrapOuterMarkdownFence(result.final_summary))
     : ""
+  /** While Results owns job-status polling, slow the sidebar queue polls. */
+  const deferQueuePolling = Boolean(jobId) && !isComplete && !jobFailed && !pollTimedOut
 
   return (
     <div className="flex">
@@ -320,6 +367,7 @@ function ResultsContent() {
                   currentJobId={jobId}
                   onSelectJob={selectJob}
                   autoSelectLatest
+                  deferPolling={deferQueuePolling}
                 />
               </div>
 
@@ -339,7 +387,9 @@ function ResultsContent() {
                       <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
                         <div
                           className="h-full bg-primary transition-all duration-300 ease-out"
-                          style={{ width: `${Math.min(100, Math.max(0, liveProgress))}%` }}
+                          style={{
+                            width: `${Math.min(100, Math.max(0, liveProgress))}%`,
+                          }}
                         />
                       </div>
                     </Card>
@@ -359,12 +409,8 @@ function ResultsContent() {
                   </Card>
                 ) : null}
 
-                {isComplete && !result ? (
-                  <Card className="p-6 bg-card/50 border-border/50">
-                    <p className="text-sm text-muted-foreground">
-                      Job complete — loading results…
-                    </p>
-                  </Card>
+                {isComplete && (resultLoading || !result) ? (
+                  <ResultsPanelSkeleton />
                 ) : null}
 
                 {isComplete && result ? (
@@ -387,7 +433,10 @@ function ResultsContent() {
                       </TabsContent>
 
                       <TabsContent value="chat" className="space-y-4">
-                        <DocumentChat key={(result as any).document_id} result={result as any} />
+                        <DocumentChat
+                          key={(result as any).document_id}
+                          result={result as any}
+                        />
                       </TabsContent>
                     </Tabs>
                   </>
@@ -419,7 +468,15 @@ function ResultsContent() {
 
 export default function ResultsPage() {
   return (
-    <Suspense fallback={<div>Loading...</div>}>
+    <Suspense
+      fallback={
+        <div className="flex min-h-screen">
+          <div className="flex-1 p-8">
+            <ResultsPanelSkeleton />
+          </div>
+        </div>
+      }
+    >
       <ResultsContent />
     </Suspense>
   )

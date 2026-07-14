@@ -1,25 +1,13 @@
 "use client"
 
+import dynamic from "next/dynamic"
 import { motion } from "framer-motion"
 import { Sidebar } from "@/components/sidebar"
 import { TopBar } from "@/components/top-bar"
 import { apiFetch } from "@/lib/api"
 import { KPICard } from "@/components/kpi-card"
-import { ChartCard } from "@/components/chart-card"
 import { DocumentHistory } from "@/components/document-history"
 import { useCallback, useEffect, useMemo, useState } from "react"
-import {
-  Bar,
-  BarChart,
-  CartesianGrid,
-  Legend,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts"
 import { Leaf, Scale, TrendingDown, Gauge } from "lucide-react"
 import { Card } from "@/components/ui/card"
 import { Label } from "@/components/ui/label"
@@ -31,6 +19,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { DashboardChartsSkeleton } from "@/components/loading-skeletons"
+
+const DashboardCharts = dynamic(() => import("@/components/dashboard-charts"), {
+  ssr: false,
+  loading: () => <DashboardChartsSkeleton />,
+})
 
 type RangeKey = "today" | "7d" | "30d" | "90d" | "custom"
 
@@ -73,33 +67,6 @@ function fmt(value: number | undefined | null, digits = 2) {
   return Number(value).toFixed(digits)
 }
 
-function CarbonTooltip({ active, payload, label }: any) {
-  if (!active || !payload?.length) return null
-  const row = payload[0]?.payload as TrendPoint
-  return (
-    <div className="rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-xl">
-      <p className="font-semibold mb-1">{label}</p>
-      <p>Baseline CO₂: {fmt(row.baseline)} g</p>
-      <p>Actual CO₂: {fmt(row.actual)} g</p>
-      <p>Carbon Saved: {fmt(row.carbon_saved ?? row.savings)} g</p>
-      <p>Efficiency: {fmt(row.efficiency, 1)}%</p>
-    </div>
-  )
-}
-
-function EnergyTooltip({ active, payload, label }: any) {
-  if (!active || !payload?.length) return null
-  const row = payload[0]?.payload as EnergyPoint
-  return (
-    <div className="rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-xl">
-      <p className="font-semibold mb-1">{label}</p>
-      <p>Energy Consumed: {fmt(row.energy_consumed_kwh, 4)} kWh</p>
-      <p>Estimated CO₂: {fmt(row.estimated_co2e)} g</p>
-      <p>Documents Processed: {row.docs_processed ?? 0}</p>
-    </div>
-  )
-}
-
 export default function Dashboard() {
   const [range, setRange] = useState<RangeKey>("30d")
   const [customStart, setCustomStart] = useState("")
@@ -113,6 +80,7 @@ export default function Dashboard() {
     carbon_trend: [],
     energy_trend: [],
   })
+  const [statsLoaded, setStatsLoaded] = useState(false)
 
   const queryString = useMemo(() => {
     const params = new URLSearchParams()
@@ -146,6 +114,8 @@ export default function Dashboard() {
       }
     } catch (e) {
       console.error("Failed to fetch dashboard stats", e)
+    } finally {
+      setStatsLoaded(true)
     }
   }, [queryString])
 
@@ -249,141 +219,16 @@ export default function Dashboard() {
               />
             </div>
 
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-              <ChartCard title="Daily Carbon Savings vs Baseline" delay={0.2}>
-                {sparse ? (
-                  <div className="space-y-4">
-                    <p className="text-sm text-muted-foreground">{emptyMessage}</p>
-                    {stats.carbon_trend.length > 0 ? (
-                      <ResponsiveContainer width="100%" height={260}>
-                        <BarChart data={stats.carbon_trend}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" />
-                          <XAxis dataKey="date" stroke="rgba(255,255,255,0.45)" />
-                          <YAxis stroke="rgba(255,255,255,0.45)" />
-                          <Tooltip content={<CarbonTooltip />} />
-                          <Legend />
-                          <Bar dataKey="baseline" name="Baseline CO₂" fill="#64748b" radius={6} />
-                          <Bar dataKey="actual" name="Actual CO₂" fill="#22c55e" radius={6} />
-                          <Bar
-                            dataKey="carbon_saved"
-                            name="Carbon Saved"
-                            fill="#3b82f6"
-                            radius={6}
-                          />
-                        </BarChart>
-                      </ResponsiveContainer>
-                    ) : (
-                      <div className="h-[260px] flex items-center justify-center text-sm text-muted-foreground">
-                        No documents in this range yet.
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <ResponsiveContainer width="100%" height={300}>
-                    <LineChart data={stats.carbon_trend}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" />
-                      <XAxis dataKey="date" stroke="rgba(255,255,255,0.45)" />
-                      <YAxis stroke="rgba(255,255,255,0.45)" />
-                      <Tooltip content={<CarbonTooltip />} />
-                      <Legend />
-                      <Line
-                        type="monotone"
-                        dataKey="baseline"
-                        name="Baseline CO₂"
-                        stroke="rgba(255,255,255,0.35)"
-                        strokeWidth={2}
-                        dot={{ r: 3 }}
-                      />
-                      <Line
-                        type="monotone"
-                        dataKey="actual"
-                        name="Actual CO₂"
-                        stroke="#22c55e"
-                        strokeWidth={2}
-                        dot={{ r: 3 }}
-                      />
-                      <Line
-                        type="monotone"
-                        dataKey="carbon_saved"
-                        name="Carbon Saved"
-                        stroke="#3b82f6"
-                        strokeWidth={2}
-                        dot={{ r: 3 }}
-                      />
-                    </LineChart>
-                  </ResponsiveContainer>
-                )}
-              </ChartCard>
-
-              <ChartCard title="Energy & Processing Trends" delay={0.25}>
-                {sparse ? (
-                  <div className="space-y-4">
-                    <p className="text-sm text-muted-foreground">{emptyMessage}</p>
-                    {stats.energy_trend.length > 0 ? (
-                      <ResponsiveContainer width="100%" height={260}>
-                        <BarChart data={stats.energy_trend}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" />
-                          <XAxis dataKey="date" stroke="rgba(255,255,255,0.45)" />
-                          <YAxis stroke="rgba(255,255,255,0.45)" />
-                          <Tooltip content={<EnergyTooltip />} />
-                          <Legend />
-                          <Bar
-                            dataKey="estimated_co2e"
-                            name="Estimated CO₂"
-                            fill="#22c55e"
-                            radius={6}
-                          />
-                          <Bar
-                            dataKey="docs_processed"
-                            name="Documents"
-                            fill="#64748b"
-                            radius={6}
-                          />
-                        </BarChart>
-                      </ResponsiveContainer>
-                    ) : (
-                      <div className="h-[260px] flex items-center justify-center text-sm text-muted-foreground">
-                        No documents in this range yet.
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <ResponsiveContainer width="100%" height={300}>
-                    <LineChart data={stats.energy_trend}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" />
-                      <XAxis dataKey="date" stroke="rgba(255,255,255,0.45)" />
-                      <YAxis stroke="rgba(255,255,255,0.45)" />
-                      <Tooltip content={<EnergyTooltip />} />
-                      <Legend />
-                      <Line
-                        type="monotone"
-                        dataKey="energy_consumed_kwh"
-                        name="Energy (kWh)"
-                        stroke="#f59e0b"
-                        strokeWidth={2}
-                        dot={{ r: 3 }}
-                      />
-                      <Line
-                        type="monotone"
-                        dataKey="estimated_co2e"
-                        name="Estimated CO₂"
-                        stroke="#22c55e"
-                        strokeWidth={2}
-                        dot={{ r: 3 }}
-                      />
-                      <Line
-                        type="monotone"
-                        dataKey="docs_processed"
-                        name="Documents"
-                        stroke="#64748b"
-                        strokeWidth={2}
-                        dot={{ r: 3 }}
-                      />
-                    </LineChart>
-                  </ResponsiveContainer>
-                )}
-              </ChartCard>
-            </div>
+            {statsLoaded ? (
+              <DashboardCharts
+                carbonTrend={stats.carbon_trend}
+                energyTrend={stats.energy_trend}
+                sparse={sparse}
+                emptyMessage={emptyMessage}
+              />
+            ) : (
+              <DashboardChartsSkeleton />
+            )}
 
             <div className="mb-8">
               <DocumentHistory />
