@@ -32,6 +32,22 @@ export type QueueSnapshot = {
     current_job_id?: string | null
   }>
   active_jobs: JobListItem[]
+  scheduler?: {
+    endpoint_count?: number
+    active_requests?: number
+    total_capacity?: number
+    available_slots?: number
+    utilization?: number
+    avg_latency_ms?: number
+    avg_ttft_ms?: number
+    endpoints?: Array<{
+      id?: string
+      active?: number
+      max_concurrent?: number
+      healthy?: boolean
+      latency_ema_ms?: number
+    }>
+  } | null
 }
 
 type Props = {
@@ -225,6 +241,15 @@ export function JobQueuePanel({
                     ? `Worker busy · ${queue.processing_count} processing · ${queue.queued_count} queued`
                     : `Worker idle · ${queue.queued_count} queued`}
             </p>
+            {queue?.scheduler && typeof queue.scheduler.utilization === "number" ? (
+              <p className="text-xs text-muted-foreground mt-1 tabular-nums">
+                NIM endpoints {queue.scheduler.endpoint_count ?? "?"} ·{" "}
+                {Math.round(queue.scheduler.utilization * 100)}% util (
+                {queue.scheduler.active_requests ?? 0}/
+                {queue.scheduler.total_capacity ?? "?"}) · avg TTFT{" "}
+                {Math.round(queue.scheduler.avg_ttft_ms ?? 0)}ms
+              </p>
+            ) : null}
           </div>
           <Button
             type="button"

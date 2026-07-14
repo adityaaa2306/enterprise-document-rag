@@ -237,20 +237,52 @@ def call_chat_with_fallback(
     role = "compile" if (call_meta or {}).get("phase") == "compile" else "map"
     if call_meta and call_meta.get("endpoint_role"):
         role = str(call_meta.get("endpoint_role"))
-    if use_pool and pool_mod is not None:
-        lease = pool_mod.acquire_endpoint(role=role)
-        client = lease.client if lease else get_nim_client()
-    else:
-        client = get_nim_client()
+    exclude_endpoints: set = set()
+    acquire_timeout = float(
+        getattr(settings, "NIM_ENDPOINT_ACQUIRE_TIMEOUT_SEC", 120.0) or 120.0
+    )
+    soft_ttft = float(getattr(settings, "NIM_SOFT_TTFT_TIMEOUT_SEC", 45.0) or 0.0)
+    # Soft TTFT applies to map/embed paths; compile uses its own shorter wall.
+    use_soft_ttft = soft_ttft > 0 and role != "compile"
+    # Measure TTFT whenever soft timeout is active (stream + cancel).
+    measure_ttft = bool(return_timing or use_soft_ttft)
+
+    def _acquire_client():
+        nonlocal lease
+        if use_pool and pool_mod is not None:
+            lease = pool_mod.acquire_endpoint(
+                role=role,
+                exclude_ids=exclude_endpoints or None,
+                block=True,
+                timeout=acquire_timeout,
+            )
+            if lease is None and exclude_endpoints:
+                # All preferred endpoints busy/cooling — allow any with capacity
+                lease = pool_mod.acquire_endpoint(
+                    role=role, block=True, timeout=min(30.0, acquire_timeout)
+                )
+            return lease.client if lease else get_nim_client()
+        return get_nim_client()
+
+    client = _acquire_client()
     if client is None:
         raise RuntimeError("NVIDIA NIM client is not configured (missing NVIDIA_API_KEY).")
 
     if max_retries_per_model is None:
-        max_retries_per_model = int(getattr(settings, "NIM_TRANSIENT_RETRIES", 3) or 3)
+        max_retries_per_model = int(getattr(settings, "NIM_TRANSIENT_RETRIES", 1) or 1)
     max_retries_per_model = max(1, int(max_retries_per_model))
+    # Extra same-model tries across different endpoints before model fallback.
+    endpoint_retries = max(
+        1, int(getattr(settings, "NIM_ENDPOINT_RETRIES_PER_MODEL", 2) or 2)
+    )
 
     last_error: Optional[Exception] = None
-    base_timeout = timeout or _nim_timeout()
+    hard_read = float(
+        getattr(settings, "NIM_HARD_TIMEOUT_SEC", None)
+        or getattr(settings, "NIM_HTTP_TIMEOUT_SEC", 90.0)
+        or 90.0
+    )
+    base_timeout = timeout or _nim_timeout(read_override=hard_read)
     t_call0 = time.perf_counter()
     attempts_log: List[Dict[str, Any]] = []
     retry_count = 0
@@ -275,7 +307,14 @@ def call_chat_with_fallback(
                 )
                 log.warning("%s", last_error)
                 break
-        for attempt in range(max_retries_per_model):
+        model_attempts = max_retries_per_model * endpoint_retries
+        for attempt in range(model_attempts):
+            # Soft TTFT via idle read timeout: httpx resets between streamed
+            # tokens, so a hung socket dies at soft_ttft while active streams
+            # can continue up to the scheduler hard wall.
+            read_cap = float(getattr(base_timeout, "read", None) or hard_read)
+            if use_soft_ttft and soft_ttft > 0:
+                read_cap = min(read_cap, soft_ttft)
             if deadline_mono is not None:
                 remaining = float(deadline_mono) - time.monotonic()
                 if remaining <= max(1.0, connect_cap):
@@ -285,17 +324,15 @@ def call_chat_with_fallback(
                     )
                     log.warning("%s", last_error)
                     break
-                # Shrink read timeout so the socket itself returns before the wall.
-                read_cap = float(getattr(base_timeout, "read", None) or 90.0)
                 req_timeout = httpx.Timeout(
                     max(1.0, min(read_cap, remaining - 0.5)),
                     connect=min(connect_cap, max(1.0, remaining - 0.5)),
                 )
             else:
-                req_timeout = base_timeout
+                req_timeout = httpx.Timeout(read_cap, connect=connect_cap)
             t_attempt = time.perf_counter()
             try:
-                if return_timing:
+                if measure_ttft:
                     text, timing = _chat_completion_with_ttft(
                         client,
                         model_id=model_id,
@@ -303,6 +340,7 @@ def call_chat_with_fallback(
                         temperature=temperature,
                         max_tokens=max_tokens,
                         timeout=req_timeout,
+                        soft_ttft_timeout_sec=soft_ttft if use_soft_ttft else None,
                     )
                 else:
                     completion = client.chat.completions.create(
@@ -317,6 +355,7 @@ def call_chat_with_fallback(
                 if not text:
                     raise ValueError(f"Empty response from {model_id}")
                 attempt_ms = (time.perf_counter() - t_attempt) * 1000.0
+                ttft_ms = float((timing or {}).get("ttft_ms") or 0.0)
                 attempts_log.append(
                     {
                         "model_id": model_id,
@@ -325,6 +364,7 @@ def call_chat_with_fallback(
                         "duration_ms": round(attempt_ms, 1),
                         "http_status": 200,
                         "error": None,
+                        "endpoint_id": lease.endpoint_id if lease else None,
                     }
                 )
                 log.info(
@@ -349,7 +389,11 @@ def call_chat_with_fallback(
                     )
                 if use_pool and pool_mod is not None and lease is not None:
                     pool_mod.release_endpoint(
-                        lease, ok=True, latency_ms=attempt_ms, rate_limited=False
+                        lease,
+                        ok=True,
+                        latency_ms=attempt_ms,
+                        ttft_ms=ttft_ms,
+                        rate_limited=False,
                     )
                     lease = None
                 if return_timing:
@@ -376,6 +420,12 @@ def call_chat_with_fallback(
                     http_status = _http_status_from_exc(e)
                 last_http_status = http_status
                 attempt_ms = (time.perf_counter() - t_attempt) * 1000.0
+                is_soft = "soft_ttft" in err_str.lower() or "soft ttft" in err_str.lower()
+                is_timeout = (
+                    is_soft
+                    or isinstance(classified, (APITimeoutError, TimeoutError))
+                    or "timeout" in err_str.lower()
+                )
                 attempts_log.append(
                     {
                         "model_id": model_id,
@@ -385,6 +435,7 @@ def call_chat_with_fallback(
                         "http_status": http_status,
                         "error": f"{type(classified).__name__}: {str(classified)[:180]}",
                         "endpoint_id": lease.endpoint_id if lease else None,
+                        "soft_ttft": is_soft,
                     }
                 )
                 is_rate_limit = (
@@ -392,46 +443,60 @@ def call_chat_with_fallback(
                     or "429" in err_str
                     or "rate" in err_str.lower()
                 )
-                transient = is_transient_nim_error(classified) or is_rate_limit
+                # Retry only on timeout / 429 / 5xx / connection (and soft TTFT).
+                retryable = (
+                    is_soft
+                    or is_timeout
+                    or is_rate_limit
+                    or is_transient_nim_error(classified)
+                    or (http_status is not None and http_status >= 500)
+                )
 
-                # Cool current endpoint and rotate for the next attempt
+                failed_ep = lease.endpoint_id if lease else None
                 if use_pool and pool_mod is not None and lease is not None:
                     pool_mod.release_endpoint(
                         lease,
                         ok=False,
                         latency_ms=attempt_ms,
                         rate_limited=is_rate_limit,
+                        timed_out=is_timeout,
                     )
-                    lease = pool_mod.acquire_endpoint(role=role)
-                    if lease is not None:
-                        client = lease.client
+                    lease = None
+                if failed_ep:
+                    exclude_endpoints.add(failed_ep)
 
-                if transient and attempt < max_retries_per_model - 1:
-                    if deadline_mono is not None:
-                        remaining = float(deadline_mono) - time.monotonic()
-                        if remaining <= max(1.0, connect_cap):
-                            break
+                if retryable and attempt < model_attempts - 1:
                     retry_count += 1
-                    wait = (3 * (attempt + 1)) if is_rate_limit else (2 ** attempt)
+                    # Prefer another endpoint on the SAME model before falling through.
+                    client = _acquire_client()
+                    if client is None:
+                        break
+                    wait = 0.5 if is_soft else ((2 * (attempt + 1)) if is_rate_limit else 0.25)
                     if deadline_mono is not None:
-                        wait = min(wait, max(0.0, float(deadline_mono) - time.monotonic() - 1.0))
+                        wait = min(
+                            wait, max(0.0, float(deadline_mono) - time.monotonic() - 1.0)
+                        )
                     log.warning(
-                        "Transient NIM error on %s (%s). Retrying in %ss "
-                        "(attempt %s/%s)...",
+                        "NIM retry model=%s endpoint_rotate=%s reason=%s attempt=%s/%s",
                         model_id,
+                        failed_ep,
                         type(classified).__name__,
-                        wait,
                         attempt + 1,
-                        max_retries_per_model,
+                        model_attempts,
                     )
                     if wait > 0:
                         time.sleep(wait)
                     continue
 
                 log.warning(
-                    f"Model '{model_id}' failed ({type(classified).__name__}): {classified}. "
-                    f"Trying next fallback if any."
+                    "Model '%s' failed on all tried endpoints (%s): %s. "
+                    "Trying next fallback if any.",
+                    model_id,
+                    type(classified).__name__,
+                    classified,
                 )
+                exclude_endpoints.clear()
+                client = _acquire_client()
                 break  # next model
         else:
             continue
@@ -471,25 +536,21 @@ def _chat_completion_with_ttft(
     temperature: float,
     max_tokens: int,
     timeout: httpx.Timeout,
+    soft_ttft_timeout_sec: Optional[float] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Stream the completion solely to separate TTFT from TTLT.
     Accumulates the full text; does not change the upstream response shape.
     Falls back to a blocking call if streaming is unsupported.
 
-    Timing fields (all measured, not estimated):
-      request_start_ms — always 0 (reference)
-      first_byte_ms — first streamed chunk received (any delta)
-      ttft_ms — first non-empty content token
-      ttlt_ms — stream complete / last token
-      network_ms — alias of first_byte_ms (server→client first packet)
-      inference_ms — ttlt_ms - first_byte_ms (approx generation after first packet)
-      mode — stream_measure | blocking_ttft_equals_ttlt
+    When ``soft_ttft_timeout_sec`` is set and no content token arrives in time,
+    raises ``NimApiError`` with ``soft_ttft`` so the caller can rotate endpoints.
     """
     t0 = time.perf_counter()
     ttft_ms: Optional[float] = None
     first_byte_ms: Optional[float] = None
     parts: List[str] = []
+    soft = float(soft_ttft_timeout_sec) if soft_ttft_timeout_sec else 0.0
     try:
         stream = client.chat.completions.create(
             model=model_id,
@@ -502,6 +563,11 @@ def _chat_completion_with_ttft(
         for chunk in stream:
             if first_byte_ms is None:
                 first_byte_ms = (time.perf_counter() - t0) * 1000.0
+            if soft > 0 and ttft_ms is None and (time.perf_counter() - t0) >= soft:
+                raise NimApiError(
+                    f"soft_ttft timeout after {soft:.0f}s on {model_id} "
+                    f"(no first token)"
+                )
             try:
                 delta = chunk.choices[0].delta.content if chunk.choices else None
             except (IndexError, AttributeError):
@@ -515,7 +581,11 @@ def _chat_completion_with_ttft(
         if first_byte_ms is None:
             first_byte_ms = ttlt_ms
         if ttft_ms is None:
-            # Empty deltas until end, or provider buffered — TTFT ≈ TTLT
+            if soft > 0:
+                raise NimApiError(
+                    f"soft_ttft timeout after {soft:.0f}s on {model_id} "
+                    f"(stream ended without content)"
+                )
             ttft_ms = ttlt_ms
         return text, {
             "request_start_ms": 0.0,
@@ -527,8 +597,15 @@ def _chat_completion_with_ttft(
             "mode": "stream_measure",
             "http_status": 200,
         }
+    except NimApiError:
+        raise
     except Exception as e:
-        # Streaming unsupported / failed — fall back to blocking (TTFT == TTLT)
+        # Soft timeout must not fall through to a long blocking call.
+        if soft > 0 and (time.perf_counter() - t0) >= soft * 0.9:
+            raise NimApiError(
+                f"soft_ttft timeout after {soft:.0f}s on {model_id}",
+                cause=e,
+            ) from e
         log.warning(
             "Streaming TTFT measure failed for %s (%s); using blocking call.",
             model_id,

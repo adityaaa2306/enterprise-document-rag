@@ -496,7 +496,7 @@ def map_summarize_routed(state: AgentState) -> Dict[str, Any]:
         for i, r in enumerate(state.get("chunk_routing") or [])
     }
 
-    log.info("Job %s: [5] Adaptive map summarize (per-chunk tiers)", job_id)
+    log.info("Job %s: [5] Adaptive map summarize (capacity-aware scheduler)", job_id)
     _set_progress(job_id, 35.0, "Summarizing chunks with adaptive routing...", force=True)
 
     chunks = state["chunks"]
@@ -510,13 +510,12 @@ def map_summarize_routed(state: AgentState) -> Dict[str, Any]:
     lat.add_meta(
         map_max_workers=max_workers,
         adaptive_chunk_routing=True,
+        capacity_scheduler=bool(getattr(settings, "CAPACITY_SCHEDULER_ENABLED", True)),
         embedded_worker=bool(getattr(settings, "RUN_EMBEDDED_WORKER", False)),
     )
-    submit_times: Dict[int, float] = {}
     stage_t0 = time.perf_counter()
     carbon_spent = float(state.get("carbon_spent_g") or 0.0)
 
-    # Overlap store embeddings with map/validate/compile (source text is immutable)
     if bool(getattr(settings, "ENABLE_EMBED_PREFETCH", True)):
         try:
             from src.perf.prefetch import start_embed_prefetch
@@ -530,7 +529,6 @@ def map_summarize_routed(state: AgentState) -> Dict[str, Any]:
         route = routes.get(idx) or {}
         tier = str(route.get("tier") or default_tier)
         chain = _models_for_tier(tier, decision) or default_chain
-        queue_ms = (time.perf_counter() - submit_times[idx]) * 1000.0
         lat.worker_enter()
         try:
             result = summarization_agents.run_summarization_agent(
@@ -545,7 +543,7 @@ def map_summarize_routed(state: AgentState) -> Dict[str, Any]:
                     "chunk_index": idx,
                     "tier": tier,
                     "model_id": result.model_id or (chain[0] if chain else None),
-                    "queue_ms": round(queue_ms, 1),
+                    "queue_ms": 0.0,
                     "call_ms": round(result.latency_ms, 1),
                     "success": result.success,
                     "retry_count": 0,
@@ -567,115 +565,112 @@ def map_summarize_routed(state: AgentState) -> Dict[str, Any]:
         for i in done_set:
             if 0 <= i < len(summaries) and i < len(prev):
                 summaries[i] = prev[i]
-        # Per-call worst case: retries × models × read timeout (+ cushion).
-        nim_read = float(getattr(settings, "NIM_HTTP_TIMEOUT_SEC", 90.0) or 90.0)
-        nim_retries = max(1, int(getattr(settings, "NIM_TRANSIENT_RETRIES", 2) or 2))
-        chain_len = max(1, len(default_chain or [1]))
-        per_future_timeout = max(120.0, nim_read * nim_retries * chain_len + 30.0)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_idx = {}
-            for i, c in pending:
-                submit_times[i] = time.perf_counter()
-                fut = executor.submit(_run, (i, c))
-                future_to_idx[fut] = i
-            done = len(done_set)
-            pending_futs = set(future_to_idx.keys())
-            while pending_futs:
-                finished, pending_futs = concurrent.futures.wait(
-                    pending_futs,
-                    timeout=15.0,
-                    return_when=concurrent.futures.FIRST_COMPLETED,
-                )
-                # Abandon futures that have exceeded wall-clock budget since submit.
-                # cancel() cannot kill a running NIM thread, but we stop waiting on it
-                # so map can finish and the UI is not stuck at N-1 forever.
-                timed_out = [
-                    fut
-                    for fut in list(pending_futs)
-                    if (time.perf_counter() - submit_times.get(future_to_idx.get(fut, -1), stage_t0))
-                    >= per_future_timeout
-                ]
-                for fut in timed_out:
-                    idx = future_to_idx.get(fut, -1)
-                    fut.cancel()
-                    pending_futs.discard(fut)
-                    if idx < 0 or idx in done_set:
-                        continue
-                    log.error(
-                        "Job %s: map chunk %s exceeded %.0fs — marking empty",
-                        job_id,
-                        idx,
-                        per_future_timeout,
-                    )
+
+        use_sched = bool(getattr(settings, "CAPACITY_SCHEDULER_ENABLED", True))
+        hard_to = float(
+            getattr(settings, "MAP_CHUNK_HARD_TIMEOUT_SEC", 90.0) or 90.0
+        )
+        empty_attempts = max(
+            1, int(getattr(settings, "MAP_EMPTY_RETRY_ATTEMPTS", 2) or 2)
+        )
+
+        def _is_ok(res) -> bool:
+            if res is None:
+                return False
+            try:
+                _idx, result = res
+            except Exception:
+                return False
+            text = (getattr(result, "summary", None) or "").strip()
+            return bool(text) and bool(getattr(result, "success", True))
+
+        def _on_progress(prog, mets) -> None:
+            done = prog.completed + len(done_set)
+            pct = 35.0 + (done / max(total, 1)) * 25.0
+            _set_progress(job_id, pct, prog.message("Summarizing"), force=False)
+            try:
+                from src.core.execution_scheduler import map_progress_partial
+
+                job_store.JOB_STATUSES.setdefault(job_id, {})
+                partial = map_progress_partial(prog, mets)
+                partial["chunks_done"] = prog.completed
+                partial["chunks_total"] = total
+                job_store.JOB_STATUSES[job_id]["partial"] = partial
+            except Exception:
+                pass
+
+        if use_sched and pending:
+            from src.core.execution_scheduler import run_capacity_pool
+
+            ordered, prog, mets = run_capacity_pool(
+                pending,
+                _run,
+                role="map",
+                kind="map",
+                max_workers=max_workers,
+                hard_timeout_sec=hard_to,
+                max_attempts=empty_attempts,
+                is_success=_is_ok,
+                on_progress=_on_progress,
+            )
+            for idx, _chunk in pending:
+                res = ordered[idx] if idx < len(ordered) else None
+                if res is None:
                     summaries[idx] = ""
                     agent_telemetry.append(
                         {
                             "chunk_index": idx,
                             "phase": "map",
                             "success": False,
-                            "error": f"map_future_timeout_{per_future_timeout:.0f}s",
+                            "error": "scheduler_failed_or_empty",
                         }
                     )
                     done_set.add(idx)
-                    done += 1
-                    _set_progress(
-                        job_id,
-                        35.0 + (done / max(total, 1)) * 25.0,
-                        f"Summarizing... ({done}/{total})",
-                    )
-                if not finished:
-                    # Heartbeat so the UI does not look frozen on a slow NIM call.
-                    _set_progress(
-                        job_id,
-                        35.0 + (done / max(total, 1)) * 25.0,
-                        f"Summarizing... ({done}/{total}) — waiting on model...",
-                    )
                     continue
-                for fut in finished:
-                    idx = future_to_idx.get(fut, -1)
+                _idx, result = res
+                summaries[idx] = (result.summary or "").strip()
+                agent_telemetry.append(
+                    result.to_dict() | {"chunk_index": idx, "phase": "map"}
+                )
+                carbon_spent += float(result.carbon_estimate_g or 0.0)
+                done_set.add(idx)
+            lat.add_meta(scheduler=mets.to_dict(), map_progress=prog.snapshot())
+            _on_progress(prog, mets)
+        else:
+            # Legacy submit path (feature flag off) — still capacity-capped workers
+            submit_times: Dict[int, float] = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_idx = {}
+                for i, c in pending:
+                    submit_times[i] = time.perf_counter()
+                    future_to_idx[executor.submit(_run, (i, c))] = i
+                for fut in concurrent.futures.as_completed(future_to_idx):
+                    idx = future_to_idx[fut]
                     try:
-                        idx, result = fut.result(timeout=0)
+                        idx, result = fut.result(timeout=hard_to)
+                        summaries[idx] = (result.summary or "").strip()
+                        agent_telemetry.append(
+                            result.to_dict() | {"chunk_index": idx, "phase": "map"}
+                        )
+                        carbon_spent += float(result.carbon_estimate_g or 0.0)
                     except Exception as e:
                         log.error("Job %s: map chunk %s failed: %s", job_id, idx, e)
-                        if idx >= 0:
-                            summaries[idx] = ""
-                            agent_telemetry.append(
-                                {
-                                    "chunk_index": idx,
-                                    "phase": "map",
-                                    "success": False,
-                                    "error": str(e)[:300],
-                                }
-                            )
-                            done_set.add(idx)
-                        done += 1
-                        _set_progress(
-                            job_id,
-                            35.0 + (done / max(total, 1)) * 25.0,
-                            f"Summarizing... ({done}/{total})",
-                        )
-                        continue
-                    summaries[idx] = result.summary
-                    agent_telemetry.append(
-                        result.to_dict() | {"chunk_index": idx, "phase": "map"}
-                    )
-                    carbon_spent += float(result.carbon_estimate_g or 0.0)
-                    done_set.add(idx)
-                    done += 1
-                    progress = 35.0 + (done / max(total, 1)) * 25.0
-                    _set_progress(job_id, progress, f"Summarizing... ({done}/{total})")
-                    # Stream partial chunk completions for UI (Phase 13)
-                    if done == 1 or done == total or done % max(1, total // 8) == 0:
-                        try:
-                            job_store.JOB_STATUSES.setdefault(job_id, {})
-                            job_store.JOB_STATUSES[job_id]["partial"] = {
-                                "chunks_done": done,
-                                "chunks_total": total,
-                                "latest_chunk_index": idx,
-                                "latest_summary_preview": (result.summary or "")[:240],
+                        summaries[idx] = ""
+                        agent_telemetry.append(
+                            {
+                                "chunk_index": idx,
+                                "phase": "map",
+                                "success": False,
+                                "error": str(e)[:300],
                             }
-                        except Exception:
-                            pass
+                        )
+                    done_set.add(idx)
+                    done = len(done_set)
+                    _set_progress(
+                        job_id,
+                        35.0 + (done / max(total, 1)) * 25.0,
+                        f"Summarizing... completed {done}/{total}",
+                    )
 
     budget = float(state.get("carbon_budget_g") or settings.CARBON_BUDGET_G)
     lat.add_meta(map_wall_ms=round((time.perf_counter() - stage_t0) * 1000.0, 1))
@@ -701,12 +696,23 @@ def validate_map(state: AgentState) -> Dict[str, Any]:
     with lat.stage(STAGE_VALIDATE):
         strat = ((state.get("pipeline_intelligence") or {}).get("strategy") or {})
         tau = strat.get("qva_confidence_threshold")
+        summaries = list(state.get("summaries") or [])
+        # Never send empty summaries through QVA — mark failed and validate the rest.
+        empty_idx = [
+            i for i, s in enumerate(summaries) if not (s or "").strip()
+        ]
         only_idx = list(state.get("last_escalated_indices") or [])
+        if empty_idx:
+            log.warning(
+                "Job %s: %s empty summaries skipped for QVA (failed without evaluate)",
+                job_id,
+                len(empty_idx),
+            )
         prior_raw = ((state.get("validation_verdict") or {}).get("details") or {}).get(
             "chunk_verdicts"
         )
         prior_verdicts = None
-        if only_idx and prior_raw and len(prior_raw) == len(state.get("summaries") or []):
+        if only_idx and prior_raw and len(prior_raw) == len(summaries):
             prior_verdicts = []
             for d in prior_raw:
                 if not isinstance(d, dict):
@@ -729,18 +735,84 @@ def validate_map(state: AgentState) -> Dict[str, Any]:
                         readability=float(d.get("readability") or 0),
                     )
                 )
-            verdict = quality_validation.validate_chunks(
-                state["chunks"],
-                state["summaries"],
-                confidence_threshold=float(tau) if tau is not None else None,
-                only_indices=only_idx,
-                prior_verdicts=prior_verdicts,
-            )
+            # Incremental: only re-check non-empty escalated indices
+            check_idx = [i for i in only_idx if i not in empty_idx]
+            if check_idx:
+                verdict = quality_validation.validate_chunks(
+                    state["chunks"],
+                    summaries,
+                    confidence_threshold=float(tau) if tau is not None else None,
+                    only_indices=check_idx,
+                    prior_verdicts=prior_verdicts,
+                )
+            else:
+                verdict = quality_validation.validate_chunks(
+                    state["chunks"],
+                    summaries,
+                    confidence_threshold=float(tau) if tau is not None else None,
+                    only_indices=[],
+                    prior_verdicts=prior_verdicts,
+                )
         else:
-            verdict = quality_validation.validate_chunks(
-                state["chunks"],
-                state["summaries"],
-                confidence_threshold=float(tau) if tau is not None else None,
+            non_empty = [i for i in range(len(summaries)) if i not in empty_idx]
+            if non_empty and empty_idx:
+                # Validate non-empty only; inject empty failures after.
+                placeholder = [
+                    s if (s or "").strip() else " "
+                    for s in summaries
+                ]
+                verdict = quality_validation.validate_chunks(
+                    state["chunks"],
+                    placeholder,
+                    confidence_threshold=float(tau) if tau is not None else None,
+                    only_indices=non_empty,
+                    prior_verdicts=[None] * len(summaries),
+                )
+            elif non_empty:
+                verdict = quality_validation.validate_chunks(
+                    state["chunks"],
+                    summaries,
+                    confidence_threshold=float(tau) if tau is not None else None,
+                )
+            else:
+                verdict = quality_validation.ValidationVerdict(
+                    passed=False,
+                    confidence=0.0,
+                    faithfulness=0.0,
+                    coverage=0.0,
+                    hallucination_rate=1.0,
+                    contradiction_rate=0.0,
+                    codes=["all_summaries_empty"],
+                    details={
+                        "failed_indices": list(empty_idx),
+                        "chunk_fail_ratio_high": True,
+                    },
+                )
+        if empty_idx and hasattr(verdict, "details"):
+            details = dict(verdict.details or {})
+            failed = list(details.get("failed_indices") or [])
+            for i in empty_idx:
+                if i not in failed:
+                    failed.append(i)
+            details["failed_indices"] = sorted(failed)
+            details["empty_summary_indices"] = list(empty_idx)
+            codes = list(verdict.codes or [])
+            if "empty_summary" not in codes:
+                codes.append("empty_summary")
+            verdict = quality_validation.ValidationVerdict(
+                passed=False,
+                confidence=float(verdict.confidence or 0),
+                faithfulness=float(verdict.faithfulness or 0),
+                coverage=float(verdict.coverage or 0),
+                hallucination_rate=float(verdict.hallucination_rate or 0),
+                contradiction_rate=float(verdict.contradiction_rate or 0),
+                codes=codes,
+                details=details,
+                semantic_similarity=float(getattr(verdict, "semantic_similarity", 0) or 0),
+                entity_retention=float(getattr(verdict, "entity_retention", 0) or 0),
+                compression_ratio=float(getattr(verdict, "compression_ratio", 0) or 0),
+                redundancy=float(getattr(verdict, "redundancy", 0) or 0),
+                readability=float(getattr(verdict, "readability", 0) or 0),
             )
     log.info(
         f"Job {job_id}: QVA map passed={verdict.passed} conf={verdict.confidence} "
@@ -780,9 +852,8 @@ def should_escalate(state: AgentState) -> str:
 def escalate_once(state: AgentState) -> Dict[str, Any]:
     """Escalate ONLY failed chunks one tier (Light→Medium→Heavy).
 
-    Failed chunks (up to QVA_MAX_ESCALATE_CHUNKS, worst-first) are dispatched
-    concurrently via the same ThreadPoolExecutor pattern as map_summarize —
-    not a sequential loop.
+    Failed chunks are dispatched concurrently via the capacity-aware pull
+    scheduler (never a sequential loop, never submit-all past endpoint capacity).
     """
     job_id = state["job_id"]
     verdict = state.get("validation_verdict") or {}
@@ -832,10 +903,9 @@ def escalate_once(state: AgentState) -> Dict[str, Any]:
     carbon_spent = float(state.get("carbon_spent_g") or 0.0)
     intensity = float((state.get("features") or {}).get("grid_intensity") or 500.0)
     max_workers = max(1, int(settings.effective_map_max_workers()))
-    submit_times: Dict[int, float] = {}
 
     log.info(
-        "Job %s: [6b] Escalating %s failed chunks concurrently (workers=%s, ladder step %s)",
+        "Job %s: [6b] Escalating %s failed chunks (capacity scheduler, workers=%s, step %s)",
         job_id,
         len(failed_idx),
         max_workers,
@@ -853,7 +923,6 @@ def escalate_once(state: AgentState) -> Dict[str, Any]:
         cur = str(route.get("tier") or decision.tier)
         nxt = _next_tier(cur) or "heavy"
         chain = _models_for_tier(nxt, decision.to_dict())
-        queue_ms = (time.perf_counter() - submit_times[idx]) * 1000.0
         lat.worker_enter()
         try:
             result = summarization_agents.run_summarization_agent(
@@ -868,7 +937,7 @@ def escalate_once(state: AgentState) -> Dict[str, Any]:
                     "chunk_index": idx,
                     "tier": nxt,
                     "model_id": result.model_id,
-                    "queue_ms": round(queue_ms, 1),
+                    "queue_ms": 0.0,
                     "call_ms": round(result.latency_ms, 1),
                     "success": result.success,
                     "retry_count": 0,
@@ -882,33 +951,84 @@ def escalate_once(state: AgentState) -> Dict[str, Any]:
             lat.worker_exit()
 
     with lat.stage(STAGE_ESCALATE):
-        # Concurrent dispatch (same pattern as map_summarize_routed).
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for idx in failed_idx:
-                submit_times[idx] = time.perf_counter()
-                futures.append(executor.submit(_run, idx))
-            done = 0
-            for fut in concurrent.futures.as_completed(futures):
-                idx, nxt, result = fut.result()
-                summaries[idx] = result.summary
+        hard_to = float(getattr(settings, "MAP_CHUNK_HARD_TIMEOUT_SEC", 90.0) or 90.0)
+        use_sched = bool(getattr(settings, "CAPACITY_SCHEDULER_ENABLED", True))
+
+        def _is_ok(res) -> bool:
+            if res is None:
+                return False
+            try:
+                _i, _n, result = res
+            except Exception:
+                return False
+            return bool((getattr(result, "summary", None) or "").strip())
+
+        if use_sched and failed_idx:
+            from src.core.execution_scheduler import run_capacity_pool
+
+            # Payloads as (idx,) tuples so ordered results key by index
+            payloads = [(i,) for i in failed_idx]
+
+            def _run_wrapped(payload):
+                return _run(payload[0])
+
+            ordered, prog, mets = run_capacity_pool(
+                payloads,
+                _run_wrapped,
+                role="map",
+                kind="repair",
+                max_workers=max_workers,
+                hard_timeout_sec=hard_to,
+                max_attempts=max(1, int(getattr(settings, "MAP_EMPTY_RETRY_ATTEMPTS", 2) or 2)),
+                is_success=_is_ok,
+                on_progress=lambda p, m: _set_progress(
+                    job_id,
+                    70.0 + 10.0 * (p.completed / max(len(failed_idx), 1)),
+                    p.message("Escalating"),
+                ),
+            )
+            for i in failed_idx:
+                res = ordered[i] if i < len(ordered) else None
+                if res is None:
+                    continue
+                idx, nxt, result = res
+                summaries[idx] = (result.summary or "").strip()
                 agent_telemetry.append(
                     result.to_dict()
-                    | {"chunk_index": idx, "phase": "escalate", "escalation_step": esc_count}
+                    | {
+                        "chunk_index": idx,
+                        "phase": "escalate",
+                        "escalation_step": esc_count,
+                        "to_tier": nxt,
+                    }
                 )
                 carbon_spent += float(result.carbon_estimate_g or 0.0)
-                if idx in routes:
-                    routes[idx]["tier"] = nxt
-                    routes[idx]["reason"] = (
-                        f"Escalated to {nxt} after QVA failure (step {esc_count})"
+                routes[idx] = {**(routes.get(idx) or {}), "tier": nxt}
+            lat.add_meta(escalate_scheduler=mets.to_dict())
+            done = prog.completed
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_run, idx): idx for idx in failed_idx}
+                done = 0
+                for fut in concurrent.futures.as_completed(futures):
+                    idx, nxt, result = fut.result()
+                    summaries[idx] = (result.summary or "").strip()
+                    agent_telemetry.append(
+                        result.to_dict()
+                        | {
+                            "chunk_index": idx,
+                            "phase": "escalate",
+                            "escalation_step": esc_count,
+                        }
                     )
-                    routes[idx]["model"] = result.model_id
-                done += 1
-                _set_progress(
-                    job_id,
-                    70.0 + (10.0 * done / max(len(failed_idx), 1)),
-                    f"Escalating... ({done}/{len(failed_idx)})",
-                )
+                    carbon_spent += float(result.carbon_estimate_g or 0.0)
+                    routes[idx] = {**(routes.get(idx) or {}), "tier": nxt}
+                    done += 1
+                    _set_progress(
+                        job_id,
+                        70.0 + 10.0 * (done / max(len(failed_idx), 1)),
+                        f"Escalating... completed {done}/{len(failed_idx)}",
+                    )
 
     # Validation runs once in validate_map (incremental for escalated indices).
     # Do NOT revalidate here — that duplicated full QVA every escalate cycle.

@@ -238,14 +238,13 @@ def test_stalled_job_detected_before_runtime_wall(monkeypatch):
 
 
 def test_escalate_once_is_concurrent():
-    """Task 7: escalate_once already dispatches failed chunks via ThreadPoolExecutor."""
+    """Escalate failed chunks concurrently (capacity scheduler or ThreadPool fallback)."""
     import inspect
     from src.core import orchestrator
 
     src = inspect.getsource(orchestrator.escalate_once)
-    assert "ThreadPoolExecutor" in src
-    assert "as_completed" in src
-    assert "Concurrent dispatch" in src or "concurrently" in src.lower()
+    assert "run_capacity_pool" in src or "ThreadPoolExecutor" in src
+    assert "concurrently" in src.lower() or "capacity" in src.lower()
 
 
 def test_carbon_accounting_uses_measured_compile_calls():

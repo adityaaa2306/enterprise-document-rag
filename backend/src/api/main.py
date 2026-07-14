@@ -321,6 +321,13 @@ def get_queue_snapshot(
 ):
     """Live worker occupancy + this user's pending/processing jobs."""
     snap = job_store.queue_snapshot_for_user(int(current_user["id"]))
+    scheduler = None
+    try:
+        from src.agents import nim_endpoint_pool as pool
+
+        scheduler = pool.scheduler_snapshot()
+    except Exception:
+        scheduler = None
     return QueueSnapshotResponse(
         alive_workers=int(snap.get("alive_workers") or 0),
         worker_busy=bool(snap.get("worker_busy")),
@@ -328,6 +335,7 @@ def get_queue_snapshot(
         processing_count=int(snap.get("processing_count") or 0),
         workers=list(snap.get("workers") or []),
         active_jobs=[_job_list_item(j) for j in (snap.get("active_jobs") or [])],
+        scheduler=scheduler,
     )
 
 
@@ -428,6 +436,19 @@ def _job_status_payload(job_id: str, status_dict: Dict[str, Any]) -> JobStatus:
     done, total = _parse_chunk_progress(message)
     stage = _stage_from_progress(progress, message)
     partial = status_dict.get("partial") if isinstance(status_dict.get("partial"), dict) else None
+    sched = None
+    if isinstance(partial, dict):
+        sched = partial.get("scheduler") if isinstance(partial.get("scheduler"), dict) else None
+        # Prefer honest scheduler counters over message parse (submitted ≠ completed)
+        if sched:
+            if sched.get("completed") is not None:
+                done = int(sched.get("completed") or 0)
+            if sched.get("total") is not None:
+                total = int(sched.get("total") or 0)
+        elif partial.get("chunks_done") is not None:
+            done = int(partial.get("chunks_done") or 0)
+        if partial.get("chunks_total") is not None:
+            total = int(partial.get("chunks_total") or total or 0)
     stalled = status_dict.get("stalled")
     if stalled is None and "stalled" in (message or "").lower():
         stalled = True
@@ -445,6 +466,10 @@ def _job_status_payload(job_id: str, status_dict: Dict[str, Any]) -> JobStatus:
         partial=partial,
         chunks_done=done,
         chunks_total=total,
+        chunks_queued=int(sched["queued"]) if sched and sched.get("queued") is not None else None,
+        chunks_running=int(sched["running"]) if sched and sched.get("running") is not None else None,
+        chunks_failed=int(sched["failed"]) if sched and sched.get("failed") is not None else None,
+        chunks_retrying=int(sched["retrying"]) if sched and sched.get("retrying") is not None else None,
         stage=stage,
         stalled=bool(stalled) if stalled is not None else False,
         stall_reason=status_dict.get("stall_reason"),

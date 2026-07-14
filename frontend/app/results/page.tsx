@@ -92,6 +92,10 @@ interface JobStatus {
   stage?: string | null
   chunks_done?: number | null
   chunks_total?: number | null
+  chunks_queued?: number | null
+  chunks_running?: number | null
+  chunks_failed?: number | null
+  chunks_retrying?: number | null
   partial?: Record<string, unknown> | null
 }
 
@@ -283,7 +287,18 @@ function ResultsContent() {
             data.chunks_total != null &&
             data.chunks_total > 0
           ) {
-            setChunkProgress(`${data.chunks_done}/${data.chunks_total} chunks`)
+            const bits = [
+              `completed ${data.chunks_done}/${data.chunks_total}`,
+              data.chunks_running != null ? `running ${data.chunks_running}` : "",
+              data.chunks_queued != null ? `queued ${data.chunks_queued}` : "",
+              data.chunks_failed != null && data.chunks_failed > 0
+                ? `failed ${data.chunks_failed}`
+                : "",
+              data.chunks_retrying != null && data.chunks_retrying > 0
+                ? `retrying ${data.chunks_retrying}`
+                : "",
+            ].filter(Boolean)
+            setChunkProgress(bits.join(" · "))
           }
           const dag = (data.partial as { dag?: Record<string, { done?: number; total?: number }> } | null)
             ?.dag
@@ -308,15 +323,45 @@ function ResultsContent() {
               dagBit = " · " + parts.join(", ")
             }
           }
+          let utilBit = ""
+          const top = (
+            data.partial as {
+              scheduler?: {
+                endpoints?: {
+                  utilization?: number
+                  active_requests?: number
+                  total_capacity?: number
+                }
+                utilization?: number
+                active_requests?: number
+                total_capacity?: number
+              }
+            } | null
+          )?.scheduler
+          const utilSrc =
+            top && typeof top.utilization === "number"
+              ? top
+              : top?.endpoints && typeof top.endpoints.utilization === "number"
+                ? top.endpoints
+                : null
+          if (utilSrc) {
+            utilBit = ` · endpoints ${Math.round((utilSrc.utilization ?? 0) * 100)}% util (${utilSrc.active_requests ?? "?"}/${utilSrc.total_capacity ?? "?"})`
+          }
           const detail =
             data.stage || data.chunks_done != null || dagBit
               ? `${data.message || data.status}${
                   data.stage ? ` · ${data.stage}` : ""
                 }${
                   data.chunks_done != null && data.chunks_total
-                    ? ` · ${data.chunks_done}/${data.chunks_total}`
+                    ? ` · completed ${data.chunks_done}/${data.chunks_total}`
                     : ""
-                }${dagBit}`
+                }${
+                  data.chunks_running != null
+                    ? ` · running ${data.chunks_running}`
+                    : ""
+                }${
+                  data.chunks_queued != null ? ` · queued ${data.chunks_queued}` : ""
+                }${utilBit}${dagBit}`
               : data.message || `Status: ${data.status}`
           appendLog(detail, isErrorStatus(data.status) ? "error" : "info")
 

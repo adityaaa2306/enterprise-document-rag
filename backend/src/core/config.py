@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     NIM_ENDPOINT_STRATEGY: str = "least_load"  # least_load | round_robin
     NIM_ENDPOINT_COOLDOWN_SEC: float = 8.0
     NIM_ENDPOINT_RATELIMIT_COOLDOWN_SEC: float = 20.0
+    # Hard cap of in-flight HTTP calls per endpoint (capacity-aware scheduler).
+    NIM_ENDPOINT_MAX_CONCURRENT: int = 3
+    # How long a worker waits for an endpoint slot before re-queueing.
+    NIM_ENDPOINT_ACQUIRE_TIMEOUT_SEC: float = 120.0
     NIM_ENDPOINT_1_ROLES: str = "map,compile,embed,any"
     NIM_ENDPOINT_2_API_KEY: str = ""
     NIM_ENDPOINT_2_BASE_URL: str = ""
@@ -61,8 +65,18 @@ class Settings(BaseSettings):
     REGION_SCHEDULER_DEFAULT_REGION: str = "india"
     REGION_SCHEDULER_DEFAULT_REGION_NAME: str = "India"
     REGION_SCHEDULER_PROVIDER: str = "electricity_maps"
+    # Soft TTFT: if no first token by this deadline, cancel and try another endpoint.
+    NIM_SOFT_TTFT_TIMEOUT_SEC: float = 45.0
+    # Hard per-call wall (also used as NIM_HTTP_TIMEOUT_SEC read timeout).
+    NIM_HARD_TIMEOUT_SEC: float = 90.0
     # Per-request HTTP timeout for chat/embeddings (prevents infinite "processing")
     NIM_HTTP_TIMEOUT_SEC: float = 90.0
+    # Per-chunk scheduler hard abort — never wait 390s on one chunk.
+    MAP_CHUNK_HARD_TIMEOUT_SEC: float = 90.0
+    # Pull-based capacity scheduler for map/escalate (vs submit-all ThreadPool).
+    CAPACITY_SCHEDULER_ENABLED: bool = True
+    # Retry empty map summaries before QVA (endpoint/model rotate inside call).
+    MAP_EMPTY_RETRY_ATTEMPTS: int = 2
     # Longer read timeout for final compile (large multi-chunk prompts)
     # Keep compile prompts short-lived — free-tier NIM often stalls on large
     # synthesize calls; fail over (or stitch) instead of hanging the UI.
@@ -72,7 +86,10 @@ class Settings(BaseSettings):
     # OpenAI SDK transport retries (we also fall back across models ourselves)
     NIM_SDK_MAX_RETRIES: int = 1
     # App-level retries per model for transient NIM errors (timeout/connection/5xx)
-    NIM_TRANSIENT_RETRIES: int = 2
+    # Keep low: prefer rotating endpoints over long same-model waits.
+    NIM_TRANSIENT_RETRIES: int = 1
+    # Same-model retries across different endpoints before model fallback.
+    NIM_ENDPOINT_RETRIES_PER_MODEL: int = 2
 
     # --- Light tier (chunk summarization) ---
     # llama-3.2-3b timed out 0/4 on NIM free tier (2026-07-13 probe).
@@ -151,13 +168,13 @@ class Settings(BaseSettings):
     # Soft token budget for a single compile prompt; over this we hierarchical-batch.
     COMPILE_MAX_INPUT_TOKENS: int = 10000
     COMPILE_BATCH_SIZE: int = 8
-    # Parallel map summarization workers (NIM-bound; raise for lower wall-clock).
-    # With 3 NIM endpoints, 16–24 is appropriate; auto-scaled in effective_map_max_workers().
-    MAP_MAX_WORKERS: int = 16
+    # Parallel map summarization workers — hard-capped by endpoint capacity
+    # (nim_endpoint_count × NIM_ENDPOINT_MAX_CONCURRENT) in effective_map_max_workers().
+    MAP_MAX_WORKERS: int = 12
     # When API+worker share one process, cap map concurrency so /job-status stays responsive
-    EMBEDDED_MAP_MAX_WORKERS: int = 6
-    # Parallel DAG / hierarchical compile node workers
-    COMPILE_MAX_WORKERS: int = 12
+    EMBEDDED_MAP_MAX_WORKERS: int = 4
+    # Parallel DAG / hierarchical compile node workers (also capacity-capped)
+    COMPILE_MAX_WORKERS: int = 6
     # Parallel QVA chunk validation workers (CPU-bound lexical checks)
     VALIDATE_MAX_WORKERS: int = 8
     # DAG hierarchical compile (parallel regional/chapter/executive nodes)
@@ -440,25 +457,25 @@ class Settings(BaseSettings):
         return n
 
     def effective_map_max_workers(self) -> int:
-        """Map concurrency; scales with endpoint pool; capped when embedded."""
+        """Map concurrency ≤ endpoint capacity (never overload NIM)."""
         base = max(1, int(self.MAP_MAX_WORKERS or 3))
-        eps = self.nim_endpoint_count()
-        # ~6–8 concurrent calls per independent endpoint before queues dominate
-        scaled = min(base, max(4, eps * 8))
-        if eps <= 1:
-            scaled = min(scaled, 10)
+        eps = max(1, self.nim_endpoint_count())
+        per = max(1, int(self.NIM_ENDPOINT_MAX_CONCURRENT or 3))
+        capacity = eps * per
+        scaled = min(base, capacity)
         if bool(self.RUN_EMBEDDED_WORKER):
             cap = max(1, int(getattr(self, "EMBEDDED_MAP_MAX_WORKERS", 3) or 3))
             return min(scaled, cap)
         return scaled
 
     def effective_compile_max_workers(self) -> int:
+        """Compile concurrency ≤ endpoint capacity; separate from map via roles."""
         base = max(1, int(self.COMPILE_MAX_WORKERS or 4))
-        eps = self.nim_endpoint_count()
-        scaled = min(base, max(2, eps * 4))
-        if eps <= 1:
-            scaled = min(scaled, 6)
-        return scaled
+        eps = max(1, self.nim_endpoint_count())
+        per = max(1, int(self.NIM_ENDPOINT_MAX_CONCURRENT or 3))
+        # Reserve ~1/3 of capacity for compile when pool is shared
+        capacity = max(1, (eps * per + 2) // 3)
+        return min(base, capacity, eps * per)
 
     def validate_for_runtime(self, *, require_cors: bool | None = None) -> None:
         """

@@ -106,6 +106,11 @@ class JobStatus(BaseModel):
     partial: Optional[dict] = None
     chunks_done: Optional[int] = None
     chunks_total: Optional[int] = None
+    # Capacity scheduler counters (completed ≠ submitted)
+    chunks_queued: Optional[int] = None
+    chunks_running: Optional[int] = None
+    chunks_failed: Optional[int] = None
+    chunks_retrying: Optional[int] = None
     stage: Optional[str] = None
     filename: Optional[str] = None
     job_mode: Optional[str] = None
@@ -148,6 +153,8 @@ class QueueSnapshotResponse(BaseModel):
     processing_count: int = 0
     workers: List[dict] = []
     active_jobs: List[JobListItem] = []
+    # NIM endpoint utilization (capacity-aware scheduler)
+    scheduler: Optional[dict] = None
 
 
 class CancelJobResponse(BaseModel):

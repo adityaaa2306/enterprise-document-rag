@@ -57,12 +57,14 @@ def test_effective_workers_scale_with_endpoints(monkeypatch):
     monkeypatch.setattr(settings, "NIM_ENDPOINT_2_API_KEY", "k2")
     monkeypatch.setattr(settings, "NIM_ENDPOINT_3_API_KEY", "k3")
     monkeypatch.setattr(settings, "NIM_API_KEYS", "")
+    monkeypatch.setattr(settings, "NIM_ENDPOINT_MAX_CONCURRENT", 3)
     monkeypatch.setattr(settings, "MAP_MAX_WORKERS", 24)
     monkeypatch.setattr(settings, "COMPILE_MAX_WORKERS", 20)
     monkeypatch.setattr(settings, "RUN_EMBEDDED_WORKER", False)
     assert settings.nim_endpoint_count() == 3
-    assert settings.effective_map_max_workers() >= 16
-    assert settings.effective_compile_max_workers() >= 8
+    # Capacity-aware: 3 endpoints × 3 concurrent = 9 (never firehose past NIM)
+    assert settings.effective_map_max_workers() == 9
+    assert 1 <= settings.effective_compile_max_workers() <= 9
 
 
 def test_dag_compile_runs_levels_in_parallel(monkeypatch):
