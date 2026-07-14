@@ -1,0 +1,15 @@
+# Keep Vercel uploads lean and avoid wrong package managers / CRA leftovers
+frontend/yarn.lock
+frontend/src
+frontend/public/index.html
+frontend/craco.config.js
+frontend/jsconfig.json
+frontend/README.md
+frontend/tailwind.config.js
+oolala
+forensics
+*.pdf
+*.sqlite
+.vercel
+backend
+carbon-router
