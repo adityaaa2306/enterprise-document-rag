@@ -60,6 +60,7 @@ export default function Nav() {
           </Link>
           <Link
             href="/new-job"
+            prefetch
             data-testid="nav-cta"
             className="font-mono text-[11px] tracking-[0.14em] uppercase px-3 py-1.5 border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500 hover:text-black transition-colors"
           >
