@@ -971,6 +971,7 @@ def reduce_compile(state: AgentState) -> Dict[str, Any]:
                         job_id,
                         progress,
                         f"{label} — waiting on model... ({int(elapsed)}s)",
+                        force=True,
                     )
 
     with lat.stage(STAGE_COMPILE):

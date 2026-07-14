@@ -49,7 +49,9 @@ class Settings(BaseSettings):
     # Per-request HTTP timeout for chat/embeddings (prevents infinite "processing")
     NIM_HTTP_TIMEOUT_SEC: float = 90.0
     # Longer read timeout for final compile (large multi-chunk prompts)
-    NIM_COMPILE_TIMEOUT_SEC: float = 90.0
+    # Keep compile prompts short-lived — free-tier NIM often stalls on large
+    # synthesize calls; fail over (or stitch) instead of hanging the UI.
+    NIM_COMPILE_TIMEOUT_SEC: float = 55.0
     # Connect timeout for NIM (separate from read/write)
     NIM_CONNECT_TIMEOUT_SEC: float = 15.0
     # OpenAI SDK transport retries (we also fall back across models ourselves)
@@ -209,7 +211,8 @@ class Settings(BaseSettings):
     # Cap a single compile NIM invocation (branch repair / heavy compile).
     # Progress UI polls every 15s inside the wait; without a cap, a hung HTTP
     # client can leave the job at "waiting on model..." indefinitely.
-    COMPILE_CALL_MAX_SEC: float = 600.0
+    # 180s ≈ 3 unique models × ~55s compile timeout (+ a little slack).
+    COMPILE_CALL_MAX_SEC: float = 180.0
     # Feature extraction LLM/embed probe is optional metadata — never abort the job
     FEATURE_EXTRACTION_OPTIONAL: bool = True
     # When true, API process starts durable worker as an in-process thread

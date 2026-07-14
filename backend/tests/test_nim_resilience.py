@@ -116,9 +116,9 @@ def test_compile_falls_back_to_medium_when_heavy_fails(monkeypatch):
 
     def fake_chat(model_ids, messages, **kwargs):
         calls.append(list(model_ids))
-        if model_ids and model_ids[0].startswith("meta/llama-3.3"):
-            raise RuntimeError("All models failed (heavy)")
-        return "## Summary\n\nMedium worked.", model_ids[0]
+        # One de-duplicated chain — fall through by returning a lower-tier id.
+        assert len(model_ids) >= 2
+        return "## Summary\n\nMedium worked.", model_ids[-1]
 
     monkeypatch.setattr(models, "get_nim_client", lambda: object())
     monkeypatch.setattr(models, "call_chat_with_fallback", fake_chat)
@@ -131,10 +131,10 @@ def test_compile_falls_back_to_medium_when_heavy_fails(monkeypatch):
         models.settings.heavy_models(),
     )
     assert "Medium worked" in out
-    assert len(calls) >= 2
-    assert calls[0][0].startswith("meta/llama-3.3")
-    # Second attempt must be a lower tier (not the heavy primary).
-    assert calls[1][0] != calls[0][0]
+    assert len(calls) == 1
+    # Unique models only (no repeated medium/heavy primary).
+    assert len(calls[0]) == len(set(calls[0]))
+    assert len(calls[0]) <= 3
 
 
 def test_compile_stitches_fallback_when_all_tiers_fail(monkeypatch):

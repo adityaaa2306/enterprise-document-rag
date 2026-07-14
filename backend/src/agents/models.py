@@ -759,42 +759,43 @@ def _compile_model_chains(
     primary: Optional[List[str]],
     *,
     medium_first: Optional[bool] = None,
+    max_models: int = 3,
 ) -> List[List[str]]:
     """
-    Ordered unique model chains for compile.
+    Ordered unique model chain(s) for compile.
 
-    When COMPILE_MEDIUM_FIRST (default), try medium → heavy → light so Heavy
-    is an exception path, not the default.
+    Collapses medium/heavy/light into one de-duplicated list (heavy primary is
+    often the same id as medium). Caps length so a stalled NIM call cannot
+    burn 10+ minutes walking a redundant ladder.
     """
     use_medium_first = (
         bool(settings.COMPILE_MEDIUM_FIRST)
         if medium_first is None
         else bool(medium_first)
     )
-    chains: List[List[str]] = []
     if use_medium_first:
-        ordered = (
+        sources = (
             list(primary or []) or list(settings.medium_models()),
             list(settings.medium_models()),
             list(settings.heavy_models()),
             list(settings.light_models()),
         )
     else:
-        ordered = (
+        sources = (
             list(primary or []) or list(settings.heavy_models()),
             list(settings.medium_models()),
             list(settings.light_models()),
         )
-    for chain in ordered:
-        cleaned: List[str] = []
-        seen: set = set()
+    unique: List[str] = []
+    seen: set = set()
+    for chain in sources:
         for mid in chain:
             if mid and mid not in seen:
                 seen.add(mid)
-                cleaned.append(mid)
-        if cleaned and cleaned not in chains:
-            chains.append(cleaned)
-    return chains
+                unique.append(mid)
+            if len(unique) >= max(1, int(max_models or 3)):
+                return [unique]
+    return [unique] if unique else []
 
 
 def _build_compile_prompt(text_of_summaries: str, *, intermediate: bool = False) -> str:
@@ -843,7 +844,7 @@ EXECUTIVE SUMMARY:
 
 
 def _compile_timeout() -> httpx.Timeout:
-    read = float(getattr(settings, "NIM_COMPILE_TIMEOUT_SEC", 180.0) or 180.0)
+    read = float(getattr(settings, "NIM_COMPILE_TIMEOUT_SEC", 55.0) or 55.0)
     return _nim_timeout(read_override=read)
 
 
@@ -860,15 +861,34 @@ def _call_compile_llm(
             "content": _build_compile_prompt(text_of_summaries, intermediate=intermediate),
         },
     ]
-    # One retry only — long compile prompts must fall through quickly if a model stalls.
-    return call_chat_with_fallback(
-        chain,
-        messages,
-        temperature=0.5,
-        max_tokens=1600 if intermediate else 2000,
-        max_retries_per_model=1,
-        timeout=_compile_timeout(),
-    )
+    read = float(getattr(settings, "NIM_COMPILE_TIMEOUT_SEC", 55.0) or 55.0)
+    # Hard wall even if the OpenAI/httpx client fails to abort a hung socket.
+    # Cap by chain length so multi-model fallthrough still fits under COMPILE_CALL_MAX_SEC.
+    n_models = max(1, len([m for m in (chain or []) if m]))
+    hard_sec = min(read * n_models + 20.0, float(getattr(settings, "COMPILE_CALL_MAX_SEC", 180.0) or 180.0))
+
+    def _invoke() -> Tuple[str, Optional[str]]:
+        # No per-model retries — long compile prompts must fall through quickly.
+        return call_chat_with_fallback(
+            chain,
+            messages,
+            temperature=0.5,
+            max_tokens=1600 if intermediate else 2000,
+            max_retries_per_model=1,
+            timeout=_compile_timeout(),
+        )
+
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(_invoke)
+        try:
+            return fut.result(timeout=hard_sec)
+        except concurrent.futures.TimeoutError as e:
+            raise NimApiError(
+                f"Compile hard timeout after {hard_sec:.0f}s "
+                f"(models={chain})"
+            ) from e
 
 
 def _estimate_compile_tokens(text: str) -> int:
@@ -905,14 +925,18 @@ def _hierarchical_compile(
         batch_text = "\n\n".join(batch)
         last_err: Optional[Exception] = None
         job_id = state.get("job_id")
+        # Intermediate batches: at most 2 unique models (skip full ladder).
+        primary = list(chains[0]) if chains else []
+        batch_chains = [primary[:2]] if primary else []
         if job_id:
             try:
                 from src.db import jobs as jobs_db
 
+                model_hint = (batch_chains[0][0] if batch_chains and batch_chains[0] else "?")
                 jobs_db.set_progress(
                     job_id,
                     min(90.0, 82.0 + (8.0 * bi / max(batch_total, 1))),
-                    f"Compiling summary batches... ({bi}/{batch_total})",
+                    f"Compiling summary batches... ({bi}/{batch_total}) · {model_hint}",
                 )
             except Exception:
                 pass
@@ -922,9 +946,9 @@ def _hierarchical_compile(
             bi,
             batch_total,
             _estimate_compile_tokens(batch_text),
-            [c[0] for c in chains if c],
+            [c[0] for c in batch_chains if c],
         )
-        for chain in chains:
+        for chain in batch_chains:
             try:
                 text, used = _call_compile_llm(batch_text, chain, intermediate=True)
                 return bi, text, used, len(batch_text), None
@@ -990,7 +1014,19 @@ def _hierarchical_compile(
 
     final_text = "\n\n".join(working)
     last_error: Optional[Exception] = None
+    job_id = state.get("job_id")
     for chain in chains:
+        if job_id and chain:
+            try:
+                from src.db import jobs as jobs_db
+
+                jobs_db.set_progress(
+                    job_id,
+                    88.0,
+                    f"Compiling executive summary... · {chain[0]}",
+                )
+            except Exception:
+                pass
         try:
             result, used = _call_compile_llm(final_text, chain, intermediate=False)
             state.setdefault("model_usage_chars", {"light": 0, "medium": 0, "large": 0})

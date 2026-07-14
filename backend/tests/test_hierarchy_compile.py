@@ -35,3 +35,7 @@ def test_compile_chains_medium_first():
 
     med = settings.medium_models()[0]
     assert chains[0][0] == med or med in chains[0]
+    # Deduped + capped — no repeated model ids across the ladder
+    flat = [m for c in chains for m in c]
+    assert len(flat) == len(set(flat))
+    assert len(flat) <= 3
