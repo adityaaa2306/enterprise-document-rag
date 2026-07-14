@@ -296,7 +296,7 @@ function ResultsContent() {
     }
   }
 
-  const showLiveFeed = !isComplete && !jobFailed && !pollTimedOut
+  const showLiveFeed = Boolean(jobId) && !isComplete && !jobFailed && !pollTimedOut
   const showFailure = jobFailed || pollTimedOut
   const summaryMarkdown = result?.final_summary
     ? stripSummaryMetrics(unwrapOuterMarkdownFence(result.final_summary))
@@ -316,7 +316,11 @@ function ResultsContent() {
 
             <div className="grid grid-cols-1 xl:grid-cols-4 gap-6">
               <div className="xl:col-span-1 space-y-4">
-                <JobQueuePanel currentJobId={jobId} onSelectJob={selectJob} />
+                <JobQueuePanel
+                  currentJobId={jobId}
+                  onSelectJob={selectJob}
+                  autoSelectLatest
+                />
               </div>
 
               <div className="xl:col-span-3 space-y-6">
@@ -355,6 +359,14 @@ function ResultsContent() {
                   </Card>
                 ) : null}
 
+                {isComplete && !result ? (
+                  <Card className="p-6 bg-card/50 border-border/50">
+                    <p className="text-sm text-muted-foreground">
+                      Job complete — loading results…
+                    </p>
+                  </Card>
+                ) : null}
+
                 {isComplete && result ? (
                   <>
                     <JobResultsPanel result={result as any} />
@@ -381,10 +393,18 @@ function ResultsContent() {
                   </>
                 ) : null}
 
-                {!showLiveFeed && !showFailure && !isComplete ? (
+                {!jobId && !showLiveFeed && !showFailure && !isComplete ? (
                   <Card className="p-6 bg-card/50 border-border/50">
                     <p className="text-sm text-muted-foreground">
-                      Select a job from the queue to view results.
+                      Loading your latest job…
+                    </p>
+                  </Card>
+                ) : null}
+
+                {jobId && !showLiveFeed && !showFailure && !isComplete ? (
+                  <Card className="p-6 bg-card/50 border-border/50">
+                    <p className="text-sm text-muted-foreground">
+                      Waiting for job status…
                     </p>
                   </Card>
                 ) : null}

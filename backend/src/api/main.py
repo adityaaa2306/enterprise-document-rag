@@ -259,13 +259,10 @@ def list_my_jobs(
     """
     Job list for the signed-in user.
 
-    Only the latest job is retained; older jobs (and their document data) are purged.
+    Retention (purge older jobs) runs on enqueue only — never on this read path,
+    so the Results sidebar can poll without multi-second latency.
     """
     uid = int(current_user["id"])
-    try:
-        job_store.retain_only_latest_job(uid)
-    except Exception as e:
-        log.warning("retain_only_latest_job on list failed: %s", e)
 
     rows = job_store.list_jobs_for_user(
         uid,

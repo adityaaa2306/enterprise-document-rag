@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { apiFetch } from "@/lib/api"
@@ -37,7 +37,20 @@ export type QueueSnapshot = {
 type Props = {
   currentJobId?: string | null
   onSelectJob?: (jobId: string) => void
+  /** Poll interval while a job is pending/processing (default 2.5s). */
   pollMs?: number
+  /** Poll interval when worker is idle and jobs are terminal (default 30s). */
+  idlePollMs?: number
+  /** When true and no currentJobId, open the latest history job once. */
+  autoSelectLatest?: boolean
+}
+
+const ACTIVE_POLL_MS = 2500
+const IDLE_POLL_MS = 30000
+
+function isActiveStatus(status: string) {
+  const s = (status || "").toLowerCase()
+  return s === "pending" || s === "processing" || s === "queued" || s === "running"
 }
 
 function statusTone(status: string) {
@@ -49,12 +62,20 @@ function statusTone(status: string) {
   return "text-muted-foreground"
 }
 
-export function JobQueuePanel({ currentJobId, onSelectJob, pollMs = 2500 }: Props) {
+export function JobQueuePanel({
+  currentJobId,
+  onSelectJob,
+  pollMs = ACTIVE_POLL_MS,
+  idlePollMs = IDLE_POLL_MS,
+  autoSelectLatest = false,
+}: Props) {
   const router = useRouter()
   const [queue, setQueue] = useState<QueueSnapshot | null>(null)
   const [history, setHistory] = useState<JobListItem[]>([])
   const [cancelling, setCancelling] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const autoSelectedRef = useRef(false)
+  const needsFastPollRef = useRef(true)
 
   const refresh = useCallback(async () => {
     try {
@@ -62,38 +83,90 @@ export function JobQueuePanel({ currentJobId, onSelectJob, pollMs = 2500 }: Prop
         apiFetch("/queue"),
         apiFetch("/jobs?limit=1"),
       ])
+      let nextQueue: QueueSnapshot | null = null
+      let nextHistory: JobListItem[] = []
+
       if (qRes.ok) {
-        setQueue(await qRes.json())
+        nextQueue = await qRes.json()
+        setQueue(nextQueue)
       }
       if (hRes.ok) {
         const data = await hRes.json()
-        setHistory(Array.isArray(data.jobs) ? data.jobs : [])
+        nextHistory = Array.isArray(data.jobs) ? data.jobs : []
+        setHistory(nextHistory)
       }
+
+      const busy =
+        Boolean(nextQueue?.worker_busy) ||
+        (nextQueue?.queued_count || 0) > 0 ||
+        (nextQueue?.processing_count || 0) > 0 ||
+        nextHistory.some((j) => isActiveStatus(j.status)) ||
+        (nextQueue?.active_jobs || []).some((j) => isActiveStatus(j.status))
+      needsFastPollRef.current = busy
+
+      if (
+        autoSelectLatest &&
+        !autoSelectedRef.current &&
+        !currentJobId &&
+        nextHistory[0]?.job_id &&
+        onSelectJob
+      ) {
+        autoSelectedRef.current = true
+        onSelectJob(nextHistory[0].job_id)
+      }
+
       setError(null)
     } catch {
       setError("Could not load job queue")
     }
-  }, [])
+  }, [autoSelectLatest, currentJobId, onSelectJob])
 
   useEffect(() => {
     let cancelled = false
     let inFlight = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    const scheduleNext = () => {
+      if (cancelled) return
+      const hidden =
+        typeof document !== "undefined" && document.visibilityState === "hidden"
+      const delay = hidden
+        ? Math.max(idlePollMs, 60000)
+        : needsFastPollRef.current
+          ? pollMs
+          : idlePollMs
+      timer = setTimeout(tick, delay)
+    }
+
     const tick = async () => {
-      if (cancelled || inFlight) return
+      if (cancelled || inFlight) {
+        scheduleNext()
+        return
+      }
       inFlight = true
       try {
         await refresh()
       } finally {
         inFlight = false
+        scheduleNext()
       }
     }
+
+    const onVisibility = () => {
+      if (document.visibilityState === "visible" && !cancelled) {
+        if (timer) clearTimeout(timer)
+        tick()
+      }
+    }
+
     tick()
-    const id = setInterval(tick, pollMs)
+    document.addEventListener("visibilitychange", onVisibility)
     return () => {
       cancelled = true
-      clearInterval(id)
+      if (timer) clearTimeout(timer)
+      document.removeEventListener("visibilitychange", onVisibility)
     }
-  }, [refresh, pollMs])
+  }, [refresh, pollMs, idlePollMs])
 
   const openJob = (jobId: string) => {
     rememberJobId(jobId)

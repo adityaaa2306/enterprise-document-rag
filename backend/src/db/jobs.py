@@ -585,35 +585,38 @@ def list_worker_heartbeats(*, stale_after_sec: Optional[int] = None) -> List[Dic
         db.close()
 
 
-def _row_to_status(row) -> Dict[str, Any]:
+def _row_to_status(row, *, include_result: bool = True) -> Dict[str, Any]:
     status: Dict[str, Any] = {
         "job_id": row.id,
         "status": row.status,
         "progress": row.progress if row.progress is not None else 0.0,
         "message": row.message or "",
-        "understanding": row.understanding,
+        "understanding": getattr(row, "understanding", None) if include_result else None,
         "attempt_count": int(getattr(row, "attempt_count", 0) or 0),
         "claimed_by": getattr(row, "claimed_by", None),
     }
     if row.user_id is not None:
         status["user_id"] = row.user_id
-    if row.result_json is not None:
+    if include_result and row.result_json is not None:
         status["result"] = row.result_json
-    if row.error_detail:
+    if include_result and row.error_detail:
+        status["error_detail"] = row.error_detail
+    elif (not include_result) and getattr(row, "error_detail", None):
+        # Keep a short error signal for list UIs without loading huge payloads.
         status["error_detail"] = row.error_detail
     if row.filename:
         status["filename"] = row.filename
     if row.job_mode:
         status["job_mode"] = row.job_mode
-    if row.selected_model:
+    if include_result and row.selected_model:
         status["selected_model"] = row.selected_model
-    if row.crs is not None:
+    if include_result and row.crs is not None:
         status["crs"] = row.crs
-    if row.confidence is not None:
+    if include_result and row.confidence is not None:
         status["confidence"] = row.confidence
-    if row.latency_ms is not None:
+    if include_result and row.latency_ms is not None:
         status["latency_ms"] = row.latency_ms
-    if row.routing_decision is not None:
+    if include_result and row.routing_decision is not None:
         status["routing_decision"] = row.routing_decision
     if getattr(row, "available_at", None) is not None:
         status["available_at"] = row.available_at
@@ -709,8 +712,14 @@ def list_jobs_for_user(
     *,
     limit: int = 50,
     include_terminal: bool = True,
+    include_result: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Persistent job history for the signed-in user (all sessions)."""
+    """Persistent job history for the signed-in user (all sessions).
+
+    By default skips loading ``result_json`` / heavy payload columns so sidebar
+    polls stay cheap. Pass ``include_result=True`` only when the full payload
+    is required.
+    """
     if not _db_enabled():
         # Fallback: in-memory only
         out = []
@@ -723,9 +732,16 @@ def list_jobs_for_user(
                 job_status_mod.STATUS_CANCELLED,
             ):
                 continue
-            out.append(dict(st))
+            row = dict(st)
+            if not include_result:
+                row.pop("result", None)
+                row.pop("understanding", None)
+                row.pop("routing_decision", None)
+            out.append(row)
         out.sort(key=lambda x: str(x.get("updated_at") or x.get("job_id") or ""), reverse=True)
         return out[: max(1, limit)]
+
+    from sqlalchemy.orm import load_only
 
     from src.db.models import JobModel
     from src.db.session import get_session
@@ -742,9 +758,29 @@ def list_jobs_for_user(
                     ]
                 )
             )
+        if not include_result:
+            q = q.options(
+                load_only(
+                    JobModel.id,
+                    JobModel.user_id,
+                    JobModel.status,
+                    JobModel.progress,
+                    JobModel.message,
+                    JobModel.filename,
+                    JobModel.job_mode,
+                    JobModel.claimed_by,
+                    JobModel.attempt_count,
+                    JobModel.error_detail,
+                    JobModel.available_at,
+                    JobModel.heartbeat_at,
+                    JobModel.created_at,
+                    JobModel.updated_at,
+                    JobModel.completed_at,
+                )
+            )
         q = q.order_by(JobModel.created_at.desc()).limit(max(1, min(200, int(limit))))
         rows = db.execute(q).scalars().all()
-        return [_row_to_status(r) for r in rows]
+        return [_row_to_status(r, include_result=include_result) for r in rows]
     finally:
         db.close()
 

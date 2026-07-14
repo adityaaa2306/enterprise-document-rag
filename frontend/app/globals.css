@@ -364,3 +364,138 @@
     font-size: 1.15rem;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Landing page (oolala reference design) — scoped to .landing-root
+   --------------------------------------------------------------------------- */
+.landing-root {
+  --bg: #050505;
+  --surface: #0f0f0f;
+  --surface-2: #171717;
+  --border-landing: #262626;
+  --border-strong: #333333;
+  --text: #fafafa;
+  --text-2: #a3a3a3;
+  --text-3: #525252;
+  --emerald: #10b981;
+  --emerald-glow: rgba(16, 185, 129, 0.25);
+  --tier-light: #14b8a6;
+  --tier-medium: #f59e0b;
+  --tier-heavy: #f43f5e;
+
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-landing-body), "IBM Plex Sans", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+
+.landing-root ::selection {
+  background: var(--emerald);
+  color: #000;
+}
+
+.landing-root .font-display {
+  font-family: var(--font-landing-display), Outfit, system-ui, sans-serif;
+  letter-spacing: -0.02em;
+}
+
+.landing-root .font-body {
+  font-family: var(--font-landing-body), "IBM Plex Sans", system-ui, sans-serif;
+}
+
+.landing-root .font-mono {
+  font-family: var(--font-mono), "JetBrains Mono", ui-monospace, monospace;
+}
+
+.landing-root .font-serif {
+  font-family: var(--font-landing-serif), "Cormorant Garamond", "Times New Roman", serif;
+}
+
+.landing-root .noise {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 100;
+  opacity: 0.035;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  mix-blend-mode: overlay;
+}
+
+.landing-root .hairline {
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+.landing-root .hairline-b {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.landing-root .hairline-t {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.landing-root .hairline-r {
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.landing-root .hairline-l {
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.landing-root .grid-bg {
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+  background-size: 80px 80px;
+}
+
+.landing-root .emerald-glow {
+  box-shadow: 0 0 40px -8px var(--emerald-glow);
+}
+
+.landing-root .marquee-fade {
+  position: relative;
+}
+
+.landing-root .marquee-fade::before,
+.landing-root .marquee-fade::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 80px;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.landing-root .marquee-fade::before {
+  left: 0;
+  background: linear-gradient(to right, var(--bg), transparent);
+}
+
+.landing-root .marquee-fade::after {
+  right: 0;
+  background: linear-gradient(to left, var(--bg), transparent);
+}
+
+.landing-root::-webkit-scrollbar,
+.landing-root *::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.landing-root::-webkit-scrollbar-track,
+.landing-root *::-webkit-scrollbar-track {
+  background: #0a0a0a;
+}
+
+.landing-root::-webkit-scrollbar-thumb,
+.landing-root *::-webkit-scrollbar-thumb {
+  background: #262626;
+}
+
+.landing-root::-webkit-scrollbar-thumb:hover,
+.landing-root *::-webkit-scrollbar-thumb:hover {
+  background: #333;
+}
