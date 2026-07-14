@@ -2,34 +2,31 @@
 
 import { useEffect, useState } from "react"
 import { apiFetch } from "@/lib/api"
+import {
+  fetchCurrentUserCached,
+  peekCurrentUserCache,
+  clearCurrentUserCache,
+  type CurrentUser,
+} from "@/lib/current-user-cache"
 
-export interface CurrentUser {
-  id: number
-  email: string
-  full_name: string
-  is_active: boolean
-  created_at?: string | null
-}
+export type { CurrentUser }
+export { clearCurrentUserCache }
 
 export function useCurrentUser() {
-  const [user, setUser] = useState<CurrentUser | null>(null)
-  const [loading, setLoading] = useState(true)
+  const [user, setUser] = useState<CurrentUser | null>(() => peekCurrentUserCache())
+  const [loading, setLoading] = useState(() => !peekCurrentUserCache())
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
     ;(async () => {
       try {
-        const res = await apiFetch("/auth/me")
-        if (!res.ok) {
-          if (!cancelled) {
-            setUser(null)
-            setError(`HTTP ${res.status}`)
-          }
-          return
-        }
-        const data = (await res.json()) as CurrentUser
-        if (!cancelled) {
+        const data = await fetchCurrentUserCached(() => apiFetch("/auth/me"))
+        if (cancelled) return
+        if (!data) {
+          setUser(null)
+          setError("Unauthenticated")
+        } else {
           setUser(data)
           setError(null)
         }
