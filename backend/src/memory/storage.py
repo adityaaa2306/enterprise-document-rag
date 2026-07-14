@@ -104,6 +104,21 @@ def store_chunks(
     embeddings were computed in parallel with map/compile.
     """
     try:
+        from src.monitoring.query_path_guard import note_ingest_op
+        from src.retrieval import doc_cache
+        from src.retrieval.bm25 import invalidate_memory as invalidate_bm25
+
+        note_ingest_op(
+            "document_embedding_generation",
+            detail=f"store_chunks document_id={document_id}",
+        )
+        note_ingest_op(
+            "chunk_generation",
+            detail=f"store_chunks n={len(chunks) if chunks else 0}",
+        )
+        doc_cache.invalidate(document_id)
+        invalidate_bm25(document_id)
+
         collection = _get_documents_collection()
         db = _session()
 
@@ -288,6 +303,13 @@ def delete_chunks(document_id: str):
             delete_index(document_id)
         except Exception as e:
             log.warning(f"BM25 index delete failed for {document_id}: {e}")
+
+        try:
+            from src.retrieval import doc_cache
+
+            doc_cache.invalidate(document_id)
+        except Exception as e:
+            log.warning(f"doc_cache invalidate failed for {document_id}: {e}")
 
         try:
             from src.memory.service import MemoryService

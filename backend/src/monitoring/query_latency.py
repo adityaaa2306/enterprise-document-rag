@@ -22,10 +22,41 @@ STAGE_RERANK = "rerank_ms"
 STAGE_PARENT_EXPAND = "parent_expand_ms"
 STAGE_RETRIEVAL_TOTAL = "retrieval_total_ms"
 STAGE_CONTEXT_ASSEMBLE = "context_assemble_ms"
+STAGE_GRAPH_SEED = "graph_seed_ms"
+STAGE_META = "meta_lookup_ms"
 STAGE_LLM_TTFT = "llm_ttft_ms"
 STAGE_LLM_TTLT = "llm_ttlt_ms"
 STAGE_LLM_TOTAL = "llm_generation_ms"
+STAGE_NIM_REQUEST = "nim_request_ms"
+STAGE_NIM_NETWORK = "nim_network_ms"
+STAGE_EXPLAINABILITY = "explainability_ms"
+STAGE_CITATIONS = "citations_ms"
+STAGE_POSTPROCESS = "postprocess_ms"
 STAGE_TOTAL = "total_ms"
+
+# Ordered list for tables / waterfall UI
+STAGE_DISPLAY_ORDER = [
+    STAGE_QUERY_EMBED,
+    STAGE_DENSE,
+    STAGE_BM25,
+    STAGE_GRAPH_SEED,
+    STAGE_RRF,
+    STAGE_META,
+    STAGE_RERANK,
+    STAGE_PARENT_EXPAND,
+    STAGE_RETRIEVAL_TOTAL,
+    STAGE_CONTEXT_ASSEMBLE,
+    STAGE_NIM_REQUEST,
+    STAGE_NIM_NETWORK,
+    STAGE_LLM_TTFT,
+    STAGE_LLM_TTLT,
+    STAGE_LLM_TOTAL,
+    STAGE_EXPLAINABILITY,
+    STAGE_CITATIONS,
+    STAGE_POSTPROCESS,
+    STAGE_TOTAL,
+]
+
 
 
 class QueryLatencyTracker:
@@ -91,20 +122,7 @@ def log_query_latency(
     """Structured one-line log for easy grepping / table extraction."""
     stages = latency.get("stages_ms") or {}
     # Stable column order for copy/paste into a table
-    order = [
-        STAGE_QUERY_EMBED,
-        STAGE_DENSE,
-        STAGE_BM25,
-        STAGE_RRF,
-        STAGE_RERANK,
-        STAGE_PARENT_EXPAND,
-        STAGE_RETRIEVAL_TOTAL,
-        STAGE_CONTEXT_ASSEMBLE,
-        STAGE_LLM_TTFT,
-        STAGE_LLM_TTLT,
-        STAGE_LLM_TOTAL,
-        STAGE_TOTAL,
-    ]
+    order = list(STAGE_DISPLAY_ORDER)
     ordered = {k: stages[k] for k in order if k in stages}
     extras = {k: v for k, v in stages.items() if k not in ordered}
     ordered.update(extras)

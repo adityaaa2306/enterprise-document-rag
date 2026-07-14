@@ -252,16 +252,29 @@ def _job_list_item(raw: Dict[str, Any]) -> JobListItem:
 
 @app.get("/jobs", response_model=JobListResponse)
 def list_my_jobs(
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(1, ge=1, le=200),
     active_only: bool = Query(False),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Persistent job history for the signed-in user (survives navigation / sessions)."""
+    """
+    Job list for the signed-in user.
+
+    Only the latest job is retained; older jobs (and their document data) are purged.
+    """
+    uid = int(current_user["id"])
+    try:
+        job_store.retain_only_latest_job(uid)
+    except Exception as e:
+        log.warning("retain_only_latest_job on list failed: %s", e)
+
     rows = job_store.list_jobs_for_user(
-        int(current_user["id"]),
-        limit=limit,
+        uid,
+        limit=min(limit, 1) if not active_only else limit,
         include_terminal=not active_only,
     )
+    # Hard cap: never return more than one terminal history slot
+    if not active_only and len(rows) > 1:
+        rows = rows[:1]
     items = [_job_list_item(r) for r in rows]
     return JobListResponse(jobs=items, count=len(items))
 
@@ -327,6 +340,11 @@ async def summarize_document(
         filename=meta["original_filename"],
         job_mode=preference,
     )
+    # Single-slot retention: wipe older jobs + their RAG data for this user
+    try:
+        job_store.retain_only_latest_job(user_id, keep_job_id=meta["job_id"])
+    except Exception as e:
+        log.warning("retain_only_latest_job after enqueue failed: %s", e)
 
     return SummarizeJobResponse(
         job_id=meta["job_id"],
@@ -677,6 +695,36 @@ def query_document(
     )
 
 
+@app.post("/rag-query/stream")
+def query_document_stream(
+    request: RagQueryRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    True SSE streaming: tokens as they arrive from NIM, explainability in final event.
+    Events: meta | token | done | error (JSON lines as ``data: {...}\\n\\n``).
+    """
+    assert_document_owner(int(current_user["id"]), request.document_id)
+    if request.conversation_id:
+        assert_conversation_owner(
+            int(current_user["id"]), request.conversation_id, request.document_id
+        )
+    return StreamingResponse(
+        _iter_rag_query_sse(
+            document_id=request.document_id,
+            query=request.query,
+            conversation_id=request.conversation_id,
+            user_id=int(current_user["id"]),
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/chat", response_model=RagQueryResponse)
 def chat_document(
     request: ChatRequest,
@@ -705,6 +753,259 @@ def chat_document(
     )
 
 
+def _sse_line(payload: Dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload, default=str)}\n\n"
+
+
+def _iter_rag_query_sse(
+    *,
+    document_id: str,
+    query: str,
+    conversation_id: Optional[str] = None,
+    user_id: Optional[int] = None,
+):
+    """Generator that yields SSE frames for /rag-query/stream."""
+    import time
+    import threading
+
+    from src.monitoring.query_latency import (
+        STAGE_CITATIONS,
+        STAGE_CONTEXT_ASSEMBLE,
+        STAGE_EXPLAINABILITY,
+        log_query_latency,
+        merge_latency,
+    )
+    from src.monitoring.query_path_guard import (
+        begin_query_path,
+        end_query_path,
+        snapshot_violations,
+    )
+    from src.perf.profiler import attach_resource_snapshot, sample_resources
+
+    t_request = time.perf_counter()
+    begin_query_path(document_id=document_id, query=query)
+    resources_start = sample_resources()
+    prior_entities: List[str] = []
+    mem = None
+    if conversation_id:
+        from src.memory.service import MemoryService
+
+        mem = MemoryService()
+        prior_entities = mem.prior_entity_resolutions(conversation_id)
+
+    try:
+        routing = storage.get_routing_decision(document_id)
+        assemble_tier = "heavy"
+        if routing and settings.USE_CONTEXT_ASSEMBLER:
+            assemble_tier = (
+                routing.get("compile_tier")
+                or routing.get("tier")
+                or "heavy"
+            )
+
+        from src.retrieval.service import RetrievalService
+        from src.context.assembler import ContextAssembler
+
+        retrieval = RetrievalService().search(
+            query=query,
+            document_id=document_id,
+        )
+        retrieval_debug = dict(retrieval.debug or {})
+        retrieval_latency = dict(retrieval_debug.get("latency") or {})
+        pack = ContextAssembler().pack(
+            retrieval.passages,
+            tier=assemble_tier,
+            query=query,
+        )
+        assemble_ms = (pack.stats or {}).get("latency_ms") or {}
+        assemble_latency = (
+            {"stages_ms": dict(assemble_ms), "meta": {}} if assemble_ms else {}
+        )
+        if not pack.passages and not pack.context_text:
+            yield _sse_line(
+                {
+                    "event": "error",
+                    "message": "No relevant context found for this query.",
+                    "status": 404,
+                }
+            )
+            return
+
+        pre_ms = (time.perf_counter() - t_request) * 1000.0
+        yield _sse_line(
+            {
+                "event": "meta",
+                "document_id": document_id,
+                "retrieval_ms": round(pre_ms, 1),
+                "context_tokens": pack.tokens_used,
+                "context_budget": pack.tokens_budget,
+                "packed": (pack.stats or {}).get("packed"),
+            }
+        )
+
+        from src.agents.response_agent import ResponseAgent
+
+        answer = ""
+        skill = None
+        model_used = None
+        tier = assemble_tier
+        sources: List[str] = []
+        response_debug: Dict[str, Any] = {}
+        llm_latency: Dict[str, Any] = {}
+        client_ttft_ms: Optional[float] = None
+        t_first_token_client: Optional[float] = None
+
+        for ev in ResponseAgent().answer_stream(
+            query,
+            pack=pack,
+            document_id=document_id,
+            routing_decision=routing,
+        ):
+            event = ev.get("event")
+            if event == "meta":
+                # Already sent retrieval meta; enrich with plan
+                yield _sse_line(
+                    {
+                        "event": "plan",
+                        "skill": ev.get("skill"),
+                        "response_plan": ev.get("response_plan"),
+                    }
+                )
+            elif event == "token":
+                if t_first_token_client is None:
+                    t_first_token_client = time.perf_counter()
+                    client_ttft_ms = (t_first_token_client - t_request) * 1000.0
+                yield _sse_line({"event": "token", "text": ev.get("text") or ""})
+            elif event == "error":
+                yield _sse_line({"event": "error", "message": ev.get("message")})
+                return
+            elif event == "done":
+                answer = ev.get("answer") or ""
+                skill = ev.get("skill")
+                model_used = ev.get("model_used")
+                tier = ev.get("tier") or tier
+                sources = list(ev.get("sources") or [])
+                response_debug = dict(ev.get("debug") or {})
+                llm_latency = dict(response_debug.get("latency") or {})
+                pack = ev.get("pack") or pack
+
+        # Explainability AFTER tokens (off critical path for perceived latency)
+        explain_ms = 0.0
+        cite_ms = 0.0
+        entities_used: List[str] = []
+        done_payload: Dict[str, Any] = {
+            "event": "done",
+            "document_id": document_id,
+            "query": query,
+            "answer": answer,
+            "sources": sources,
+            "skill": skill,
+            "model_used": model_used,
+            "conversation_id": conversation_id,
+            "client_ttft_ms": round(client_ttft_ms, 3) if client_ttft_ms is not None else None,
+        }
+
+        if settings.EXPLAINABILITY_ENABLED:
+            from src.explainability.builder import ExplainabilityBuilder
+
+            t_explain = time.perf_counter()
+            envelope = ExplainabilityBuilder().build(
+                answer=answer,
+                query=query,
+                document_id=document_id,
+                pack=pack,
+                skill=skill,
+                model_used=model_used,
+                tier=tier,
+                routing_decision=routing,
+                retrieval_debug=retrieval_debug,
+                prior_entities=prior_entities,
+                response_debug=response_debug,
+            )
+            explain_ms = (time.perf_counter() - t_explain) * 1000.0
+            t_cite = time.perf_counter()
+            chunk_dicts = [c.to_dict() for c in envelope.retrieved_chunks]
+            cite_ms = (time.perf_counter() - t_cite) * 1000.0
+            entities_used = list(envelope.entities_used)
+            done_payload.update(
+                {
+                    "confidence": envelope.confidence,
+                    "knowledge_sources": envelope.knowledge_sources,
+                    "retrieved_chunks": chunk_dicts,
+                    "entities_used": envelope.entities_used,
+                    "reasoning_path": envelope.reasoning_path,
+                    "missing_context": envelope.missing_context,
+                    "model": envelope.model.to_dict() if envelope.model else None,
+                    "routing_ref": envelope.routing_ref,
+                }
+            )
+
+        total_ms = (time.perf_counter() - t_request) * 1000.0
+        latency = merge_latency(
+            retrieval_latency,
+            assemble_latency,
+            llm_latency,
+            {
+                "stages_ms": {
+                    STAGE_EXPLAINABILITY: round(explain_ms, 3),
+                    STAGE_CITATIONS: round(cite_ms, 3),
+                },
+                "meta": {},
+            },
+            total_ms=total_ms,
+        )
+        if STAGE_CONTEXT_ASSEMBLE not in (latency.get("stages_ms") or {}):
+            latency.setdefault("stages_ms", {})[STAGE_CONTEXT_ASSEMBLE] = 0.0
+
+        violations = snapshot_violations()
+        resources_end = sample_resources()
+        latency.setdefault("meta", {})
+        latency["meta"].update(
+            {
+                "document_id": document_id,
+                "streaming": True,
+                "pipeline_validation": {
+                    "ingest_ops_on_query_path": violations,
+                    "clean": len(violations) == 0,
+                },
+                "resources_start": resources_start,
+                "resources_end": resources_end,
+                "active_threads": threading.active_count(),
+                "client_ttft_ms": (
+                    round(client_ttft_ms, 3) if client_ttft_ms is not None else None
+                ),
+            }
+        )
+        llm_meta = (llm_latency.get("meta") or {}) if isinstance(llm_latency, dict) else {}
+        for key in ("nim", "prompt", "llm_timing_mode"):
+            if key in llm_meta and key not in latency["meta"]:
+                latency["meta"][key] = llm_meta[key]
+        attach_resource_snapshot(latency, label="end")
+        log_query_latency(document_id=document_id, query=query, latency=latency)
+        done_payload["latency"] = latency
+
+        if conversation_id and mem is not None:
+            mem.append_turn(
+                conversation_id, "user", query,
+                entities=list(prior_entities), user_id=user_id,
+            )
+            mem.append_turn(
+                conversation_id,
+                "assistant",
+                answer,
+                entities=entities_used,
+                meta={"skill": skill, "model_used": model_used},
+                user_id=user_id,
+            )
+
+        yield _sse_line(done_payload)
+    except Exception as e:
+        log.error(f"SSE RAG stream failed: {e}")
+        yield _sse_line({"event": "error", "message": str(e)})
+    finally:
+        end_query_path()
+
+
 def _run_rag_query(
     *,
     document_id: str,
@@ -714,16 +1015,27 @@ def _run_rag_query(
     user_id: Optional[int] = None,
 ) -> RagQueryResponse:
     import time
+    import threading
 
     from src.monitoring.query_latency import (
+        STAGE_CITATIONS,
         STAGE_CONTEXT_ASSEMBLE,
+        STAGE_EXPLAINABILITY,
         STAGE_LLM_TOTAL,
         log_query_latency,
         merge_latency,
     )
+    from src.monitoring.query_path_guard import (
+        begin_query_path,
+        end_query_path,
+        snapshot_violations,
+    )
+    from src.perf.profiler import attach_resource_snapshot, sample_resources
 
     log.info(f"RAG Query: Doc ID {document_id}, Query: {query}")
     t_request = time.perf_counter()
+    begin_query_path(document_id=document_id, query=query)
+    resources_start = sample_resources()
 
     prior_entities: List[str] = []
     mem = None
@@ -790,8 +1102,10 @@ def _run_rag_query(
                     detail="No relevant context found for this query.",
                 )
     except HTTPException:
+        end_query_path()
         raise
     except Exception as e:
+        end_query_path()
         log.error(f"Error during vector search: {e}")
         raise HTTPException(status_code=500, detail="Error searching document.")
 
@@ -861,19 +1175,9 @@ def _run_rag_query(
             }
             sources = [chunk.content for chunk in context_chunks]
 
-        total_ms = (time.perf_counter() - t_request) * 1000.0
-        latency = merge_latency(
-            retrieval_latency,
-            assemble_latency,
-            llm_latency,
-            total_ms=total_ms,
-        )
-        # Ensure assemble key present even if pack path skipped timing
-        if STAGE_CONTEXT_ASSEMBLE not in (latency.get("stages_ms") or {}):
-            latency.setdefault("stages_ms", {})[STAGE_CONTEXT_ASSEMBLE] = 0.0
-        latency.setdefault("meta", {})["document_id"] = document_id
-        log_query_latency(document_id=document_id, query=query, latency=latency)
-
+        explain_ms = 0.0
+        cite_ms = 0.0
+        entities_used: List[str] = []
         resp_kwargs: Dict[str, Any] = {
             "document_id": document_id,
             "query": query,
@@ -882,13 +1186,12 @@ def _run_rag_query(
             "skill": skill,
             "model_used": model_used,
             "conversation_id": conversation_id,
-            "latency": latency,
         }
 
-        entities_used: List[str] = []
         if settings.EXPLAINABILITY_ENABLED:
             from src.explainability.builder import ExplainabilityBuilder
 
+            t_explain = time.perf_counter()
             envelope = ExplainabilityBuilder().build(
                 answer=answer,
                 query=query,
@@ -902,12 +1205,17 @@ def _run_rag_query(
                 prior_entities=prior_entities,
                 response_debug=response_debug,
             )
+            explain_ms = (time.perf_counter() - t_explain) * 1000.0
+            t_cite = time.perf_counter()
+            # Citation serialization is part of explainability envelope; measure dict build
+            chunk_dicts = [c.to_dict() for c in envelope.retrieved_chunks]
+            cite_ms = (time.perf_counter() - t_cite) * 1000.0
             entities_used = list(envelope.entities_used)
             resp_kwargs.update(
                 {
                     "confidence": envelope.confidence,
                     "knowledge_sources": envelope.knowledge_sources,
-                    "retrieved_chunks": [c.to_dict() for c in envelope.retrieved_chunks],
+                    "retrieved_chunks": chunk_dicts,
                     "entities_used": envelope.entities_used,
                     "reasoning_path": envelope.reasoning_path,
                     "missing_context": envelope.missing_context,
@@ -915,6 +1223,47 @@ def _run_rag_query(
                     "routing_ref": envelope.routing_ref,
                 }
             )
+
+        total_ms = (time.perf_counter() - t_request) * 1000.0
+        latency = merge_latency(
+            retrieval_latency,
+            assemble_latency,
+            llm_latency,
+            {
+                "stages_ms": {
+                    STAGE_EXPLAINABILITY: round(explain_ms, 3),
+                    STAGE_CITATIONS: round(cite_ms, 3),
+                },
+                "meta": {},
+            },
+            total_ms=total_ms,
+        )
+        if STAGE_CONTEXT_ASSEMBLE not in (latency.get("stages_ms") or {}):
+            latency.setdefault("stages_ms", {})[STAGE_CONTEXT_ASSEMBLE] = 0.0
+
+        violations = snapshot_violations()
+        resources_end = sample_resources()
+        latency.setdefault("meta", {})
+        latency["meta"].update(
+            {
+                "document_id": document_id,
+                "pipeline_validation": {
+                    "ingest_ops_on_query_path": violations,
+                    "clean": len(violations) == 0,
+                },
+                "resources_start": resources_start,
+                "resources_end": resources_end,
+                "active_threads": threading.active_count(),
+            }
+        )
+        # Promote nested LLM meta if present
+        llm_meta = (llm_latency.get("meta") or {}) if isinstance(llm_latency, dict) else {}
+        for key in ("nim", "prompt", "llm_timing_mode"):
+            if key in llm_meta and key not in latency["meta"]:
+                latency["meta"][key] = llm_meta[key]
+        attach_resource_snapshot(latency, label="end")
+        log_query_latency(document_id=document_id, query=query, latency=latency)
+        resp_kwargs["latency"] = latency
 
         if persist_conversation and conversation_id and mem is not None:
             mem.append_turn(
@@ -934,8 +1283,11 @@ def _run_rag_query(
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"Error during RAG answer synthesis: {e}")
+        log.error(f"Error during RAG generation: {e}")
         raise HTTPException(status_code=500, detail="Error generating answer.")
+    finally:
+        end_query_path()
+
 
 from src.api.schemas import DocumentResponse, KnowledgeResponse, GraphResponse
 

@@ -10,32 +10,18 @@ from src.context.assembler import ContextPack
 
 def build_messages(query: str, pack: ContextPack) -> List[Dict[str, str]]:
     context = pack.context_text or ""
-    user = f"""Answer the user's query *only* based on the provided context.
-Be concise and factual. If the context is insufficient, say so clearly.
-Cite evidence using the bracket numbers from the context when helpful (e.g. [1]).
-
-{MARKDOWN_OUTPUT_RULES}
-
-Suggested structure when useful:
-## Summary
-## Key Findings
-## Details
-## Sources
-
+    concise = bool((pack.stats or {}).get("concise_prompt"))
+    structure = "" if concise else "\nUse ## Summary / Key findings only if helpful.\n"
+    user = f"""Answer using only the context. Be concise and factual. If insufficient, say so. Cite [n] when useful.
+{MARKDOWN_OUTPUT_RULES}{structure}
 CONTEXT:
 {context}
 
-QUERY:
-{query}
-
-ANSWER:"""
+QUERY: {query}"""
     return [
         {
             "role": "system",
-            "content": (
-                "You are an expert Q&A assistant. Use only the provided context. "
-                "Do not invent facts. Always reply in GitHub-Flavored Markdown."
-            ),
+            "content": "Grounded Q&A assistant. Use only the context. No invented facts. GFM Markdown.",
         },
         {"role": "user", "content": user},
     ]
@@ -46,7 +32,7 @@ register(
         name="qa",
         description="Grounded question answering",
         build_messages=build_messages,
-        max_tokens=1500,
+        max_tokens=500,  # overridden by response planner
         temperature=0.2,
     )
 )

@@ -155,6 +155,10 @@ class ContextAssembler:
 
         t0 = time.perf_counter()
         budget = self.token_budget if self.token_budget is not None else budget_for_tier(tier)
+        # Cap chat/RAG context so generation prompts stay lean (retrieval unchanged)
+        response_cap = int(getattr(settings, "RESPONSE_CONTEXT_BUDGET", 0) or 0)
+        if response_cap > 0:
+            budget = min(budget, response_cap)
         norms = _normalize(passages)
         if not norms:
             assemble_ms = round((time.perf_counter() - t0) * 1000.0, 3)
@@ -323,13 +327,10 @@ class ContextAssembler:
         )
 
     def _format(self, packed: List[PackedPassage]) -> str:
+        # Lean headers: citation index only (section path kept in provenance for UI)
         blocks: List[str] = []
         for p in packed:
-            header_bits = [f"[{p.citation}]"]
-            if p.section_path:
-                header_bits.append(f"Section: {p.section_path}")
-            header = " ".join(header_bits)
-            blocks.append(f"{header}\n{p.content}")
+            blocks.append(f"[{p.citation}]\n{p.content}")
         return "\n\n---\n\n".join(blocks)
 
 

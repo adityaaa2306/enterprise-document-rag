@@ -1,5 +1,8 @@
 """
 RetrievalService — hybrid dense + BM25 → RRF → NIM rerank → parent expand (Phase 2.B).
+
+Optimized for query path: in-memory BM25 + document chunk cache, batched meta,
+fast parent expand, Chroma collection reuse. Does not change LLM generation.
 """
 from __future__ import annotations
 
@@ -11,11 +14,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from src.core.config import settings
 from src.agents import models
 from src.retrieval.bm25 import load_index, build_and_save
+from src.retrieval import doc_cache
 from src.retrieval.rrf import reciprocal_rank_fusion
 from src.monitoring.query_latency import (
     QueryLatencyTracker,
     STAGE_BM25,
     STAGE_DENSE,
+    STAGE_GRAPH_SEED,
+    STAGE_META,
     STAGE_PARENT_EXPAND,
     STAGE_QUERY_EMBED,
     STAGE_RERANK,
@@ -24,12 +30,22 @@ from src.monitoring.query_latency import (
 )
 
 log = logging.getLogger(__name__)
+_collection_cache: Any = None
 
 
 def _storage():
     from src.memory import storage
 
     return storage
+
+
+def _get_collection():
+    """Reuse Chroma collection handle within the process."""
+    global _collection_cache
+    if _collection_cache is not None:
+        return _collection_cache
+    _collection_cache = _storage()._get_documents_collection()
+    return _collection_cache
 
 
 @dataclass
@@ -69,6 +85,14 @@ class RetrievalService:
         lat = QueryLatencyTracker()
         t_retrieval = time.perf_counter()
 
+        # Warm document chunk cache once (shared by BM25 texts / meta / parent expand)
+        t_cache = time.perf_counter()
+        chunk_map = doc_cache.get_map(document_id)
+        lat.add_meta(
+            doc_cache_chunks=len(chunk_map),
+            doc_cache_load_ms=round((time.perf_counter() - t_cache) * 1000.0, 3),
+        )
+
         if not settings.ENABLE_HYBRID_RETRIEVAL:
             return self._dense_only(
                 query, document_id, top_k, graph_seed=use_seed, lat=lat
@@ -88,7 +112,10 @@ class RetrievalService:
         seed_ids: List[str] = []
         seed_map: Dict[str, str] = {}
         if use_seed:
-            seed_ids, seed_map = self._graph_seed(query, document_id)
+            with lat.stage(STAGE_GRAPH_SEED):
+                seed_ids, seed_map = self._graph_seed(query, document_id)
+        else:
+            lat.set(STAGE_GRAPH_SEED, 0.0)
 
         ranked_lists = [dense_ids, sparse_ids]
         if seed_ids:
@@ -98,43 +125,52 @@ class RetrievalService:
             fused = reciprocal_rank_fusion(ranked_lists, k=60, top_n=rrf_k)
         fused_ids = [doc_id for doc_id, _ in fused]
 
-        # Build candidate passages (prefer text from either map)
-        candidates: List[RetrievedPassage] = []
-        for i, (doc_id, score) in enumerate(fused):
-            text = dense_map.get(doc_id) or sparse_map.get(doc_id) or seed_map.get(doc_id) or ""
-            if not text:
-                continue
-            meta = self._meta_for(document_id, doc_id)
-            src = "graph_seed" if doc_id in seed_ids and doc_id not in dense_ids and doc_id not in sparse_ids else "rrf"
-            candidates.append(
-                RetrievedPassage(
-                    chunk_id=doc_id,
-                    content=text,
-                    score=score,
-                    rank=i,
-                    parent_id=meta.get("parent_id"),
-                    section_path=meta.get("section_path"),
-                    source=src,
+        with lat.stage(STAGE_META):
+            candidates: List[RetrievedPassage] = []
+            for i, (cid, score) in enumerate(fused):
+                text = (
+                    dense_map.get(cid)
+                    or sparse_map.get(cid)
+                    or seed_map.get(cid)
+                    or (chunk_map[cid].text if cid in chunk_map else "")
                 )
-            )
+                if not text:
+                    continue
+                meta = doc_cache.meta_for(document_id, cid)
+                src = (
+                    "graph_seed"
+                    if cid in seed_ids and cid not in dense_ids and cid not in sparse_ids
+                    else "rrf"
+                )
+                candidates.append(
+                    RetrievedPassage(
+                        chunk_id=cid,
+                        content=text,
+                        score=score,
+                        rank=i,
+                        parent_id=meta.get("parent_id"),
+                        section_path=meta.get("section_path"),
+                        source=src,
+                    )
+                )
 
         if not candidates:
-            # Fall back to dense-only if BM25 missing / empty
             log.warning("Hybrid fusion empty; falling back to dense-only")
             return self._dense_only(
                 query, document_id, top_k, graph_seed=use_seed, lat=lat
             )
 
-        # Rerank top fused
         to_rerank = candidates[: max(rerank_n, top_k)]
         passages_text = [c.content for c in to_rerank]
         with lat.stage(STAGE_RERANK):
             reranked_texts = models.rerank(
                 query, passages_text, top_k=min(top_k, len(passages_text))
             )
+        lat.add_meta(
+            rerank_meta=models.models_registry.get("last_rerank_meta") or {},
+        )
 
-        # Map back preserving first occurrence
-        by_text = {}
+        by_text: Dict[str, RetrievedPassage] = {}
         for c in to_rerank:
             by_text.setdefault(c.content, c)
 
@@ -143,7 +179,6 @@ class RetrievalService:
         for i, text in enumerate(reranked_texts):
             base = by_text.get(text)
             if not base or base.chunk_id in used:
-                # duplicate text — skip
                 continue
             used.add(base.chunk_id)
             ranked.append(
@@ -166,10 +201,19 @@ class RetrievalService:
         else:
             lat.set(STAGE_PARENT_EXPAND, 0.0)
 
-        lat.set(STAGE_RETRIEVAL_TOTAL, (time.perf_counter() - t_retrieval) * 1000.0)
-        lat.add_meta(retrieval_mode="hybrid")
-
         limit = top_k + (settings.RAG_PARENT_EXPAND_MAX if settings.ENABLE_PARENT_EXPAND else 0)
+        lat.set(STAGE_RETRIEVAL_TOTAL, (time.perf_counter() - t_retrieval) * 1000.0)
+        lat.add_meta(
+            retrieval_mode="hybrid",
+            retrieved_chunks=len(ranked[:limit]),
+            reranked_chunks=len(to_rerank),
+            dense_k=dense_k,
+            sparse_k=sparse_k,
+            rrf_k=rrf_k,
+            rerank_n=rerank_n,
+            top_k=top_k,
+        )
+
         debug = {
             "mode": "hybrid",
             "dense_ids": dense_ids[:10],
@@ -193,24 +237,11 @@ class RetrievalService:
             seed_ids = store.neighbor_chunk_ids(document_id, query)
             if not seed_ids:
                 return [], {}
-            storage = _storage()
-            rows = storage.retrieve_chunks(document_id)
-            by_id = {f"{document_id}_{r['index']}": r["text"] for r in rows}
-            # Also allow exact chunk ids stored in evidence
+            by_id = doc_cache.text_map(document_id)
             id_to_text: Dict[str, str] = {}
             ordered: List[str] = []
             for cid in seed_ids:
                 text = by_id.get(cid, "")
-                if not text:
-                    # try loading from ChunkModel directly
-                    try:
-                        db = storage.DBSessionLocal()
-                        row = db.get(storage.ChunkModel, cid)
-                        db.close()
-                        if row and row.text:
-                            text = row.text
-                    except Exception:
-                        text = ""
                 if text:
                     id_to_text[cid] = text
                     ordered.append(cid)
@@ -229,7 +260,6 @@ class RetrievalService:
     ) -> RetrievalResult:
         lat = lat or QueryLatencyTracker()
         t_retrieval = time.perf_counter()
-        # Zero sparse/RRF when this path is used so breakdown tables stay aligned
         if STAGE_BM25 not in lat.stages:
             lat.set(STAGE_BM25, 0.0)
         if STAGE_RRF not in lat.stages:
@@ -240,11 +270,14 @@ class RetrievalService:
         )
         seed_ids: List[str] = []
         if graph_seed and settings.ENABLE_GRAPH_SEED:
-            seed_ids, seed_map = self._graph_seed(query, document_id)
+            with lat.stage(STAGE_GRAPH_SEED):
+                seed_ids, seed_map = self._graph_seed(query, document_id)
             for cid in seed_ids:
                 if cid not in id_to_text and cid in seed_map:
                     id_to_text[cid] = seed_map[cid]
                     ids = [cid] + [i for i in ids if i != cid]
+        elif STAGE_GRAPH_SEED not in lat.stages:
+            lat.set(STAGE_GRAPH_SEED, 0.0)
 
         if not ids:
             lat.set(STAGE_RETRIEVAL_TOTAL, (time.perf_counter() - t_retrieval) * 1000.0)
@@ -266,7 +299,7 @@ class RetrievalService:
         passages = []
         for i, text in enumerate(reranked):
             cid = id_by_text.get(text, f"unknown_{i}")
-            meta = self._meta_for(document_id, cid)
+            meta = doc_cache.meta_for(document_id, cid)
             passages.append(
                 RetrievedPassage(
                     chunk_id=cid,
@@ -304,7 +337,7 @@ class RetrievalService:
         k: int,
         lat: Optional[QueryLatencyTracker] = None,
     ) -> Tuple[List[str], Dict[str, str]]:
-        collection = _storage()._get_documents_collection()
+        collection = _get_collection()
         if not models.get_embedding_model():
             if lat is not None:
                 lat.set(STAGE_QUERY_EMBED, 0.0)
@@ -315,6 +348,13 @@ class RetrievalService:
             qvec = models.embed_texts([query], input_type="query")[0]
             if lat is not None:
                 lat.set(STAGE_QUERY_EMBED, (time.perf_counter() - t_embed) * 1000.0)
+                embed_meta = models.models_registry.get("last_embed_meta") or {}
+                lat.add_meta(
+                    embedding=embed_meta,
+                    embedding_model=embed_meta.get("embedding_model"),
+                    embed_cache_hits=embed_meta.get("cache_hits"),
+                    embed_cache_misses=embed_meta.get("cache_misses"),
+                )
 
             t_dense = time.perf_counter()
             results = collection.query(
@@ -342,43 +382,33 @@ class RetrievalService:
     def _sparse_search(
         self, query: str, document_id: str, k: int
     ) -> tuple[List[str], Dict[str, str]]:
-        storage = _storage()
         idx = load_index(document_id)
         if idx is None:
-            # Build from SQLite if missing
-            rows = storage.retrieve_chunks(document_id)
-            if not rows:
+            from src.monitoring.query_path_guard import note_ingest_op
+
+            note_ingest_op(
+                "vector_index_rebuild",
+                detail=f"BM25 rebuild on query path for {document_id}",
+            )
+            cmap = doc_cache.get_map(document_id)
+            if not cmap:
                 return [], {}
-            docs = [(f"{document_id}_{r['index']}", r["text"]) for r in rows]
+            docs = [(cid, c.text) for cid, c in cmap.items()]
             idx = build_and_save(document_id, docs)
 
         hits = idx.search(query, k=k)
+        texts = doc_cache.text_map(document_id)
+        ids: List[str] = []
         id_to_text: Dict[str, str] = {}
-        # Load texts from SQLite
-        rows = storage.retrieve_chunks(document_id)
-        by_id = {f"{document_id}_{r['index']}": r["text"] for r in rows}
-        # Also map raw index keys if stored that way
         for cid, _score in hits:
-            id_to_text[cid] = by_id.get(cid, "")
-        # Fill missing from index order using retrieve
-        ids = [cid for cid, _ in hits if id_to_text.get(cid)]
-        return ids, {i: id_to_text[i] for i in ids}
+            text = texts.get(cid, "")
+            if text:
+                ids.append(cid)
+                id_to_text[cid] = text
+        return ids, id_to_text
 
     def _meta_for(self, document_id: str, chunk_id: str) -> Dict[str, Any]:
-        try:
-            storage = _storage()
-            db = storage.DBSessionLocal()
-            row = db.get(storage.ChunkModel, chunk_id)
-            db.close()
-            if not row:
-                return {}
-            return {
-                "parent_id": row.parent_id,
-                "section_path": row.section_path,
-                "chunk_kind": row.chunk_kind,
-            }
-        except Exception:
-            return {}
+        return doc_cache.meta_for(document_id, chunk_id)
 
     def _parent_expand(
         self,
@@ -395,48 +425,33 @@ class RetrievalService:
         if not parent_ids:
             return passages
 
-        try:
-            storage = _storage()
-            db = storage.DBSessionLocal()
-            extras: List[RetrievedPassage] = []
-            for pid in dict.fromkeys(parent_ids):  # unique, order-preserving
-                if len(extras) >= max_extra:
-                    break
-                # Inherit best score from a hit that belongs to this parent
-                parent_score = 0.0
-                for hit in passages:
-                    if getattr(hit, "parent_id", None) == pid:
-                        parent_score = max(parent_score, float(getattr(hit, "score", 0.0) or 0.0))
-                siblings = (
-                    db.query(storage.ChunkModel)
-                    .filter(
-                        storage.ChunkModel.document_id == document_id,
-                        storage.ChunkModel.parent_id == pid,
+        extras: List[RetrievedPassage] = []
+        for pid in dict.fromkeys(parent_ids):
+            if len(extras) >= max_extra:
+                break
+            parent_score = 0.0
+            for hit in passages:
+                if getattr(hit, "parent_id", None) == pid:
+                    parent_score = max(
+                        parent_score, float(getattr(hit, "score", 0.0) or 0.0)
                     )
-                    .all()
+            for sib in doc_cache.siblings_of_parent(document_id, pid):
+                if sib.chunk_id in existing:
+                    continue
+                extras.append(
+                    RetrievedPassage(
+                        chunk_id=sib.chunk_id,
+                        content=sib.text or "",
+                        score=max(0.0, parent_score * 0.85),
+                        rank=len(passages) + len(extras),
+                        parent_id=sib.parent_id,
+                        section_path=sib.section_path,
+                        source="parent_expand",
+                    )
                 )
-                # Prefer a title/merged section overview: shortest non-hit sibling or first
-                for sib in siblings:
-                    if sib.id in existing:
-                        continue
-                    extras.append(
-                        RetrievedPassage(
-                            chunk_id=sib.id,
-                            content=sib.text or "",
-                            score=max(0.0, parent_score * 0.85),
-                            rank=len(passages) + len(extras),
-                            parent_id=sib.parent_id,
-                            section_path=sib.section_path,
-                            source="parent_expand",
-                        )
-                    )
-                    existing.add(sib.id)
-                    break
-            db.close()
-            return passages + extras
-        except Exception as e:
-            log.warning(f"Parent expand failed: {e}")
-            return passages
+                existing.add(sib.chunk_id)
+                break
+        return passages + extras
 
 
 def search_as_content_chunks(
@@ -444,4 +459,7 @@ def search_as_content_chunks(
 ) -> List[Any]:
     """Adapter returning objects with ``.content`` for legacy RAG callers."""
     result = RetrievalService().search(query, document_id, top_k=k)
-    return [_ContentChunk(p.content, p.chunk_id, {"score": p.score, "source": p.source}) for p in result.passages]
+    return [
+        _ContentChunk(p.content, p.chunk_id, {"score": p.score, "source": p.source})
+        for p in result.passages
+    ]

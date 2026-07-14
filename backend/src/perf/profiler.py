@@ -32,8 +32,24 @@ def sample_resources() -> Dict[str, Any]:
             mem = _PROC.memory_info()
             out["rss_mb"] = round(mem.rss / (1024 * 1024), 2)
             out["cpu_percent"] = _PROC.cpu_percent(interval=None)
+            out["num_threads"] = _PROC.num_threads()
         except Exception:
             pass
+    # Optional NVIDIA GPU stats via pynvml / nvidia-ml-py — never required
+    try:
+        import pynvml  # type: ignore
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        out["gpu_util_percent"] = float(util.gpu)
+        out["gpu_mem_used_mb"] = round(meminfo.used / (1024 * 1024), 2)
+        out["gpu_mem_total_mb"] = round(meminfo.total / (1024 * 1024), 2)
+        pynvml.nvmlShutdown()
+    except Exception:
+        out["gpu_util_percent"] = None
+        out["gpu_mem_used_mb"] = None
     return out
 
 

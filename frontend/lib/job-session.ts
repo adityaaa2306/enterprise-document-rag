@@ -1,7 +1,6 @@
 /**
- * Persist active job IDs across navigation / refreshes (per browser).
- * Server-side /jobs is the source of truth between sessions; this keeps
- * the Results tab sticky when switching sidebar sections.
+ * Persist the active job ID across navigation / refreshes (per browser).
+ * Only the latest job is kept — older job ids are discarded locally.
  */
 const LAST_JOB_KEY = "gar_last_job_id"
 const RECENT_JOBS_KEY = "gar_recent_job_ids"
@@ -9,9 +8,23 @@ const RECENT_JOBS_KEY = "gar_recent_job_ids"
 export function rememberJobId(jobId: string) {
   if (typeof window === "undefined" || !jobId) return
   localStorage.setItem(LAST_JOB_KEY, jobId)
-  const prev = getRecentJobIds().filter((id) => id !== jobId)
-  const next = [jobId, ...prev].slice(0, 20)
-  localStorage.setItem(RECENT_JOBS_KEY, JSON.stringify(next))
+  // Single-slot: only the latest job id
+  localStorage.setItem(RECENT_JOBS_KEY, JSON.stringify([jobId]))
+  // Drop persisted chats for older documents
+  try {
+    const prefix = "green-rag-chat:"
+    const keepSuffix = `:${jobId}`
+    const toRemove: string[] = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i)
+      if (key && key.startsWith(prefix) && !key.endsWith(keepSuffix)) {
+        toRemove.push(key)
+      }
+    }
+    toRemove.forEach((k) => localStorage.removeItem(k))
+  } catch {
+    // ignore
+  }
 }
 
 export function getLastJobId(): string | null {
@@ -22,10 +35,14 @@ export function getLastJobId(): string | null {
 export function getRecentJobIds(): string[] {
   if (typeof window === "undefined") return []
   try {
+    const last = getLastJobId()
+    if (last) return [last]
     const raw = localStorage.getItem(RECENT_JOBS_KEY)
     if (!raw) return []
     const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? parsed.filter((x) => typeof x === "string") : []
+    if (!Array.isArray(parsed)) return []
+    const ids = parsed.filter((x) => typeof x === "string")
+    return ids.slice(0, 1)
   } catch {
     return []
   }
@@ -34,4 +51,5 @@ export function getRecentJobIds(): string[] {
 export function clearLastJobId() {
   if (typeof window === "undefined") return
   localStorage.removeItem(LAST_JOB_KEY)
+  localStorage.removeItem(RECENT_JOBS_KEY)
 }

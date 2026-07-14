@@ -88,10 +88,19 @@ def test_response_agent_mock_nim():
         tokens_used=20,
         tokens_budget=6000,
     )
+    timing = {
+        "ttft_ms": 12.0,
+        "ttlt_ms": 80.0,
+        "first_byte_ms": 10.0,
+        "network_ms": 10.0,
+        "inference_ms": 70.0,
+        "mode": "mock",
+        "attempts": [],
+    }
     with patch("src.agents.models.get_nim_client", return_value=object()):
         with patch(
             "src.agents.models.call_chat_with_fallback",
-            return_value=("Intensity is 700.", "mock-model-1"),
+            return_value=("Intensity is 700.", "mock-model-1", timing),
         ) as mock_chat:
             result = ResponseAgent().answer(
                 "What is the intensity?",
@@ -108,6 +117,11 @@ def test_response_agent_mock_nim():
     mock_chat.assert_called_once()
     args, kwargs = mock_chat.call_args
     assert args[0][0] == "mock-model-1"
+    assert kwargs.get("return_timing") is True
+    # Adaptive budget for short factual query
+    assert kwargs.get("max_tokens") <= 150
+    assert result.debug.get("response_plan", {}).get("query_type") == "fact"
+    assert "latency" in result.debug
 
 
 def test_response_agent_unknown_intent_uses_qa_skill():
@@ -115,10 +129,11 @@ def test_response_agent_unknown_intent_uses_qa_skill():
         context_text="[1]\nHello world evidence.",
         passages=[PackedPassage(content="Hello world evidence.", chunk_ids=["a"], citation=1)],
     )
+    timing = {"ttft_ms": 1.0, "ttlt_ms": 2.0, "mode": "mock", "attempts": []}
     with patch("src.agents.models.get_nim_client", return_value=object()):
         with patch(
             "src.agents.models.call_chat_with_fallback",
-            return_value=("Hi.", "m1"),
+            return_value=("Hi.", "m1", timing),
         ):
             result = ResponseAgent().answer(
                 "Explain this document detail",
@@ -132,6 +147,8 @@ def test_config_flags():
     assert hasattr(settings, "USE_RESPONSE_AGENT")
     assert hasattr(settings, "RESPONSE_DEFAULT_SKILL")
     assert hasattr(settings, "RESPONSE_USE_ROUTING_DECISION")
+    assert hasattr(settings, "RESPONSE_CONTEXT_BUDGET")
+    assert hasattr(settings, "RESPONSE_DEFER_EXPLAINABILITY")
 
 
 if __name__ == "__main__":

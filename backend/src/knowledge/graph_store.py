@@ -18,6 +18,18 @@ from src.knowledge.schemas import KnowledgeDocument
 
 log = logging.getLogger(__name__)
 
+# Process-level graph cache (document_id -> DocumentGraph)
+_graph_cache: Dict[str, DocumentGraph] = {}
+_graph_cache_lock = __import__("threading").RLock()
+
+
+def invalidate_graph_cache(document_id: Optional[str] = None) -> None:
+    with _graph_cache_lock:
+        if document_id is None:
+            _graph_cache.clear()
+        else:
+            _graph_cache.pop(document_id, None)
+
 
 @dataclass
 class GraphNode:
@@ -192,6 +204,7 @@ class GraphStore:
                     )
                 )
             db.commit()
+            invalidate_graph_cache(graph.document_id)
             log.info(
                 f"GraphStore replaced graph for {graph.document_id}: "
                 f"{len(graph.nodes)} nodes, {len(graph.edges)} edges"
@@ -250,6 +263,11 @@ class GraphStore:
             db.close()
 
     def get_graph(self, document_id: str) -> DocumentGraph:
+        with _graph_cache_lock:
+            hit = _graph_cache.get(document_id)
+            if hit is not None:
+                return hit
+
         db = self._session()
         try:
             nodes_rows = (
@@ -296,7 +314,10 @@ class GraphStore:
                         evidence_chunk_ids=ev,
                     )
                 )
-            return DocumentGraph(document_id=document_id, nodes=nodes, edges=edges)
+            graph = DocumentGraph(document_id=document_id, nodes=nodes, edges=edges)
+            with _graph_cache_lock:
+                _graph_cache[document_id] = graph
+            return graph
         finally:
             db.close()
 
@@ -306,20 +327,27 @@ class GraphStore:
             db.query(GraphNodeModel).filter(GraphNodeModel.document_id == document_id).delete()
             db.query(GraphEdgeModel).filter(GraphEdgeModel.document_id == document_id).delete()
             db.commit()
+            invalidate_graph_cache(document_id)
         except Exception as e:
             db.rollback()
             log.warning(f"GraphStore delete failed: {e}")
         finally:
             db.close()
 
-    def match_entity_ids(self, document_id: str, query: str) -> List[str]:
+    def match_entity_ids(
+        self,
+        document_id: str,
+        query: str,
+        *,
+        graph: Optional[DocumentGraph] = None,
+    ) -> List[str]:
         """Match query text against node names/aliases (case-insensitive substring)."""
         q = (query or "").lower()
         if not q:
             return []
-        graph = self.get_graph(document_id)
+        g = graph if graph is not None else self.get_graph(document_id)
         matched: List[str] = []
-        for n in graph.nodes:
+        for n in g.nodes:
             names = [n.name] + list(n.aliases)
             for name in names:
                 token = (name or "").strip()
@@ -347,11 +375,11 @@ class GraphStore:
             if min_confidence is not None
             else float(settings.GRAPH_SEED_MIN_CONFIDENCE)
         )
-        matched = self.match_entity_ids(document_id, query)
+        graph = self.get_graph(document_id)
+        matched = self.match_entity_ids(document_id, query, graph=graph)
         if not matched:
             return []
 
-        graph = self.get_graph(document_id)
         node_by_id = {n.id: n for n in graph.nodes}
         seed_nodes: Set[str] = set(matched)
 

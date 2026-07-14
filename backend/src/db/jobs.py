@@ -885,3 +885,119 @@ def _persist(job_id: str, current: Dict[str, Any], fields: Dict[str, Any]) -> No
         raise
     finally:
         db.close()
+
+
+def _purge_document_artifacts(document_id: str) -> None:
+    """Best-effort wipe of RAG sidecars for a document/job id."""
+    # Object storage bytes
+    try:
+        from src.memory import storage as mem_storage
+        from src.storage import get_object_storage
+
+        key = mem_storage.get_document_storage_key(document_id)
+        if key:
+            get_object_storage().delete(key)
+    except Exception as e:
+        log.warning("Object storage delete failed for %s: %s", document_id, e)
+
+    try:
+        from src.memory import storage as mem_storage
+
+        mem_storage.delete_chunks(document_id)
+        mem_storage.delete_document_data(document_id)
+    except Exception as e:
+        log.warning("Document/chunk delete failed for %s: %s", document_id, e)
+
+
+def delete_job_record(job_id: str) -> bool:
+    """Remove job row from DB + process cache (does not wipe document artifacts)."""
+    JOB_STATUSES.pop(job_id, None)
+    clear_cancel_request(job_id)
+    if not _db_enabled():
+        return True
+    try:
+        from src.db.models import JobModel
+        from src.db.session import get_session
+
+        db = get_session()
+        try:
+            row = db.get(JobModel, job_id)
+            if row is None:
+                return False
+            db.delete(row)
+            db.commit()
+            return True
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+    except Exception as e:
+        log.warning("delete_job_record failed for %s: %s", job_id, e)
+        return False
+
+
+def purge_job_completely(job_id: str, *, user_id: Optional[int] = None) -> bool:
+    """
+    Cancel if active, delete document/RAG artifacts, then remove the job row.
+    Job id == document id in this product.
+    """
+    current = get_job(job_id)
+    if current is None:
+        # Still try artifact cleanup (orphans)
+        _purge_document_artifacts(job_id)
+        return delete_job_record(job_id)
+
+    if user_id is not None and current.get("user_id") is not None:
+        if int(current["user_id"]) != int(user_id):
+            raise PermissionError("Not the job owner")
+
+    status = str(current.get("status") or "")
+    if status in (job_status_mod.STATUS_PENDING, job_status_mod.STATUS_PROCESSING):
+        try:
+            cancel_job(job_id, user_id=user_id)
+        except Exception as e:
+            log.warning("Cancel before purge failed for %s: %s", job_id, e)
+
+    _purge_document_artifacts(job_id)
+    return delete_job_record(job_id)
+
+
+def retain_only_latest_job(
+    user_id: int,
+    *,
+    keep_job_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Portfolio / single-slot retention: keep only the newest job for this user.
+    Deletes older jobs and their document/RAG data.
+    """
+    jobs = list_jobs_for_user(user_id, limit=200, include_terminal=True)
+    if not jobs:
+        return {"kept": None, "purged": [], "count_before": 0}
+
+    if keep_job_id:
+        keep = str(keep_job_id)
+    else:
+        keep = str(jobs[0].get("job_id") or "")
+
+    purged: list = []
+    for j in jobs:
+        jid = str(j.get("job_id") or "")
+        if not jid or jid == keep:
+            continue
+        try:
+            purge_job_completely(jid, user_id=user_id)
+            purged.append(jid)
+        except PermissionError:
+            continue
+        except Exception as e:
+            log.warning("Failed to purge older job %s: %s", jid, e)
+
+    log.info(
+        "retain_only_latest_job user=%s keep=%s purged=%s",
+        user_id,
+        keep,
+        len(purged),
+    )
+    return {"kept": keep or None, "purged": purged, "count_before": len(jobs)}

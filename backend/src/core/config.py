@@ -88,18 +88,25 @@ class Settings(BaseSettings):
     RAG_RERANK_N: int = 20
     ENABLE_PARENT_EXPAND: bool = True
     RAG_PARENT_EXPAND_MAX: int = 3
+    # Rerank via NVIDIA retrieval API (circuit-opens on persistent 404)
+    ENABLE_RERANK: bool = True
+    RERANK_HTTP_TIMEOUT_SEC: float = 8.0
 
     # --- Phase 2.C ContextAssembler ---
     USE_CONTEXT_ASSEMBLER: bool = True
-    CONTEXT_DEDUP_THRESHOLD: float = 0.92
+    CONTEXT_DEDUP_THRESHOLD: float = 0.85
     CONTEXT_TOKEN_BUDGET_LIGHT: int = 2000
     CONTEXT_TOKEN_BUDGET_MEDIUM: int = 4000
     CONTEXT_TOKEN_BUDGET_HEAVY: int = 6000
+    # Cap context passed to chat/RAG generation (retrieval unchanged)
+    RESPONSE_CONTEXT_BUDGET: int = 2200
 
     # --- Phase 2.D Response Agent ---
     USE_RESPONSE_AGENT: bool = True
     RESPONSE_DEFAULT_SKILL: str = "qa"
     RESPONSE_USE_ROUTING_DECISION: bool = True
+    # Defer explainability until after answer (JSON path) / after stream (SSE)
+    RESPONSE_DEFER_EXPLAINABILITY: bool = True
 
     # --- Phase 2.F Understanding Agent ---
     ENABLE_UNDERSTANDING: bool = True

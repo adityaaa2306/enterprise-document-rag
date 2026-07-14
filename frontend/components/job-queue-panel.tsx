@@ -60,7 +60,7 @@ export function JobQueuePanel({ currentJobId, onSelectJob, pollMs = 2500 }: Prop
     try {
       const [qRes, hRes] = await Promise.all([
         apiFetch("/queue"),
-        apiFetch("/jobs?limit=30"),
+        apiFetch("/jobs?limit=1"),
       ])
       if (qRes.ok) {
         setQueue(await qRes.json())
@@ -196,7 +196,7 @@ export function JobQueuePanel({ currentJobId, onSelectJob, pollMs = 2500 }: Prop
               </>
             ) : (
               <p className="text-xs text-muted-foreground">
-                The worker is busy (possibly another session&apos;s job). Check Your jobs
+                The worker is busy (possibly another session&apos;s job). Check Your job
                 below, or wait until it finishes.
               </p>
             )}
@@ -207,9 +207,9 @@ export function JobQueuePanel({ currentJobId, onSelectJob, pollMs = 2500 }: Prop
       </Card>
 
       <Card className="p-4 bg-card/50 border-border/50 space-y-3">
-        <h3 className="text-sm font-semibold">Your jobs</h3>
+        <h3 className="text-sm font-semibold">Your job</h3>
         <p className="text-xs text-muted-foreground">
-          Jobs stay here across page switches and browser sessions.
+          Only the latest job is kept. Starting a new job replaces the previous one.
         </p>
         <div className="space-y-2 max-h-80 overflow-y-auto">
           {history.length === 0 ? (

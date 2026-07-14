@@ -33,7 +33,7 @@ export function TopBar() {
       animate={{ y: 0 }}
       className="border-b border-border bg-card/50 backdrop-blur sticky top-0 z-40"
     >
-      <div className="px-8 py-4 flex justify-between items-center">
+      <div className="px-8 py-4 flex justify-between items-center md:pl-8 pl-14">
         <h2 className="text-xl font-semibold text-balance">Platform Dashboard</h2>
 
         <div className="flex items-center gap-4">

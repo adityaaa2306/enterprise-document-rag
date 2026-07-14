@@ -255,14 +255,28 @@ def call_chat_with_fallback(
                             "model_id": model_id,
                             "retry_count": retry_count,
                             "attempt_count": len(attempts_log),
-                            "http_status": None,
+                            "http_status": 200,
                             "call_ms": round((time.perf_counter() - t_call0) * 1000.0, 1),
                             "attempts": attempts_log,
                             "success": True,
+                            "fallback_used": model_id != ordered_ids[0] if ordered_ids else False,
+                            "primary_model": ordered_ids[0] if ordered_ids else None,
                         }
                     )
                 if return_timing:
-                    return text, model_id, timing or {}
+                    timing_out = dict(timing or {})
+                    timing_out.update(
+                        {
+                            "retry_count": retry_count,
+                            "attempt_count": len(attempts_log),
+                            "attempts": attempts_log,
+                            "fallback_used": model_id != ordered_ids[0] if ordered_ids else False,
+                            "primary_model": ordered_ids[0] if ordered_ids else None,
+                            "model_used": model_id,
+                            "http_status": 200,
+                        }
+                    )
+                    return text, model_id, timing_out
                 return text, model_id
             except Exception as e:
                 classified = _classify_nim_exception(e, model_id=model_id)
@@ -343,9 +357,19 @@ def _chat_completion_with_ttft(
     Stream the completion solely to separate TTFT from TTLT.
     Accumulates the full text; does not change the upstream response shape.
     Falls back to a blocking call if streaming is unsupported.
+
+    Timing fields (all measured, not estimated):
+      request_start_ms — always 0 (reference)
+      first_byte_ms — first streamed chunk received (any delta)
+      ttft_ms — first non-empty content token
+      ttlt_ms — stream complete / last token
+      network_ms — alias of first_byte_ms (server→client first packet)
+      inference_ms — ttlt_ms - first_byte_ms (approx generation after first packet)
+      mode — stream_measure | blocking_ttft_equals_ttlt
     """
     t0 = time.perf_counter()
     ttft_ms: Optional[float] = None
+    first_byte_ms: Optional[float] = None
     parts: List[str] = []
     try:
         stream = client.chat.completions.create(
@@ -357,6 +381,8 @@ def _chat_completion_with_ttft(
             stream=True,
         )
         for chunk in stream:
+            if first_byte_ms is None:
+                first_byte_ms = (time.perf_counter() - t0) * 1000.0
             try:
                 delta = chunk.choices[0].delta.content if chunk.choices else None
             except (IndexError, AttributeError):
@@ -367,13 +393,20 @@ def _chat_completion_with_ttft(
                 parts.append(delta)
         text = "".join(parts).strip()
         ttlt_ms = (time.perf_counter() - t0) * 1000.0
+        if first_byte_ms is None:
+            first_byte_ms = ttlt_ms
         if ttft_ms is None:
             # Empty deltas until end, or provider buffered — TTFT ≈ TTLT
             ttft_ms = ttlt_ms
         return text, {
+            "request_start_ms": 0.0,
+            "first_byte_ms": round(first_byte_ms, 3),
             "ttft_ms": round(ttft_ms, 3),
             "ttlt_ms": round(ttlt_ms, 3),
+            "network_ms": round(first_byte_ms, 3),
+            "inference_ms": round(max(0.0, ttlt_ms - first_byte_ms), 3),
             "mode": "stream_measure",
+            "http_status": 200,
         }
     except Exception as e:
         # Streaming unsupported / failed — fall back to blocking (TTFT == TTLT)
@@ -393,11 +426,195 @@ def _chat_completion_with_ttft(
         text = (completion.choices[0].message.content or "").strip()
         elapsed = (time.perf_counter() - t1) * 1000.0
         return text, {
+            "request_start_ms": 0.0,
+            "first_byte_ms": round(elapsed, 3),
             "ttft_ms": round(elapsed, 3),
             "ttlt_ms": round(elapsed, 3),
+            "network_ms": round(elapsed, 3),
+            "inference_ms": 0.0,
             "mode": "blocking_ttft_equals_ttlt",
             "stream_error": str(e)[:200],
+            "http_status": 200,
         }
+
+
+def iter_chat_stream_with_fallback(
+    model_ids: List[str],
+    messages: List[Dict[str, str]],
+    *,
+    temperature: float = 0.5,
+    max_tokens: int = 2000,
+    max_retries_per_model: Optional[int] = None,
+    timeout: Optional[httpx.Timeout] = None,
+    call_meta: Optional[Dict[str, Any]] = None,
+):
+    """
+    Yield ``("token", delta)`` then ``("done", {model_id, timing})``.
+    Falls through models on transient errors (same policy as call_chat_with_fallback).
+    """
+    client = get_nim_client()
+    if client is None:
+        raise RuntimeError("NVIDIA NIM client is not configured (missing NVIDIA_API_KEY).")
+
+    if max_retries_per_model is None:
+        max_retries_per_model = int(getattr(settings, "NIM_TRANSIENT_RETRIES", 3) or 3)
+    max_retries_per_model = max(1, int(max_retries_per_model))
+
+    last_error: Optional[Exception] = None
+    req_timeout = timeout or _nim_timeout()
+    t_call0 = time.perf_counter()
+    attempts_log: List[Dict[str, Any]] = []
+    retry_count = 0
+    last_http_status: Optional[int] = None
+
+    seen: set = set()
+    ordered_ids: List[str] = []
+    for mid in model_ids or []:
+        if mid and mid not in seen:
+            seen.add(mid)
+            ordered_ids.append(mid)
+
+    for model_id in ordered_ids:
+        for attempt in range(max_retries_per_model):
+            t_attempt = time.perf_counter()
+            ttft_ms: Optional[float] = None
+            first_byte_ms: Optional[float] = None
+            parts: List[str] = []
+            try:
+                t0 = time.perf_counter()
+                stream = client.chat.completions.create(
+                    model=model_id,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=req_timeout,
+                    stream=True,
+                )
+                for chunk in stream:
+                    if first_byte_ms is None:
+                        first_byte_ms = (time.perf_counter() - t0) * 1000.0
+                    try:
+                        delta = chunk.choices[0].delta.content if chunk.choices else None
+                    except (IndexError, AttributeError):
+                        delta = None
+                    if delta:
+                        if ttft_ms is None:
+                            ttft_ms = (time.perf_counter() - t0) * 1000.0
+                        parts.append(delta)
+                        yield ("token", delta)
+                text = "".join(parts).strip()
+                if not text:
+                    raise ValueError(f"Empty response from {model_id}")
+                ttlt_ms = (time.perf_counter() - t0) * 1000.0
+                if first_byte_ms is None:
+                    first_byte_ms = ttlt_ms
+                if ttft_ms is None:
+                    ttft_ms = ttlt_ms
+                attempt_ms = (time.perf_counter() - t_attempt) * 1000.0
+                attempts_log.append(
+                    {
+                        "model_id": model_id,
+                        "attempt": attempt + 1,
+                        "ok": True,
+                        "duration_ms": round(attempt_ms, 1),
+                        "http_status": 200,
+                        "error": None,
+                    }
+                )
+                timing = {
+                    "request_start_ms": 0.0,
+                    "first_byte_ms": round(first_byte_ms, 3),
+                    "ttft_ms": round(ttft_ms, 3),
+                    "ttlt_ms": round(ttlt_ms, 3),
+                    "network_ms": round(first_byte_ms, 3),
+                    "inference_ms": round(max(0.0, ttlt_ms - first_byte_ms), 3),
+                    "mode": "client_stream",
+                    "http_status": 200,
+                    "retry_count": retry_count,
+                    "attempt_count": len(attempts_log),
+                    "attempts": attempts_log,
+                    "fallback_used": model_id != ordered_ids[0] if ordered_ids else False,
+                    "primary_model": ordered_ids[0] if ordered_ids else None,
+                    "model_used": model_id,
+                }
+                if call_meta is not None:
+                    call_meta.update(
+                        {
+                            "model_id": model_id,
+                            "retry_count": retry_count,
+                            "attempt_count": len(attempts_log),
+                            "http_status": 200,
+                            "call_ms": round((time.perf_counter() - t_call0) * 1000.0, 1),
+                            "attempts": attempts_log,
+                            "success": True,
+                            "fallback_used": timing["fallback_used"],
+                            "primary_model": timing["primary_model"],
+                        }
+                    )
+                yield ("done", {"model_id": model_id, "timing": timing})
+                return
+            except Exception as e:
+                classified = _classify_nim_exception(e, model_id=model_id)
+                last_error = classified if isinstance(classified, Exception) else e
+                err_str = str(e)
+                http_status = _http_status_from_exc(classified)
+                if http_status is None:
+                    http_status = _http_status_from_exc(e)
+                last_http_status = http_status
+                attempt_ms = (time.perf_counter() - t_attempt) * 1000.0
+                attempts_log.append(
+                    {
+                        "model_id": model_id,
+                        "attempt": attempt + 1,
+                        "ok": False,
+                        "duration_ms": round(attempt_ms, 1),
+                        "http_status": http_status,
+                        "error": f"{type(classified).__name__}: {str(classified)[:180]}",
+                    }
+                )
+                is_rate_limit = (
+                    http_status == 429
+                    or "429" in err_str
+                    or "rate" in err_str.lower()
+                )
+                transient = is_transient_nim_error(classified) or is_rate_limit
+                # If we already streamed tokens, do not silently switch models
+                if parts:
+                    raise
+                if transient and attempt < max_retries_per_model - 1:
+                    retry_count += 1
+                    wait = (3 * (attempt + 1)) if is_rate_limit else (2 ** attempt)
+                    log.warning(
+                        "Transient NIM stream error on %s (%s). Retrying in %ss...",
+                        model_id,
+                        type(classified).__name__,
+                        wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                log.warning(
+                    "Stream model '%s' failed (%s). Trying next fallback if any.",
+                    model_id,
+                    type(classified).__name__,
+                )
+                break
+
+    if call_meta is not None:
+        call_meta.update(
+            {
+                "model_id": None,
+                "retry_count": retry_count,
+                "attempt_count": len(attempts_log),
+                "http_status": last_http_status,
+                "call_ms": round((time.perf_counter() - t_call0) * 1000.0, 1),
+                "attempts": attempts_log,
+                "success": False,
+                "error": str(last_error)[:300] if last_error else None,
+            }
+        )
+    raise RuntimeError(
+        f"All models failed ({ordered_ids}). Last error: {last_error}"
+    ) from last_error
 
 
 # ---------------------------------------------------------------------------
@@ -918,27 +1135,53 @@ def embed_texts(texts: List[str], *, input_type: str = "passage") -> List[List[f
 
     ``input_type`` is required for asymmetric NIM models (e.g. nemotron-embed):
     use ``passage`` for documents/chunks and ``query`` for search queries.
+
+    Side effect: updates ``models_registry["last_embed_meta"]`` with measured
+    latency / cache hit-miss for the latest call (instrumentation only).
     """
     client = get_nim_client()
     if client is None:
         raise RuntimeError("NVIDIA NIM client is not configured (missing NVIDIA_API_KEY).")
 
     if not texts:
+        models_registry["last_embed_meta"] = {
+            "embedding_model": settings.EMBEDDING_MODEL,
+            "input_type": input_type,
+            "texts": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "embed_api_ms": 0.0,
+        }
         return []
 
     model_id = settings.EMBEDDING_MODEL
     use_cache = bool(getattr(settings, "ENABLE_EMBEDDING_CACHE", True))
     itype = (input_type or "passage").strip() or "passage"
+    t0 = time.perf_counter()
 
     if use_cache:
         from src.memory import embedding_cache
 
         cached, miss_indices = embedding_cache.get_many(model_id, texts, input_type=itype)
+        hits = len(texts) - len(miss_indices)
+        misses = len(miss_indices)
         if not miss_indices:
+            models_registry["last_embed_meta"] = {
+                "embedding_model": model_id,
+                "input_type": itype,
+                "texts": len(texts),
+                "cache_hits": hits,
+                "cache_misses": 0,
+                "embed_api_ms": 0.0,
+                "total_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+                "dim": len(cached[0]) if cached and cached[0] else None,
+            }
             return [v for v in cached]  # type: ignore[misc]
 
         to_embed = [texts[i] for i in miss_indices]
+        t_api = time.perf_counter()
         fresh = _embed_batch_nim(client, model_id, to_embed, input_type=itype)
+        api_ms = (time.perf_counter() - t_api) * 1000.0
         embedding_cache.put_many(model_id, to_embed, fresh, input_type=itype)
         out: List[List[float]] = []
         fresh_iter = iter(fresh)
@@ -947,9 +1190,32 @@ def embed_texts(texts: List[str], *, input_type: str = "passage") -> List[List[f
                 out.append(existing)
             else:
                 out.append(next(fresh_iter))
+        models_registry["last_embed_meta"] = {
+            "embedding_model": model_id,
+            "input_type": itype,
+            "texts": len(texts),
+            "cache_hits": hits,
+            "cache_misses": misses,
+            "embed_api_ms": round(api_ms, 3),
+            "total_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+            "dim": len(out[0]) if out else None,
+        }
         return out
 
-    return _embed_batch_nim(client, model_id, texts, input_type=itype)
+    t_api = time.perf_counter()
+    vectors = _embed_batch_nim(client, model_id, texts, input_type=itype)
+    api_ms = (time.perf_counter() - t_api) * 1000.0
+    models_registry["last_embed_meta"] = {
+        "embedding_model": model_id,
+        "input_type": itype,
+        "texts": len(texts),
+        "cache_hits": 0,
+        "cache_misses": len(texts),
+        "embed_api_ms": round(api_ms, 3),
+        "total_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+        "dim": len(vectors[0]) if vectors else None,
+    }
+    return vectors
 
 
 def _embed_batch_nim(
@@ -992,25 +1258,81 @@ def get_embedding_model():
 
 
 # ---------------------------------------------------------------------------
-# Reranking (NIM /v1/ranking)
+# Reranking (NVIDIA retrieval API)
 # ---------------------------------------------------------------------------
+
+# Process-level circuit: after a hard 404, skip further network calls this process.
+_rerank_disabled_reason: Optional[str] = None
+
+
+def _rerank_urls() -> List[str]:
+    """
+    Candidate endpoints. integrate.api .../v1/ranking returns 404 on the cloud
+    trial; the documented retrieval path is:
+      https://ai.api.nvidia.com/v1/retrieval/nvidia/<model>/reranking
+    """
+    model = (settings.RERANK_MODEL or "").strip()
+    short = model.split("/")[-1] if model else "llama-nemotron-rerank-1b-v2"
+    urls: List[str] = []
+    # Preferred cloud retrieval API
+    urls.append(
+        f"https://ai.api.nvidia.com/v1/retrieval/nvidia/{short}/reranking"
+    )
+    # Legacy / local NIM path
+    base = settings.NVIDIA_BASE_URL.rstrip("/")
+    urls.append(f"{base}/ranking")
+    # Dedupe
+    seen = set()
+    out = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
 
 def rerank(query: str, passages: List[str], top_k: int) -> List[str]:
     """
     Rerank passages against a query using NVIDIA NIM ranking API.
     Returns the top_k passages in relevance order.
-    On failure, returns the original passages truncated to top_k.
+    On failure / circuit-open, returns the original passages truncated to top_k
+    without waiting on a guaranteed-404 endpoint.
     """
+    global _rerank_disabled_reason
+
     if not passages:
+        models_registry["last_rerank_meta"] = {
+            "status": "empty",
+            "latency_ms": 0.0,
+        }
         return []
 
     top_k = max(1, min(top_k, len(passages)))
+    t0 = time.perf_counter()
+
+    if not bool(getattr(settings, "ENABLE_RERANK", True)):
+        models_registry["last_rerank_meta"] = {
+            "status": "disabled_config",
+            "latency_ms": 0.0,
+        }
+        return passages[:top_k]
+
+    if _rerank_disabled_reason:
+        models_registry["last_rerank_meta"] = {
+            "status": "circuit_open",
+            "reason": _rerank_disabled_reason,
+            "latency_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+        }
+        return passages[:top_k]
 
     if get_nim_client() is None or not settings.NVIDIA_API_KEY:
         log.warning("Reranker unavailable; returning first top_k passages.")
+        models_registry["last_rerank_meta"] = {
+            "status": "no_client",
+            "latency_ms": 0.0,
+        }
         return passages[:top_k]
 
-    url = settings.NVIDIA_BASE_URL.rstrip("/") + "/ranking"
     payload = {
         "model": settings.RERANK_MODEL,
         "query": {"text": query},
@@ -1022,45 +1344,76 @@ def rerank(query: str, passages: List[str], top_k: int) -> List[str]:
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
+    # Fail fast — do not burn up to 60s on a broken endpoint
+    rerank_timeout = float(getattr(settings, "RERANK_HTTP_TIMEOUT_SEC", 8.0) or 8.0)
 
-    rerank_timeout = min(60.0, float(getattr(settings, "NIM_HTTP_TIMEOUT_SEC", 90.0) or 90.0))
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=rerank_timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        rankings = data.get("rankings") or data.get("results") or []
+    last_err: Optional[str] = None
+    for url in _rerank_urls():
+        try:
+            resp = requests.post(
+                url, json=payload, headers=headers, timeout=rerank_timeout
+            )
+            if resp.status_code == 404:
+                last_err = f"404 {url}"
+                log.warning("Rerank endpoint 404: %s — trying next", url)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            rankings = data.get("rankings") or data.get("results") or []
+            if not rankings:
+                log.warning("Rerank returned empty rankings; using original order.")
+                models_registry["last_rerank_meta"] = {
+                    "status": "empty_rankings",
+                    "url": url,
+                    "latency_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+                }
+                return passages[:top_k]
 
-        # Expected: [{"index": int, "logit": float}, ...] already sorted or not
-        if not rankings:
-            log.warning("Rerank returned empty rankings; using original order.")
-            return passages[:top_k]
+            def _score(item: dict) -> float:
+                return float(item.get("logit", item.get("score", 0.0)))
 
-        # Sort by logit descending if present
-        def _score(item: dict) -> float:
-            return float(item.get("logit", item.get("score", 0.0)))
-
-        ordered = sorted(rankings, key=_score, reverse=True)
-        result: List[str] = []
-        for item in ordered:
-            idx = int(item["index"])
-            if 0 <= idx < len(passages):
-                result.append(passages[idx])
-            if len(result) >= top_k:
-                break
-
-        # Fill if somehow short
-        if len(result) < top_k:
-            for p in passages:
-                if p not in result:
-                    result.append(p)
+            ordered = sorted(rankings, key=_score, reverse=True)
+            result: List[str] = []
+            for item in ordered:
+                idx = int(item["index"])
+                if 0 <= idx < len(passages):
+                    result.append(passages[idx])
                 if len(result) >= top_k:
                     break
+            if len(result) < top_k:
+                for p in passages:
+                    if p not in result:
+                        result.append(p)
+                    if len(result) >= top_k:
+                        break
 
-        log.info(f"Reranked {len(passages)} passages → top {len(result)}")
-        return result
-    except Exception as e:
-        log.error(f"Rerank failed: {e}. Falling back to original order.")
-        return passages[:top_k]
+            log.info(f"Reranked {len(passages)} passages → top {len(result)} via {url}")
+            models_registry["last_rerank_meta"] = {
+                "status": "ok",
+                "url": url,
+                "latency_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+                "input_passages": len(passages),
+                "returned": len(result),
+            }
+            return result
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            log.warning("Rerank attempt failed (%s): %s", url, e)
+            continue
+
+    # All endpoints failed — open circuit so subsequent queries skip the network
+    _rerank_disabled_reason = last_err or "all_endpoints_failed"
+    log.error(
+        "Rerank unavailable (%s). Circuit open for this process; "
+        "using original passage order.",
+        _rerank_disabled_reason,
+    )
+    models_registry["last_rerank_meta"] = {
+        "status": "failed_circuit_open",
+        "reason": _rerank_disabled_reason,
+        "latency_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+    }
+    return passages[:top_k]
 
 
 # ---------------------------------------------------------------------------
