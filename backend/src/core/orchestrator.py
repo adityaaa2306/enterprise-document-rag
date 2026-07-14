@@ -778,7 +778,12 @@ def should_escalate(state: AgentState) -> str:
 
 
 def escalate_once(state: AgentState) -> Dict[str, Any]:
-    """Escalate ONLY failed chunks one tier (Light→Medium→Heavy)."""
+    """Escalate ONLY failed chunks one tier (Light→Medium→Heavy).
+
+    Failed chunks (up to QVA_MAX_ESCALATE_CHUNKS, worst-first) are dispatched
+    concurrently via the same ThreadPoolExecutor pattern as map_summarize —
+    not a sequential loop.
+    """
     job_id = state["job_id"]
     verdict = state.get("validation_verdict") or {}
     codes = verdict.get("codes") or ["validation_failed"]
@@ -830,9 +835,10 @@ def escalate_once(state: AgentState) -> Dict[str, Any]:
     submit_times: Dict[int, float] = {}
 
     log.info(
-        "Job %s: [6b] Escalating %s failed chunks (ladder step %s)",
+        "Job %s: [6b] Escalating %s failed chunks concurrently (workers=%s, ladder step %s)",
         job_id,
         len(failed_idx),
+        max_workers,
         esc_count,
     )
     _set_progress(
@@ -876,6 +882,7 @@ def escalate_once(state: AgentState) -> Dict[str, Any]:
             lat.worker_exit()
 
     with lat.stage(STAGE_ESCALATE):
+        # Concurrent dispatch (same pattern as map_summarize_routed).
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             for idx in failed_idx:
@@ -932,27 +939,133 @@ def reduce_compile(state: AgentState) -> Dict[str, Any]:
     decision = state["routing_decision"]
     lat = _get_latency(state)
     strat = ((state.get("pipeline_intelligence") or {}).get("strategy") or {})
+    node_t0 = time.monotonic()
+    reduce_max = float(getattr(settings, "REDUCE_COMPILE_MAX_SEC", 270.0) or 270.0)
+    call_max = float(getattr(settings, "COMPILE_CALL_MAX_SEC", 180.0) or 180.0)
+    budget = float(state.get("carbon_budget_g") or settings.CARBON_BUDGET_G)
+    carbon_spent = float(state.get("carbon_spent_g") or 0.0)
+    carbon_budget_on = bool(getattr(settings, "CARBON_BUDGET_ENABLED", True))
+
     compile_meta: Dict[str, Any] = {
         "medium_first": bool(strat.get("medium_first", True)),
         "used_heavy": False,
         "strategy_id": strat.get("strategy_id"),
         "compile_depth_label": strat.get("compile_depth_label"),
         "branch_recompiles": [],
+        "compile_calls": 0,
+        "compile_carbon_g": 0.0,
+        "medium_compile_ms": None,
+        "quality_check_ms": None,
+        "heavy_compile_ms": None,
+        "branch_repair_ms": None,
+        "global_recompile_ms": None,
+        "skipped_steps": [],
+        "used_stitched_fallback": False,
+        "reduce_compile_budget_sec": reduce_max,
     }
 
-    log.info("Job %s: [7] Adaptive hierarchical compile", job_id)
+    log.info(
+        "Job %s: [7] Adaptive hierarchical compile (node_budget=%.0fs call_budget=%.0fs)",
+        job_id,
+        reduce_max,
+        call_max,
+    )
     _set_progress(job_id, 82.0, "Building hierarchy & compiling summary...", force=True)
 
-    def _compile_call(label: str, progress: float, inputs: List[str], chain: List[str]) -> str:
-        """Run a blocking NIM compile with UI heartbeats so status does not look frozen."""
+    def _node_remaining() -> float:
+        return reduce_max - (time.monotonic() - node_t0)
+
+    def _carbon_remaining() -> float:
+        return max(0.0, budget - carbon_spent)
+
+    def _estimate_compile_carbon_g(chain: List[str]) -> float:
+        # Priors aligned with chunk_router tiers; compile prompts are heavier.
+        heavy_ids = set(settings.heavy_models())
+        if chain and any(m in heavy_ids for m in chain[:1]):
+            return 0.41
+        return 0.25
+
+    def _can_start_expensive_repair(*, step: str, min_sec: float = 15.0) -> bool:
+        """Gate heavy/repair/recompile on node time ceiling AND carbon remaining."""
+        if _node_remaining() < min_sec:
+            compile_meta["skipped_steps"].append(
+                {"step": step, "reason": "reduce_compile_time_ceiling"}
+            )
+            log.warning(
+                "Job %s: skipping %s — REDUCE_COMPILE_MAX_SEC remaining=%.1fs",
+                job_id,
+                step,
+                _node_remaining(),
+            )
+            return False
+        if carbon_budget_on and _carbon_remaining() <= 0.0:
+            compile_meta["skipped_steps"].append(
+                {"step": step, "reason": "carbon_budget_exhausted"}
+            )
+            log.warning(
+                "Job %s: skipping %s — carbon budget exhausted (spent=%.3f budget=%.3f)",
+                job_id,
+                step,
+                carbon_spent,
+                budget,
+            )
+            return False
+        return True
+
+    def _compile_call(
+        label: str,
+        progress: float,
+        inputs: List[str],
+        chain: List[str],
+        *,
+        step_key: str,
+    ) -> str:
+        """Run a NIM compile with heartbeats; never block past the shared wall on join."""
+        nonlocal carbon_spent
         _set_progress(job_id, progress, label)
-        max_wait = float(getattr(settings, "COMPILE_CALL_MAX_SEC", 600.0) or 600.0)
+        # Cap this call by both per-call wall and remaining node budget.
+        max_wait = max(1.0, min(call_max, _node_remaining()))
+        deadline_mono = time.monotonic() + max_wait
         started = time.monotonic()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(models.run_compile_with_models, inputs, state, chain)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        fut = pool.submit(
+            models.run_compile_with_models,
+            inputs,
+            state,
+            chain,
+            deadline_mono=deadline_mono,
+        )
+        try:
             while True:
                 try:
-                    return fut.result(timeout=15.0)
+                    result = fut.result(timeout=15.0)
+                    elapsed_ms = (time.monotonic() - started) * 1000.0
+                    carbon_g = _estimate_compile_carbon_g(chain)
+                    carbon_spent += carbon_g
+                    compile_meta["compile_calls"] = int(compile_meta["compile_calls"]) + 1
+                    compile_meta["compile_carbon_g"] = round(
+                        float(compile_meta["compile_carbon_g"]) + carbon_g, 4
+                    )
+                    compile_meta[step_key] = round(elapsed_ms, 1)
+                    lat.record_chunk_call(
+                        {
+                            "chunk_index": -1,
+                            "tier": "heavy" if "heavy" in label.lower() or step_key.startswith(
+                                ("heavy", "branch", "global")
+                            )
+                            else "medium",
+                            "model_id": (chain[0] if chain else None),
+                            "queue_ms": 0.0,
+                            "call_ms": round(elapsed_ms, 1),
+                            "success": True,
+                            "retry_count": 0,
+                            "attempt_count": 1,
+                            "phase": "compile",
+                            "compile_step": step_key,
+                            "carbon_estimate_g": carbon_g,
+                        }
+                    )
+                    return result
                 except concurrent.futures.TimeoutError:
                     elapsed = time.monotonic() - started
                     if elapsed >= max_wait:
@@ -962,6 +1075,7 @@ def reduce_compile(state: AgentState) -> Dict[str, Any]:
                             elapsed,
                             label,
                         )
+                        compile_meta[step_key] = round(elapsed * 1000.0, 1)
                         raise TimeoutError(
                             f"Compile step exceeded {max_wait:.0f}s while: {label}"
                         )
@@ -973,6 +1087,16 @@ def reduce_compile(state: AgentState) -> Dict[str, Any]:
                         f"{label} — waiting on model... ({int(elapsed)}s)",
                         force=True,
                     )
+        finally:
+            # Do not join a hung NIM thread — HTTP timeout must reclaim it.
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                pool.shutdown(wait=False)
 
     with lat.stage(STAGE_COMPILE):
         levels = []
@@ -1002,75 +1126,217 @@ def reduce_compile(state: AgentState) -> Dict[str, Any]:
             compile_meta["hierarchy_fan_in"] = fan_in
             compile_meta["hierarchy"] = hierarchy.hierarchy_tree_for_ui(levels)
 
-        # Medium-first compile chain (or strategy hint)
         medium_chain = list(settings.medium_models())
         heavy_chain = list(
             decision.get("compile_fallbacks") or settings.heavy_models()
         )
         hint = str(strat.get("compile_tier_hint") or "medium").lower()
-        first_chain = heavy_chain if hint == "heavy" and not strat.get("medium_first", True) else medium_chain
-        final_summary = _compile_call(
-            "Compiling executive summary...",
-            82.0,
-            compile_inputs,
-            first_chain,
+        first_chain = (
+            heavy_chain
+            if hint == "heavy" and not strat.get("medium_first", True)
+            else medium_chain
+        )
+
+        final_summary = ""
+        final_verdict = quality_validation.ValidationVerdict(
+            passed=False,
+            confidence=0.0,
+            faithfulness=0.0,
+            coverage=0.0,
+            hallucination_rate=1.0,
+            contradiction_rate=0.0,
+            codes=["compile_not_run"],
+            details={},
         )
         compile_tau = float(
             strat.get("qva_compile_threshold")
             if strat.get("qva_compile_threshold") is not None
             else getattr(settings, "QVA_COMPILE_CONFIDENCE_THRESHOLD", 0.58) or 0.58
         )
-        final_verdict = quality_validation.validate_final(compile_inputs, final_summary)
-        need_heavy = (not final_verdict.passed) or (
-            float(final_verdict.confidence) < compile_tau
-        )
-        if need_heavy and bool(
-            strat.get("medium_first", getattr(settings, "COMPILE_MEDIUM_FIRST", True))
-        ):
-            log.info("Job %s: medium compile QVA failed → heavy compile", job_id)
-            final_summary = _compile_call(
-                "Heavy compile (quality gate)...",
-                86.0,
-                compile_inputs,
-                heavy_chain,
-            )
+
+        # --- DAG hierarchical compile (parallel regional/chapter/executive) ---
+        use_dag = bool(getattr(settings, "DAG_COMPILE_ENABLED", True)) and len(
+            state.get("summaries") or []
+        ) >= 2
+        if use_dag:
+            try:
+                from src.core import dag_scheduler
+
+                def _dag_progress(pct: float, msg: str, extra: Dict[str, Any]) -> None:
+                    _set_progress(job_id, pct, msg, force=True)
+                    try:
+                        job_store.JOB_STATUSES.setdefault(job_id, {})
+                        partial = dict(job_store.JOB_STATUSES[job_id].get("partial") or {})
+                        if isinstance(extra.get("dag"), dict):
+                            partial["dag"] = extra["dag"]
+                        job_store.JOB_STATUSES[job_id]["partial"] = partial
+                    except Exception:
+                        pass
+
+                dag_deadline = time.monotonic() + min(
+                    reduce_max, max(30.0, _node_remaining())
+                )
+                dag_t0 = time.perf_counter()
+                dag_out = dag_scheduler.run_dag_compile(
+                    state.get("chunks") or [],
+                    state.get("summaries") or [],
+                    state,
+                    fan_in=fan_in,
+                    max_depth=max_depth,
+                    skip_regional_below=skip_regional,
+                    medium_chain=medium_chain,
+                    heavy_chain=heavy_chain,
+                    medium_first=bool(
+                        strat.get(
+                            "medium_first",
+                            getattr(settings, "COMPILE_MEDIUM_FIRST", True),
+                        )
+                    ),
+                    qva_tau=compile_tau,
+                    max_workers=settings.effective_compile_max_workers(),
+                    deadline_mono=dag_deadline,
+                    progress_cb=_dag_progress,
+                )
+                final_summary = str(dag_out.get("final_summary") or "")
+                compile_meta["medium_compile_ms"] = round(
+                    (time.perf_counter() - dag_t0) * 1000.0, 1
+                )
+                compile_meta["compile_calls"] = int(dag_out.get("compile_calls") or 0)
+                compile_meta["compile_carbon_g"] = float(
+                    dag_out.get("compile_carbon_g") or 0.0
+                )
+                carbon_spent += float(dag_out.get("compile_carbon_g") or 0.0)
+                compile_meta["used_heavy"] = bool(dag_out.get("used_heavy"))
+                compile_meta["hierarchy"] = dag_out.get("hierarchy") or compile_meta.get(
+                    "hierarchy"
+                )
+                compile_meta["dag_nodes"] = dag_out.get("dag_nodes") or {}
+                compile_meta["dag_workers"] = dag_out.get("workers")
+                compile_meta["endpoint_pool"] = dag_out.get("endpoint_pool") or []
+                compile_meta["engine"] = "dag"
+                qva_t0 = time.perf_counter()
+                final_verdict = quality_validation.validate_final(
+                    list(state.get("summaries") or [])[:40], final_summary
+                )
+                compile_meta["quality_check_ms"] = round(
+                    (time.perf_counter() - qva_t0) * 1000.0, 1
+                )
+                use_dag = True  # completed
+            except Exception as e:
+                log.error("Job %s: DAG compile failed, falling back: %s", job_id, e)
+                compile_meta["skipped_steps"].append(
+                    {"step": "dag_compile", "reason": f"error:{type(e).__name__}"}
+                )
+                use_dag = False
+
+        if not use_dag or not (final_summary or "").strip():
+            compile_meta["engine"] = compile_meta.get("engine") or "legacy"
+            try:
+                final_summary = _compile_call(
+                    "Compiling executive summary...",
+                    82.0,
+                    compile_inputs,
+                    first_chain,
+                    step_key="medium_compile_ms",
+                )
+            except Exception as e:
+                log.error("Job %s: primary compile failed: %s", job_id, e)
+                final_summary = models.stitch_compile_fallback(
+                    compile_inputs, reason=str(e)[:160]
+                )
+                compile_meta["used_stitched_fallback"] = True
+                compile_meta["skipped_steps"].append(
+                    {"step": "primary_compile", "reason": f"error:{type(e).__name__}"}
+                )
+
+        # Legacy medium→heavy→repair path (skipped when DAG engine already ran)
+        if compile_meta.get("engine") != "dag":
+            qva_t0 = time.perf_counter()
             final_verdict = quality_validation.validate_final(
                 compile_inputs, final_summary
             )
-            compile_meta["used_heavy"] = True
-            compile_meta["branch_recompiles"].append(
-                {
-                    "branch": "global",
-                    "reason": "compile_qva_failed_or_low_confidence",
-                    "confidence": final_verdict.confidence,
-                }
+            compile_meta["quality_check_ms"] = round(
+                (time.perf_counter() - qva_t0) * 1000.0, 1
             )
-
-        # Branch-level repair: if regional nodes exist and global still weak,
-        # re-summarize only the lowest-confidence regional inputs (not full doc).
+        need_heavy = (not final_verdict.passed) or (
+            float(final_verdict.confidence) < compile_tau
+        )
         if (
-            levels
+            compile_meta.get("engine") != "dag"
+            and need_heavy
+            and bool(
+                strat.get("medium_first", getattr(settings, "COMPILE_MEDIUM_FIRST", True))
+            )
+            and not compile_meta["used_stitched_fallback"]
+            and _can_start_expensive_repair(step="heavy_compile", min_sec=20.0)
+        ):
+            log.info("Job %s: medium compile QVA failed → heavy compile", job_id)
+            try:
+                final_summary = _compile_call(
+                    "Heavy compile (quality gate)...",
+                    86.0,
+                    compile_inputs,
+                    heavy_chain,
+                    step_key="heavy_compile_ms",
+                )
+                final_verdict = quality_validation.validate_final(
+                    compile_inputs, final_summary
+                )
+                compile_meta["used_heavy"] = True
+                compile_meta["branch_recompiles"].append(
+                    {
+                        "branch": "global",
+                        "reason": "compile_qva_failed_or_low_confidence",
+                        "confidence": final_verdict.confidence,
+                    }
+                )
+            except Exception as e:
+                log.error("Job %s: heavy compile failed: %s", job_id, e)
+                compile_meta["skipped_steps"].append(
+                    {"step": "heavy_compile", "reason": f"error:{type(e).__name__}"}
+                )
+
+        # Branch-level repair: gated by node time ceiling AND carbon remaining.
+        # (Does not affect map-stage QVA escalation — compile-only.)
+        if (
+            compile_meta.get("engine") != "dag"
+            and levels
             and (not final_verdict.passed or float(final_verdict.confidence) < compile_tau)
             and len(compile_inputs) > 1
+            and not compile_meta["used_stitched_fallback"]
+            and _can_start_expensive_repair(step="branch_repair", min_sec=25.0)
         ):
+            repair_t0 = time.perf_counter()
             scores = []
             for i, text in enumerate(compile_inputs):
                 v = quality_validation.validate_pair(
-                    text, final_summary[: max(200, len(text) // 4)], confidence_threshold=compile_tau
+                    text,
+                    final_summary[: max(200, len(text) // 4)],
+                    confidence_threshold=compile_tau,
                 )
                 scores.append((float(v.confidence), i))
             scores.sort()
-            # Recompile up to 2 weakest branches only
+            repaired_any = False
             for _, bi in scores[:2]:
+                if not _can_start_expensive_repair(
+                    step=f"branch_repair_{bi}", min_sec=15.0
+                ):
+                    break
                 branch_text = compile_inputs[bi]
-                repaired = _compile_call(
-                    f"Repairing weak branch {bi + 1}...",
-                    88.0,
-                    [branch_text],
-                    heavy_chain,
-                )
+                try:
+                    repaired = _compile_call(
+                        f"Repairing weak branch {bi + 1}...",
+                        88.0,
+                        [branch_text],
+                        heavy_chain,
+                        step_key="branch_repair_ms",
+                    )
+                except Exception as e:
+                    log.warning("Job %s: branch %s repair failed: %s", job_id, bi, e)
+                    continue
                 if repaired and repaired.strip():
                     compile_inputs[bi] = repaired
+                    repaired_any = True
                     compile_meta["branch_recompiles"].append(
                         {
                             "branch": f"regional-{bi}",
@@ -1078,19 +1344,73 @@ def reduce_compile(state: AgentState) -> Dict[str, Any]:
                             "confidence": scores[0][0] if scores else None,
                         }
                     )
-            final_summary = _compile_call(
-                "Recompiling after branch repair...",
-                90.0,
-                compile_inputs,
-                heavy_chain,
+            # If branch_repair_ms was overwritten by multiple calls, keep cumulative.
+            compile_meta["branch_repair_ms"] = round(
+                (time.perf_counter() - repair_t0) * 1000.0, 1
             )
-            final_verdict = quality_validation.validate_final(
-                compile_inputs, final_summary
+            if repaired_any and _can_start_expensive_repair(
+                step="global_recompile", min_sec=20.0
+            ):
+                try:
+                    final_summary = _compile_call(
+                        "Recompiling after branch repair...",
+                        90.0,
+                        compile_inputs,
+                        heavy_chain,
+                        step_key="global_recompile_ms",
+                    )
+                    final_verdict = quality_validation.validate_final(
+                        compile_inputs, final_summary
+                    )
+                    compile_meta["used_heavy"] = True
+                except Exception as e:
+                    log.error("Job %s: global recompile failed: %s", job_id, e)
+                    compile_meta["skipped_steps"].append(
+                        {
+                            "step": "global_recompile",
+                            "reason": f"error:{type(e).__name__}",
+                        }
+                    )
+            elif repaired_any:
+                # Time/carbon blocked global recompile — keep repaired branches
+                # but fall back to stitch if current summary is unusable.
+                if not (final_summary or "").strip():
+                    final_summary = models.stitch_compile_fallback(
+                        compile_inputs, reason="global_recompile_skipped"
+                    )
+                    compile_meta["used_stitched_fallback"] = True
+
+        # If we never got a usable LLM summary and still have inputs, stitch.
+        if (
+            not (final_summary or "").strip()
+            or (
+                compile_meta.get("skipped_steps")
+                and "stitched fallback" not in (final_summary or "").lower()
+                and not final_verdict.passed
+                and float(final_verdict.confidence or 0) < 0.2
             )
-            compile_meta["used_heavy"] = True
+        ):
+            # Only force-stitch when confidence is near-zero / empty.
+            if not (final_summary or "").strip():
+                final_summary = models.stitch_compile_fallback(
+                    compile_inputs, reason="reduce_compile_budget_or_failure"
+                )
+                compile_meta["used_stitched_fallback"] = True
 
         compile_meta["compile_confidence"] = final_verdict.confidence
         compile_meta["compile_passed"] = final_verdict.passed
+        compile_meta["reduce_compile_elapsed_ms"] = round(
+            (time.monotonic() - node_t0) * 1000.0, 1
+        )
+        lat.add_meta(
+            compile_calls=compile_meta["compile_calls"],
+            compile_carbon_g=compile_meta["compile_carbon_g"],
+            medium_compile_ms=compile_meta.get("medium_compile_ms"),
+            quality_check_ms=compile_meta.get("quality_check_ms"),
+            heavy_compile_ms=compile_meta.get("heavy_compile_ms"),
+            branch_repair_ms=compile_meta.get("branch_repair_ms"),
+            global_recompile_ms=compile_meta.get("global_recompile_ms"),
+        )
 
     # Refresh intelligence report
     intel = state.get("pipeline_intelligence") or {}
@@ -1110,7 +1430,12 @@ def reduce_compile(state: AgentState) -> Dict[str, Any]:
             latency_by_stage=(state.get("ingestion_latency") or {}).get("stages_ms"),
         )
 
-    accept_warn = bool(state.get("accept_with_warning")) or not final_verdict.passed
+    accept_warn = (
+        bool(state.get("accept_with_warning"))
+        or not final_verdict.passed
+        or bool(compile_meta.get("used_stitched_fallback"))
+        or bool(compile_meta.get("skipped_steps"))
+    )
     return {
         "final_summary": final_summary,
         "validation_verdict": final_verdict.to_dict(),
@@ -1118,6 +1443,8 @@ def reduce_compile(state: AgentState) -> Dict[str, Any]:
         "hierarchy": compile_meta.get("hierarchy") or {},
         "compile_meta": compile_meta,
         "pipeline_intelligence": intel or state.get("pipeline_intelligence"),
+        "carbon_spent_g": round(carbon_spent, 4),
+        "carbon_remaining_g": round(max(0.0, budget - carbon_spent), 4),
         "ingestion_latency": _persist_latency(lat),
     }
 

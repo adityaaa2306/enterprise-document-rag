@@ -35,6 +35,21 @@ class Settings(BaseSettings):
     # --- NVIDIA NIM API ---
     NVIDIA_API_KEY: str = ""
     NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
+    # Optional multi-endpoint NIM pool (least-load). Endpoint 1 = NVIDIA_API_KEY.
+    NIM_ENDPOINT_POOL_ENABLED: bool = True
+    NIM_ENDPOINT_STRATEGY: str = "least_load"  # least_load | round_robin
+    NIM_ENDPOINT_COOLDOWN_SEC: float = 8.0
+    NIM_ENDPOINT_RATELIMIT_COOLDOWN_SEC: float = 20.0
+    NIM_ENDPOINT_1_ROLES: str = "map,compile,embed,any"
+    NIM_ENDPOINT_2_API_KEY: str = ""
+    NIM_ENDPOINT_2_BASE_URL: str = ""
+    NIM_ENDPOINT_2_ROLES: str = "map,compile,embed,any"
+    NIM_ENDPOINT_3_API_KEY: str = ""
+    NIM_ENDPOINT_3_BASE_URL: str = ""
+    NIM_ENDPOINT_3_ROLES: str = "map,compile,embed,any"
+    # Comma-separated extra keys (same BASE_URL as primary)
+    NIM_API_KEYS: str = ""
+    # Optional workload split: set endpoint-3 roles to "compile" only, etc.
     ELECTRICITY_MAPS_API_KEY: Optional[str] = None
     # Empty zone → resolve via lat/lon (default Pune / IN-WE)
     ELECTRICITY_MAPS_ZONE: str = ""
@@ -70,9 +85,8 @@ class Settings(BaseSettings):
     MEDIUM_MODEL_FALLBACK: str = "meta/llama-3.1-8b-instruct"
 
     # --- Heavy tier (final compile + RAG answers) ---
-    # Prefer ministral: llama-3.3/gpt-oss broken; llama-3.1-70b hangs on large compile.
-    HEAVY_MODEL_PRIMARY: str = "mistralai/ministral-14b-instruct-2512"
-    HEAVY_MODEL_FALLBACK_1: str = "meta/llama-3.1-70b-instruct"
+    HEAVY_MODEL_PRIMARY: str = "meta/llama-3.3-70b-instruct"
+    HEAVY_MODEL_FALLBACK_1: str = "openai/gpt-oss-120b"
     HEAVY_MODEL_FALLBACK_2: str = "meta/llama-3.1-8b-instruct"
 
     # --- Retrieval (embeddings + rerank) ---
@@ -137,14 +151,20 @@ class Settings(BaseSettings):
     # Soft token budget for a single compile prompt; over this we hierarchical-batch.
     COMPILE_MAX_INPUT_TOKENS: int = 10000
     COMPILE_BATCH_SIZE: int = 8
-    # Parallel map summarization workers (NIM-bound; raise for lower wall-clock)
-    MAP_MAX_WORKERS: int = 8
+    # Parallel map summarization workers (NIM-bound; raise for lower wall-clock).
+    # With 3 NIM endpoints, 16–24 is appropriate; auto-scaled in effective_map_max_workers().
+    MAP_MAX_WORKERS: int = 16
     # When API+worker share one process, cap map concurrency so /job-status stays responsive
-    EMBEDDED_MAP_MAX_WORKERS: int = 3
-    # Parallel intermediate compile batches within one hierarchical round
-    COMPILE_MAX_WORKERS: int = 4
+    EMBEDDED_MAP_MAX_WORKERS: int = 6
+    # Parallel DAG / hierarchical compile node workers
+    COMPILE_MAX_WORKERS: int = 12
     # Parallel QVA chunk validation workers (CPU-bound lexical checks)
     VALIDATE_MAX_WORKERS: int = 8
+    # DAG hierarchical compile (parallel regional/chapter/executive nodes)
+    DAG_COMPILE_ENABLED: bool = True
+    # Soft context window used for 80% prompt-size gating in DAG compile
+    COMPILE_CONTEXT_WINDOW_TOKENS: int = 12000
+    COMPILE_PROMPT_MAX_CONTEXT_FRAC: float = 0.80
     # Throttle durable progress DB writes (in-memory always updates)
     PROGRESS_WRITE_INTERVAL_SEC: float = 0.75
     # Prefetch chunk embeddings during map/validate/compile overlap
@@ -211,8 +231,19 @@ class Settings(BaseSettings):
     # Cap a single compile NIM invocation (branch repair / heavy compile).
     # Progress UI polls every 15s inside the wait; without a cap, a hung HTTP
     # client can leave the job at "waiting on model..." indefinitely.
-    # 180s ≈ 3 unique models × ~55s compile timeout (+ a little slack).
+    # Shared across the whole fallback chain (primary + fallbacks), not per model.
+    # Must be strictly greater than NIM_COMPILE_TIMEOUT_SEC (asserted at startup).
     COMPILE_CALL_MAX_SEC: float = 180.0
+    # Cumulative wall-clock ceiling for the entire reduce_compile node
+    # (medium + QVA + heavy + branch repair + global recompile). When exhausted,
+    # skip remaining long NIM calls and fall through to stitched fallback.
+    REDUCE_COMPILE_MAX_SEC: float = 270.0
+    # Job heartbeat older than this while status=processing → stalled (requeue).
+    # Default ≈ 2× WORKER_HEARTBEAT_INTERVAL_SEC so a dead worker is visible
+    # well before JOB_MAX_RUNTIME_SEC.
+    WORKER_JOB_HEARTBEAT_STALE_SEC: float = 25.0
+    # Build BM25 off the critical store_for_rag path (Chroma upsert still sync).
+    BM25_ASYNC_BUILD: bool = True
     # Feature extraction LLM/embed probe is optional metadata — never abort the job
     FEATURE_EXTRACTION_OPTIONAL: bool = True
     # When true, API process starts durable worker as an in-process thread
@@ -395,13 +426,39 @@ class Settings(BaseSettings):
     def chroma_collection(self) -> str:
         return self.CHUNK_COLLECTION_NAME or self.CHROMA_COLLECTION_NAME
 
+    def nim_endpoint_count(self) -> int:
+        """How many NIM API keys are configured (primary + peers + CSV)."""
+        n = 1 if (self.NVIDIA_API_KEY or "").strip() else 0
+        for i in (2, 3, 4, 5):
+            if (getattr(self, f"NIM_ENDPOINT_{i}_API_KEY", None) or "").strip():
+                n += 1
+        csv = (self.NIM_API_KEYS or "").strip()
+        if csv:
+            for key in csv.split(","):
+                if key.strip() and key.strip() != (self.NVIDIA_API_KEY or "").strip():
+                    n += 1
+        return n
+
     def effective_map_max_workers(self) -> int:
-        """Map concurrency; capped for in-process embedded worker so API polls stay live."""
+        """Map concurrency; scales with endpoint pool; capped when embedded."""
         base = max(1, int(self.MAP_MAX_WORKERS or 3))
+        eps = self.nim_endpoint_count()
+        # ~6–8 concurrent calls per independent endpoint before queues dominate
+        scaled = min(base, max(4, eps * 8))
+        if eps <= 1:
+            scaled = min(scaled, 10)
         if bool(self.RUN_EMBEDDED_WORKER):
             cap = max(1, int(getattr(self, "EMBEDDED_MAP_MAX_WORKERS", 3) or 3))
-            return min(base, cap)
-        return base
+            return min(scaled, cap)
+        return scaled
+
+    def effective_compile_max_workers(self) -> int:
+        base = max(1, int(self.COMPILE_MAX_WORKERS or 4))
+        eps = self.nim_endpoint_count()
+        scaled = min(base, max(2, eps * 4))
+        if eps <= 1:
+            scaled = min(scaled, 6)
+        return scaled
 
     def validate_for_runtime(self, *, require_cors: bool | None = None) -> None:
         """
@@ -431,6 +488,36 @@ class Settings(BaseSettings):
             log.info(f"CORS origins={origins} credentials={self.cors_allow_credentials()}")
         else:
             log.info("CORS validation skipped (worker process; no HTTP CORS surface)")
+
+        # Compile timeout invariant: HTTP read must be able to abort before the
+        # wrapper wall, otherwise ThreadPoolExecutor "timeouts" never release.
+        compile_read = float(self.NIM_COMPILE_TIMEOUT_SEC or 0.0)
+        compile_connect = float(self.NIM_CONNECT_TIMEOUT_SEC or 0.0)
+        compile_wall = float(self.COMPILE_CALL_MAX_SEC or 0.0)
+        if compile_read <= 0 or compile_wall <= 0:
+            raise ValueError(
+                "NIM_COMPILE_TIMEOUT_SEC and COMPILE_CALL_MAX_SEC must be positive"
+            )
+        if compile_read >= compile_wall:
+            raise ValueError(
+                f"NIM_COMPILE_TIMEOUT_SEC ({compile_read}) must be strictly less than "
+                f"COMPILE_CALL_MAX_SEC ({compile_wall}) so the HTTP client can abort "
+                f"before the compile wall fires"
+            )
+        if compile_connect >= compile_wall:
+            raise ValueError(
+                f"NIM_CONNECT_TIMEOUT_SEC ({compile_connect}) must be strictly less than "
+                f"COMPILE_CALL_MAX_SEC ({compile_wall})"
+            )
+        reduce_wall = float(self.REDUCE_COMPILE_MAX_SEC or 0.0)
+        if reduce_wall < compile_wall:
+            log.warning(
+                "REDUCE_COMPILE_MAX_SEC (%.0f) < COMPILE_CALL_MAX_SEC (%.0f); "
+                "raising REDUCE_COMPILE_MAX_SEC to match",
+                reduce_wall,
+                compile_wall,
+            )
+            object.__setattr__(self, "REDUCE_COMPILE_MAX_SEC", compile_wall)
 
         if self.is_production:
             if self.AUTO_CREATE_SCHEMA:

@@ -181,6 +181,7 @@ def get_job(job_id: str, *, include_result: bool = True) -> Optional[Dict[str, A
                                     JobModel.filename,
                                     JobModel.job_mode,
                                     JobModel.claimed_by,
+                                    JobModel.claimed_at,
                                     JobModel.attempt_count,
                                     JobModel.error_detail,
                                     JobModel.available_at,
@@ -447,6 +448,132 @@ def release_orphaned_claims_for_worker(worker_id: str) -> int:
         db.close()
 
 
+def job_heartbeat_stale_sec() -> float:
+    """Age after which a processing job with a silent heartbeat is considered stalled."""
+    configured = getattr(settings, "WORKER_JOB_HEARTBEAT_STALE_SEC", None)
+    if configured is not None:
+        return float(configured)
+    interval = float(getattr(settings, "WORKER_HEARTBEAT_INTERVAL_SEC", 10.0) or 10.0)
+    return max(15.0, 2.0 * interval)
+
+
+def _heartbeat_age_sec(status: Dict[str, Any]) -> Optional[float]:
+    hb = status.get("heartbeat_at")
+    if hb is None:
+        claimed = status.get("claimed_at")
+        hb = claimed
+    if hb is None:
+        return None
+    if isinstance(hb, str):
+        try:
+            hb = datetime.fromisoformat(hb.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if not isinstance(hb, datetime):
+        return None
+    if hb.tzinfo is None:
+        hb = hb.replace(tzinfo=timezone.utc)
+    return max(0.0, (_now() - hb).total_seconds())
+
+
+def is_job_heartbeat_stale(status: Dict[str, Any], *, stale_after_sec: Optional[float] = None) -> bool:
+    """True when a processing job's heartbeat is older than the stall threshold."""
+    if str(status.get("status") or "") != job_status_mod.STATUS_PROCESSING:
+        return False
+    ttl = float(stale_after_sec if stale_after_sec is not None else job_heartbeat_stale_sec())
+    age = _heartbeat_age_sec(status)
+    if age is None:
+        # No heartbeat yet — use updated_at as a weak signal.
+        updated = status.get("updated_at")
+        if isinstance(updated, str):
+            try:
+                updated = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            except Exception:
+                return False
+        if isinstance(updated, datetime):
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            age = max(0.0, (_now() - updated).total_seconds())
+        else:
+            return False
+    return age >= ttl
+
+
+def requeue_stalled_job(
+    job_id: str,
+    *,
+    reason: str = "Worker heartbeat stalled",
+) -> Dict[str, Any]:
+    """
+    Mark a processing job stalled and requeue (or error if max attempts exceeded).
+    Returns the updated status dict (includes stalled=True while pending retry).
+    """
+    current = get_job(job_id, include_result=False) or {}
+    if str(current.get("status") or "") != job_status_mod.STATUS_PROCESSING:
+        return current
+    attempts = int(current.get("attempt_count") or 0)
+    max_att = int(settings.WORKER_MAX_ATTEMPTS)
+    backoff = int(getattr(settings, "WORKER_RETRY_BACKOFF_SEC", 30) or 30)
+    now = _now()
+    msg = f"Stalled worker detected — {reason}"
+    if attempts >= max_att:
+        updated = upsert_job(
+            job_id,
+            status=job_status_mod.STATUS_ERROR,
+            message=f"{msg}; exceeded max attempts",
+            error_detail="stale_heartbeat_max_attempts",
+            progress=float(current.get("progress") or 0.0),
+            claimed_by=None,
+            claimed_at=None,
+            heartbeat_at=None,
+            completed_at=now,
+        )
+        updated["stalled"] = True
+        updated["stall_reason"] = "max_attempts"
+        return updated
+
+    log.warning(
+        "Job %s: processing → pending (stalled heartbeat, retry %s/%s)",
+        job_id,
+        attempts,
+        max_att,
+    )
+    updated = upsert_job(
+        job_id,
+        status=job_status_mod.STATUS_PENDING,
+        message=f"{msg}; retrying",
+        error_detail="stale_heartbeat_requeued",
+        # Preserve progress so UI can show where it stalled; worker resets on claim.
+        progress=float(current.get("progress") or 0.0),
+        claimed_by=None,
+        claimed_at=None,
+        heartbeat_at=None,
+        available_at=now + timedelta(seconds=backoff * max(attempts, 1)),
+    )
+    updated["stalled"] = True
+    updated["stall_reason"] = "requeued"
+    # Keep a clear UI signal distinct from "still compiling".
+    JOB_STATUSES.setdefault(job_id, {}).update(
+        {"stalled": True, "stall_reason": "requeued", "message": updated.get("message")}
+    )
+    return updated
+
+
+def detect_and_handle_stalled_job(job_id: str, status: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    If ``status`` (or DB row) looks heartbeat-stale while processing, requeue it.
+    Safe to call on every /job-status poll.
+    """
+    cur = status if status is not None else (get_job(job_id, include_result=False) or {})
+    if not cur:
+        return cur
+    if not is_job_heartbeat_stale(cur):
+        cur = dict(cur)
+        cur.setdefault("stalled", False)
+        return cur
+    return requeue_stalled_job(job_id, reason="no heartbeat within stall window")
+
+
 def reclaim_stale_jobs(
     *,
     stale_after_sec: Optional[int] = None,
@@ -463,7 +590,10 @@ def reclaim_stale_jobs(
     from src.db.models import JobModel
     from src.db.session import get_session
 
-    ttl = int(stale_after_sec if stale_after_sec is not None else settings.WORKER_CLAIM_TIMEOUT_SEC)
+    # Prefer the tighter job-heartbeat stall window so dead workers are
+    # recovered well before JOB_MAX_RUNTIME_SEC.
+    default_ttl = job_heartbeat_stale_sec()
+    ttl = int(stale_after_sec if stale_after_sec is not None else default_ttl)
     max_att = int(max_attempts if max_attempts is not None else settings.WORKER_MAX_ATTEMPTS)
     cutoff = _now() - timedelta(seconds=ttl)
     now = _now()
@@ -490,20 +620,23 @@ def reclaim_stale_jobs(
             attempts = int(row.attempt_count or 0)
             if attempts >= max_att:
                 row.status = job_status_mod.STATUS_ERROR
-                row.message = "Job failed: exceeded max attempts after worker timeout"
-                row.error_detail = row.error_detail or "stale_claim_max_attempts"
+                row.message = (
+                    "Stalled worker detected — exceeded max attempts after heartbeat timeout"
+                )
+                row.error_detail = row.error_detail or "stale_heartbeat_max_attempts"
                 row.completed_at = now
                 row.claimed_by = None
                 row.claimed_at = None
                 row.heartbeat_at = None
             else:
                 row.status = job_status_mod.STATUS_PENDING
-                row.message = "Requeued after stale worker claim"
+                row.message = "Stalled worker detected — requeued for retry"
+                row.error_detail = "stale_heartbeat_requeued"
                 row.claimed_by = None
                 row.claimed_at = None
                 row.heartbeat_at = None
                 row.available_at = now + timedelta(seconds=backoff * max(attempts, 1))
-                row.progress = 0.0
+                # Preserve progress so UI can show stall point (compiling vs map).
             row.updated_at = now
             JOB_STATUSES.pop(row.id, None)
             touched += 1
@@ -680,6 +813,8 @@ def _row_to_status(row, *, include_result: bool = True) -> Dict[str, Any]:
         status["routing_decision"] = row.routing_decision
     if getattr(row, "available_at", None) is not None:
         status["available_at"] = row.available_at
+    if getattr(row, "claimed_at", None) is not None:
+        status["claimed_at"] = row.claimed_at
     if getattr(row, "heartbeat_at", None) is not None:
         status["heartbeat_at"] = row.heartbeat_at
     if getattr(row, "created_at", None) is not None:

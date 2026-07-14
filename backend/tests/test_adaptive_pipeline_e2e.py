@@ -48,7 +48,7 @@ def test_adaptive_pipeline_smoke(monkeypatch):
             call_meta["call_ms"] = 5.0
         return f"SUMMARY({tier}): " + " ".join(str(text).split()[:40])
 
-    def fake_compile(summaries, state, model_ids=None):
+    def fake_compile(summaries, state, model_ids=None, deadline_mono=None):
         if isinstance(summaries, list):
             body = " ".join(str(s) for s in summaries)[:500]
         else:

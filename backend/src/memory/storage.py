@@ -246,14 +246,35 @@ def store_chunks(
         db.commit()
         db.close()
 
-        # Rebuild BM25 sparse index for hybrid retrieval (Phase 2.B)
-        try:
-            from src.retrieval.bm25 import build_and_save
+        # BM25 sparse index for hybrid retrieval (Phase 2.B).
+        # Full rebuild per document — by default off the critical path so
+        # store_for_rag can complete once Chroma upsert lands. Query path
+        # rebuilds on demand if the index is missing.
+        bm25_docs = [(row[0], row[2]) for row in normalized]  # chunk_id, text
 
-            bm25_docs = [(row[0], row[2]) for row in normalized]  # chunk_id, text
-            build_and_save(document_id, bm25_docs)
-        except Exception as e:
-            log.warning(f"BM25 index rebuild failed for {document_id}: {e}")
+        def _build_bm25() -> None:
+            try:
+                from src.retrieval.bm25 import build_and_save
+
+                build_and_save(document_id, bm25_docs)
+            except Exception as e:
+                log.warning(f"BM25 index rebuild failed for {document_id}: {e}")
+
+        if bool(getattr(settings, "BM25_ASYNC_BUILD", True)):
+            import threading
+
+            threading.Thread(
+                target=_build_bm25,
+                name=f"bm25-build-{document_id[:8]}",
+                daemon=True,
+            ).start()
+            log.info(
+                "BM25 rebuild scheduled async for %s (%s docs)",
+                document_id,
+                len(bm25_docs),
+            )
+        else:
+            _build_bm25()
 
         log.info(f"Stored {len(normalized)} chunks for document {document_id}")
         return True

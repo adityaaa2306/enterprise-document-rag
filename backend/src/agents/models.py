@@ -60,9 +60,11 @@ def _nim_timeout(*, read_override: Optional[float] = None) -> httpx.Timeout:
 
 
 def load_nim_client() -> None:
-    """Configure the OpenAI-compatible NVIDIA NIM client with hard timeouts."""
+    """Configure NVIDIA NIM client(s) — multi-endpoint pool when enabled."""
     global models_registry
-    if not settings.NVIDIA_API_KEY:
+    if not settings.NVIDIA_API_KEY and not (
+        getattr(settings, "NIM_API_KEYS", None) or ""
+    ).strip():
         log.error(
             "NVIDIA_API_KEY is not set. "
             "Copy backend/.env.example to backend/.env and add your key from "
@@ -72,26 +74,51 @@ def load_nim_client() -> None:
         return
 
     try:
-        timeout = _nim_timeout()
-        max_retries = int(getattr(settings, "NIM_SDK_MAX_RETRIES", 0) or 0)
-        log.info(
-            f"Configuring NVIDIA NIM client ({settings.NVIDIA_BASE_URL}) "
-            f"timeout={timeout.read}s connect={timeout.connect}s retries={max_retries}..."
-        )
-        models_registry["nim_client"] = OpenAI(
-            api_key=settings.NVIDIA_API_KEY,
-            base_url=settings.NVIDIA_BASE_URL,
-            timeout=timeout,
-            max_retries=max_retries,
-        )
-        log.info("NVIDIA NIM client configured successfully.")
+        if bool(getattr(settings, "NIM_ENDPOINT_POOL_ENABLED", True)):
+            from src.agents import nim_endpoint_pool as pool
+
+            pool.load_endpoint_pool()
+            models_registry["nim_client"] = pool.primary_client()
+            log.info(
+                "NVIDIA NIM pool ready endpoints=%s strategy=%s",
+                pool.endpoint_count(),
+                getattr(settings, "NIM_ENDPOINT_STRATEGY", "least_load"),
+            )
+        else:
+            timeout = _nim_timeout()
+            max_retries = int(getattr(settings, "NIM_SDK_MAX_RETRIES", 0) or 0)
+            log.info(
+                f"Configuring NVIDIA NIM client ({settings.NVIDIA_BASE_URL}) "
+                f"timeout={timeout.read}s connect={timeout.connect}s retries={max_retries}..."
+            )
+            models_registry["nim_client"] = OpenAI(
+                api_key=settings.NVIDIA_API_KEY,
+                base_url=settings.NVIDIA_BASE_URL,
+                timeout=timeout,
+                max_retries=max_retries,
+            )
+            log.info("NVIDIA NIM client configured successfully.")
     except Exception as e:
         log.error(f"Failed to configure NVIDIA NIM client: {e}")
         models_registry["nim_client"] = None
 
 
 def get_nim_client() -> Optional[OpenAI]:
-    return models_registry.get("nim_client")
+    """Return a NIM client (primary / any from pool). Prefer acquire via call path."""
+    client = models_registry.get("nim_client")
+    if client is not None:
+        return client
+    if bool(getattr(settings, "NIM_ENDPOINT_POOL_ENABLED", True)):
+        try:
+            from src.agents import nim_endpoint_pool as pool
+
+            pool.ensure_pool_loaded()
+            client = pool.primary_client()
+            models_registry["nim_client"] = client
+            return client
+        except Exception:
+            return None
+    return None
 
 
 def is_transient_nim_error(exc: BaseException) -> bool:
@@ -173,6 +200,7 @@ def call_chat_with_fallback(
     return_timing: bool = False,
     timeout: Optional[httpx.Timeout] = None,
     call_meta: Optional[Dict[str, Any]] = None,
+    deadline_mono: Optional[float] = None,
 ) -> Union[Tuple[str, Optional[str]], Tuple[str, Optional[str], Dict[str, Any]]]:
     """
     Try each model in order. On rate-limit / HTTP / empty errors, fall through
@@ -186,10 +214,34 @@ def call_chat_with_fallback(
     When ``call_meta`` dict is provided, it is filled with diagnostic fields:
     attempt log, retry_count, http_status on last failure, call_ms, model_id.
 
+    When ``deadline_mono`` is set (``time.monotonic()`` deadline), the shared
+    budget covers the whole fallback chain — further models are skipped once
+    the deadline is reached.
+
     Timeouts, connection errors, and HTTP 5xx are classified as NimApiError
     and retried on the same model before falling through.
+
+    When the endpoint pool is enabled, each attempt uses the healthiest NIM
+    endpoint; failures cool that endpoint and the next try picks another.
     """
-    client = get_nim_client()
+    use_pool = bool(getattr(settings, "NIM_ENDPOINT_POOL_ENABLED", True))
+    pool_mod = None
+    if use_pool:
+        try:
+            from src.agents import nim_endpoint_pool as pool_mod
+        except Exception:
+            pool_mod = None
+            use_pool = False
+
+    lease = None
+    role = "compile" if (call_meta or {}).get("phase") == "compile" else "map"
+    if call_meta and call_meta.get("endpoint_role"):
+        role = str(call_meta.get("endpoint_role"))
+    if use_pool and pool_mod is not None:
+        lease = pool_mod.acquire_endpoint(role=role)
+        client = lease.client if lease else get_nim_client()
+    else:
+        client = get_nim_client()
     if client is None:
         raise RuntimeError("NVIDIA NIM client is not configured (missing NVIDIA_API_KEY).")
 
@@ -198,11 +250,12 @@ def call_chat_with_fallback(
     max_retries_per_model = max(1, int(max_retries_per_model))
 
     last_error: Optional[Exception] = None
-    req_timeout = timeout or _nim_timeout()
+    base_timeout = timeout or _nim_timeout()
     t_call0 = time.perf_counter()
     attempts_log: List[Dict[str, Any]] = []
     retry_count = 0
     last_http_status: Optional[int] = None
+    connect_cap = float(getattr(settings, "NIM_CONNECT_TIMEOUT_SEC", 15.0) or 15.0)
 
     # De-dupe while preserving order
     seen: set = set()
@@ -213,7 +266,33 @@ def call_chat_with_fallback(
             ordered_ids.append(mid)
 
     for model_id in ordered_ids:
+        if deadline_mono is not None:
+            remaining = float(deadline_mono) - time.monotonic()
+            if remaining <= max(1.0, connect_cap):
+                last_error = NimApiError(
+                    f"Shared call deadline exhausted before trying {model_id} "
+                    f"(remaining={remaining:.1f}s)"
+                )
+                log.warning("%s", last_error)
+                break
         for attempt in range(max_retries_per_model):
+            if deadline_mono is not None:
+                remaining = float(deadline_mono) - time.monotonic()
+                if remaining <= max(1.0, connect_cap):
+                    last_error = NimApiError(
+                        f"Shared call deadline exhausted during {model_id} "
+                        f"(remaining={remaining:.1f}s)"
+                    )
+                    log.warning("%s", last_error)
+                    break
+                # Shrink read timeout so the socket itself returns before the wall.
+                read_cap = float(getattr(base_timeout, "read", None) or 90.0)
+                req_timeout = httpx.Timeout(
+                    max(1.0, min(read_cap, remaining - 0.5)),
+                    connect=min(connect_cap, max(1.0, remaining - 0.5)),
+                )
+            else:
+                req_timeout = base_timeout
             t_attempt = time.perf_counter()
             try:
                 if return_timing:
@@ -248,7 +327,11 @@ def call_chat_with_fallback(
                         "error": None,
                     }
                 )
-                log.info(f"Chat succeeded with model '{model_id}'")
+                log.info(
+                    "Chat succeeded with model '%s' endpoint=%s",
+                    model_id,
+                    lease.endpoint_id if lease else "primary",
+                )
                 if call_meta is not None:
                     call_meta.update(
                         {
@@ -261,8 +344,14 @@ def call_chat_with_fallback(
                             "success": True,
                             "fallback_used": model_id != ordered_ids[0] if ordered_ids else False,
                             "primary_model": ordered_ids[0] if ordered_ids else None,
+                            "endpoint_id": lease.endpoint_id if lease else None,
                         }
                     )
+                if use_pool and pool_mod is not None and lease is not None:
+                    pool_mod.release_endpoint(
+                        lease, ok=True, latency_ms=attempt_ms, rate_limited=False
+                    )
+                    lease = None
                 if return_timing:
                     timing_out = dict(timing or {})
                     timing_out.update(
@@ -295,6 +384,7 @@ def call_chat_with_fallback(
                         "duration_ms": round(attempt_ms, 1),
                         "http_status": http_status,
                         "error": f"{type(classified).__name__}: {str(classified)[:180]}",
+                        "endpoint_id": lease.endpoint_id if lease else None,
                     }
                 )
                 is_rate_limit = (
@@ -304,9 +394,27 @@ def call_chat_with_fallback(
                 )
                 transient = is_transient_nim_error(classified) or is_rate_limit
 
+                # Cool current endpoint and rotate for the next attempt
+                if use_pool and pool_mod is not None and lease is not None:
+                    pool_mod.release_endpoint(
+                        lease,
+                        ok=False,
+                        latency_ms=attempt_ms,
+                        rate_limited=is_rate_limit,
+                    )
+                    lease = pool_mod.acquire_endpoint(role=role)
+                    if lease is not None:
+                        client = lease.client
+
                 if transient and attempt < max_retries_per_model - 1:
+                    if deadline_mono is not None:
+                        remaining = float(deadline_mono) - time.monotonic()
+                        if remaining <= max(1.0, connect_cap):
+                            break
                     retry_count += 1
                     wait = (3 * (attempt + 1)) if is_rate_limit else (2 ** attempt)
+                    if deadline_mono is not None:
+                        wait = min(wait, max(0.0, float(deadline_mono) - time.monotonic() - 1.0))
                     log.warning(
                         "Transient NIM error on %s (%s). Retrying in %ss "
                         "(attempt %s/%s)...",
@@ -316,7 +424,8 @@ def call_chat_with_fallback(
                         attempt + 1,
                         max_retries_per_model,
                     )
-                    time.sleep(wait)
+                    if wait > 0:
+                        time.sleep(wait)
                     continue
 
                 log.warning(
@@ -324,6 +433,16 @@ def call_chat_with_fallback(
                     f"Trying next fallback if any."
                 )
                 break  # next model
+        else:
+            continue
+        if deadline_mono is not None and (float(deadline_mono) - time.monotonic()) <= max(
+            1.0, connect_cap
+        ):
+            break
+
+    if use_pool and pool_mod is not None and lease is not None:
+        pool_mod.release_endpoint(lease, ok=False, latency_ms=0.0, rate_limited=False)
+        lease = None
 
     if call_meta is not None:
         call_meta.update(
@@ -843,9 +962,55 @@ EXECUTIVE SUMMARY:
 """.strip()
 
 
-def _compile_timeout() -> httpx.Timeout:
+def _compile_timeout(*, remaining_sec: Optional[float] = None) -> httpx.Timeout:
+    """HTTP timeout for compile calls — always strictly below COMPILE_CALL_MAX_SEC."""
     read = float(getattr(settings, "NIM_COMPILE_TIMEOUT_SEC", 55.0) or 55.0)
+    wall = float(getattr(settings, "COMPILE_CALL_MAX_SEC", 180.0) or 180.0)
+    # Keep HTTP abort below the wrapper wall so the worker thread can return.
+    read = min(read, max(1.0, wall - 1.0))
+    if remaining_sec is not None:
+        read = max(1.0, min(read, float(remaining_sec) - 0.5))
     return _nim_timeout(read_override=read)
+
+
+def _shutdown_executor_nowait(pool: Any, fut: Any = None) -> None:
+    """Release the job without joining a hung NIM thread."""
+    try:
+        if fut is not None:
+            fut.cancel()
+    except Exception:
+        pass
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        # Python < 3.9: cancel_futures unavailable
+        try:
+            pool.shutdown(wait=False)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def stitch_compile_fallback(
+    summaries: Union[str, List[str]],
+    *,
+    reason: str = "NIM compile unavailable",
+) -> str:
+    """Last-resort executive summary from chunk/regional texts (no LLM)."""
+    usable = _normalize_compile_summaries(summaries)
+    stitched = "\n\n".join(f"- {s}" for s in usable[:40])
+    if not stitched.strip():
+        return (
+            "Unable to generate a final summary because no usable chunk summaries "
+            "were produced. Please retry the upload."
+        )
+    return (
+        "## Summary\n\n"
+        f"The executive compile step could not complete ({reason}), "
+        "so this is a stitched fallback from chunk summaries:\n\n"
+        f"{stitched}"
+    )
 
 
 def _call_compile_llm(
@@ -853,6 +1018,7 @@ def _call_compile_llm(
     chain: List[str],
     *,
     intermediate: bool = False,
+    deadline_mono: Optional[float] = None,
 ) -> Tuple[str, Optional[str]]:
     messages = [
         {"role": "system", "content": _COMPILE_SYSTEM},
@@ -861,13 +1027,15 @@ def _call_compile_llm(
             "content": _build_compile_prompt(text_of_summaries, intermediate=intermediate),
         },
     ]
-    read = float(getattr(settings, "NIM_COMPILE_TIMEOUT_SEC", 55.0) or 55.0)
-    # Hard wall even if the OpenAI/httpx client fails to abort a hung socket.
-    # Cap by chain length so multi-model fallthrough still fits under COMPILE_CALL_MAX_SEC.
-    n_models = max(1, len([m for m in (chain or []) if m]))
-    hard_sec = min(read * n_models + 20.0, float(getattr(settings, "COMPILE_CALL_MAX_SEC", 180.0) or 180.0))
+    wall = float(getattr(settings, "COMPILE_CALL_MAX_SEC", 180.0) or 180.0)
+    started = time.monotonic()
+    if deadline_mono is None:
+        deadline_mono = started + wall
+    # Shared budget for the whole fallback chain (not per-model stacking).
+    hard_sec = max(0.5, min(wall, float(deadline_mono) - started))
 
     def _invoke() -> Tuple[str, Optional[str]]:
+        remaining = float(deadline_mono) - time.monotonic()
         # No per-model retries — long compile prompts must fall through quickly.
         return call_chat_with_fallback(
             chain,
@@ -875,20 +1043,25 @@ def _call_compile_llm(
             temperature=0.5,
             max_tokens=1600 if intermediate else 2000,
             max_retries_per_model=1,
-            timeout=_compile_timeout(),
+            timeout=_compile_timeout(remaining_sec=remaining),
+            deadline_mono=deadline_mono,
+            call_meta={"phase": "compile", "endpoint_role": "compile"},
         )
 
     import concurrent.futures
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        fut = pool.submit(_invoke)
-        try:
-            return fut.result(timeout=hard_sec)
-        except concurrent.futures.TimeoutError as e:
-            raise NimApiError(
-                f"Compile hard timeout after {hard_sec:.0f}s "
-                f"(models={chain})"
-            ) from e
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = pool.submit(_invoke)
+    try:
+        return fut.result(timeout=hard_sec)
+    except concurrent.futures.TimeoutError as e:
+        raise NimApiError(
+            f"Compile hard timeout after {hard_sec:.0f}s "
+            f"(models={chain})"
+        ) from e
+    finally:
+        # Critical: do not join a hung socket thread — let HTTP timeout reclaim it.
+        _shutdown_executor_nowait(pool, fut)
 
 
 def _estimate_compile_tokens(text: str) -> int:
@@ -904,6 +1077,8 @@ def _hierarchical_compile(
     summaries: List[str],
     chains: List[List[str]],
     state: dict,
+    *,
+    deadline_mono: Optional[float] = None,
 ) -> str:
     """
     Batch large summary sets into intermediate compiles, then final compile.
@@ -911,15 +1086,24 @@ def _hierarchical_compile(
 
     Intermediate batches within a round run concurrently (COMPILE_MAX_WORKERS)
     — same inputs/outputs as sequential; lower wall-clock only.
+
+    ``deadline_mono`` is a shared wall for this entire compile invocation
+    (batches + final + all model fallbacks).
     """
     import concurrent.futures
 
     batch_size = max(3, int(getattr(settings, "COMPILE_BATCH_SIZE", 8) or 8))
     max_tokens = int(getattr(settings, "COMPILE_MAX_INPUT_TOKENS", 10000) or 10000)
     compile_workers = max(1, int(getattr(settings, "COMPILE_MAX_WORKERS", 4) or 4))
+    wall = float(getattr(settings, "COMPILE_CALL_MAX_SEC", 180.0) or 180.0)
+    if deadline_mono is None:
+        deadline_mono = time.monotonic() + wall
 
     working = list(summaries)
     round_idx = 0
+
+    def _deadline_left() -> float:
+        return float(deadline_mono) - time.monotonic()
 
     def _compile_one_batch(bi: int, batch: List[str], batch_total: int) -> tuple:
         batch_text = "\n\n".join(batch)
@@ -928,6 +1112,10 @@ def _hierarchical_compile(
         # Intermediate batches: at most 2 unique models (skip full ladder).
         primary = list(chains[0]) if chains else []
         batch_chains = [primary[:2]] if primary else []
+        if _deadline_left() <= 2.0:
+            return bi, batch_text, None, len(batch_text), NimApiError(
+                "Compile deadline exhausted before intermediate batch"
+            )
         if job_id:
             try:
                 from src.db import jobs as jobs_db
@@ -950,7 +1138,12 @@ def _hierarchical_compile(
         )
         for chain in batch_chains:
             try:
-                text, used = _call_compile_llm(batch_text, chain, intermediate=True)
+                text, used = _call_compile_llm(
+                    batch_text,
+                    chain,
+                    intermediate=True,
+                    deadline_mono=deadline_mono,
+                )
                 return bi, text, used, len(batch_text), None
             except Exception as e:
                 last_err = e
@@ -962,6 +1155,8 @@ def _hierarchical_compile(
         return bi, batch_text, None, len(batch_text), last_err
 
     while True:
+        if _deadline_left() <= 2.0:
+            raise NimApiError("Compile deadline exhausted during hierarchical batching")
         joined = "\n\n".join(working)
         tokens = _estimate_compile_tokens(joined)
         if len(working) <= batch_size and tokens <= max_tokens:
@@ -989,7 +1184,8 @@ def _hierarchical_compile(
                 bi2, text, used, nchars, err = _compile_one_batch(bi, batch, batch_total)
                 results_by_bi[bi2] = (text, used, nchars)
         else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+            try:
                 futs = [
                     pool.submit(_compile_one_batch, bi, batch, batch_total)
                     for bi, batch in batches
@@ -997,6 +1193,8 @@ def _hierarchical_compile(
                 for fut in concurrent.futures.as_completed(futs):
                     bi2, text, used, nchars, err = fut.result()
                     results_by_bi[bi2] = (text, used, nchars)
+            finally:
+                _shutdown_executor_nowait(pool)
 
         next_level: List[str] = []
         for bi in range(1, batch_total + 1):
@@ -1016,6 +1214,9 @@ def _hierarchical_compile(
     last_error: Optional[Exception] = None
     job_id = state.get("job_id")
     for chain in chains:
+        if _deadline_left() <= 2.0:
+            last_error = NimApiError("Compile deadline exhausted before final chain")
+            break
         if job_id and chain:
             try:
                 from src.db import jobs as jobs_db
@@ -1028,7 +1229,12 @@ def _hierarchical_compile(
             except Exception:
                 pass
         try:
-            result, used = _call_compile_llm(final_text, chain, intermediate=False)
+            result, used = _call_compile_llm(
+                final_text,
+                chain,
+                intermediate=False,
+                deadline_mono=deadline_mono,
+            )
             state.setdefault("model_usage_chars", {"light": 0, "medium": 0, "large": 0})
             state["model_usage_chars"]["large"] = (
                 state["model_usage_chars"].get("large", 0) + len(final_text)
@@ -1049,12 +1255,14 @@ def run_compile_with_models(
     text_of_summaries: Union[str, List[str]],
     state: dict,
     model_ids: Optional[List[str]] = None,
+    *,
+    deadline_mono: Optional[float] = None,
 ) -> str:
     """
     Compile chunk summaries using the router-selected chain, with:
     - hierarchical batching for large documents
-    - cross-tier fallback (primary → medium → light)
-    - longer NIM timeout + transient retries
+    - cross-tier fallback under a single COMPILE_CALL_MAX_SEC budget
+    - HTTP + wrapper timeouts that actually release the job
     """
     if get_nim_client() is None:
         log.warning("Compile model unavailable. Falling back to medium summarizer.")
@@ -1073,30 +1281,31 @@ def run_compile_with_models(
         )
 
     chains = _compile_model_chains(model_ids)
+    wall = float(getattr(settings, "COMPILE_CALL_MAX_SEC", 180.0) or 180.0)
+    if deadline_mono is None:
+        deadline_mono = time.monotonic() + wall
     log.info(
-        "Compile starting: summaries=%s tokens≈%s primary_models=%s",
+        "Compile starting: summaries=%s tokens≈%s primary_models=%s budget_sec=%.0f",
         len(summaries),
         _estimate_compile_tokens("\n\n".join(summaries)),
         [c[0] for c in chains if c],
+        max(0.0, float(deadline_mono) - time.monotonic()),
     )
 
     try:
         return strip_outer_markdown_fence(
-            _hierarchical_compile(summaries, chains, state)
+            _hierarchical_compile(
+                summaries, chains, state, deadline_mono=deadline_mono
+            )
         )
     except Exception as e:
         log.error(f"Error in compile: {e}")
         # Last-resort: stitch usable chunk summaries so the job still has content
-        stitched = "\n\n".join(f"- {s}" for s in summaries[:40])
-        if stitched.strip():
-            log.warning("Returning stitched chunk-summary fallback after compile failure")
-            return (
-                "## Summary\n\n"
-                "The executive compile step could not reach NVIDIA NIM heavy models, "
-                "so this is a stitched fallback from chunk summaries:\n\n"
-                f"{stitched}"
-            )
-        return f"Final summary generation failed: {e}"
+        out = stitch_compile_fallback(summaries, reason=str(e)[:160])
+        if out.startswith("Unable to generate"):
+            return f"Final summary generation failed: {e}"
+        log.warning("Returning stitched chunk-summary fallback after compile failure")
+        return out
 
 
 def run_large_model_compile(text_of_summaries: Union[str, List[str]], state: dict) -> str:

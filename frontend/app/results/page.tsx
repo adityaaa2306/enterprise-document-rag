@@ -285,15 +285,38 @@ function ResultsContent() {
           ) {
             setChunkProgress(`${data.chunks_done}/${data.chunks_total} chunks`)
           }
+          const dag = (data.partial as { dag?: Record<string, { done?: number; total?: number }> } | null)
+            ?.dag
+          let dagBit = ""
+          if (dag && typeof dag === "object") {
+            const parts = Object.entries(dag)
+              .filter(([k]) => k !== "workers" && k !== "completed" && k !== "running" && k !== "failed" && k !== "pending" && k !== "by_kind")
+              .map(([k, v]) =>
+                v && typeof v === "object" && "done" in v
+                  ? `${k} ${v.done ?? 0}/${v.total ?? 0}`
+                  : ""
+              )
+              .filter(Boolean)
+            const byKind = (dag as { by_kind?: Record<string, { done?: number; total?: number }> }).by_kind
+            if (byKind) {
+              dagBit =
+                " · " +
+                Object.entries(byKind)
+                  .map(([k, v]) => `${k} ${v.done ?? 0}/${v.total ?? 0}`)
+                  .join(", ")
+            } else if (parts.length) {
+              dagBit = " · " + parts.join(", ")
+            }
+          }
           const detail =
-            data.stage || data.chunks_done != null
+            data.stage || data.chunks_done != null || dagBit
               ? `${data.message || data.status}${
                   data.stage ? ` · ${data.stage}` : ""
                 }${
                   data.chunks_done != null && data.chunks_total
                     ? ` · ${data.chunks_done}/${data.chunks_total}`
                     : ""
-                }`
+                }${dagBit}`
               : data.message || `Status: ${data.status}`
           appendLog(detail, isErrorStatus(data.status) ? "error" : "info")
 

@@ -470,10 +470,19 @@ def estimate_workflow_carbon(
     summary_tokens = max(generated_tokens, min(input_tokens // 3, 6000))
     batch_size = 8
     n_rounds = max(1, int(math.ceil(math.log(max(total_chunks, 2), batch_size))))
-    compile_calls = max(
-        1, int(math.ceil(total_chunks / float(batch_size))) + (n_rounds - 1)
-    )
-    compile_tokens = int(summary_tokens * n_rounds)
+    # Prefer measured compile sub-steps from reduce_compile when present
+    # (fixes flat "compile_calls: 1" / heuristic undercount on multi-step compiles).
+    measured_calls = compile_meta.get("compile_calls")
+    if measured_calls is not None and int(measured_calls) >= 0:
+        compile_calls = max(0, int(measured_calls))
+        if compile_calls == 0 and not compile_meta.get("used_stitched_fallback"):
+            compile_calls = 1
+    else:
+        compile_calls = max(
+            1, int(math.ceil(total_chunks / float(batch_size))) + (n_rounds - 1)
+        )
+    # Scale compile token estimate by measured call count when available.
+    compile_tokens = int(summary_tokens * max(n_rounds, compile_calls))
     verification_tokens = total_chunks * 40
     map_tokens_total = (
         max(int(input_tokens * 1.25), input_tokens) if input_tokens > 0 else 0
@@ -701,4 +710,17 @@ def estimate_workflow_carbon(
         "pue": A.PUE,
         "baseline_reference": baseline_ref,
         "region_decision": region_decision_dict,
+        # Additive: measured reduce_compile sub-step counts (also in routing_impact /
+        # breakdown) so dashboards are not stuck on a flat heuristic of 1.
+        "compile_calls": int(compile_calls),
+        "compile_tokens": int(compile_tokens),
+        "compile_tier": compile_tier,
+        "compile_carbon_g": float(compile_meta.get("compile_carbon_g") or 0.0),
+        "compile_substeps_ms": {
+            "medium_compile_ms": compile_meta.get("medium_compile_ms"),
+            "quality_check_ms": compile_meta.get("quality_check_ms"),
+            "heavy_compile_ms": compile_meta.get("heavy_compile_ms"),
+            "branch_repair_ms": compile_meta.get("branch_repair_ms"),
+            "global_recompile_ms": compile_meta.get("global_recompile_ms"),
+        },
     }

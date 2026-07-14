@@ -113,6 +113,10 @@ class JobStatus(BaseModel):
     attempt_count: Optional[int] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    # Stall detection: distinct from "still compiling" when worker heartbeat dies
+    stalled: Optional[bool] = None
+    stall_reason: Optional[str] = None
+    heartbeat_age_sec: Optional[float] = None
 
 
 class JobListItem(BaseModel):

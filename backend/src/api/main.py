@@ -428,6 +428,14 @@ def _job_status_payload(job_id: str, status_dict: Dict[str, Any]) -> JobStatus:
     done, total = _parse_chunk_progress(message)
     stage = _stage_from_progress(progress, message)
     partial = status_dict.get("partial") if isinstance(status_dict.get("partial"), dict) else None
+    stalled = status_dict.get("stalled")
+    if stalled is None and "stalled" in (message or "").lower():
+        stalled = True
+    hb_age = None
+    try:
+        hb_age = job_store._heartbeat_age_sec(status_dict)
+    except Exception:
+        hb_age = None
     return JobStatus(
         job_id=job_id,
         status=status,
@@ -438,6 +446,9 @@ def _job_status_payload(job_id: str, status_dict: Dict[str, Any]) -> JobStatus:
         chunks_done=done,
         chunks_total=total,
         stage=stage,
+        stalled=bool(stalled) if stalled is not None else False,
+        stall_reason=status_dict.get("stall_reason"),
+        heartbeat_age_sec=round(hb_age, 1) if hb_age is not None else None,
     )
 
 
@@ -458,6 +469,13 @@ def get_job_status(
         job_id,
         job_store.get_job(job_id, include_result=False),
     )
+
+    # Detect dead workers mid-compile (frozen "Compiling executive summary...")
+    # well before JOB_MAX_RUNTIME_SEC — requeue and surface stalled≠compiling.
+    try:
+        status_dict = job_store.detect_and_handle_stalled_job(job_id, status_dict)
+    except Exception as e:
+        log.warning("Job %s: stall detection failed: %s", job_id, e)
 
     # Heal race: result already persisted but a late heartbeat left status=processing.
     # Only hydrate the full row when progress claims completion while status lags.
