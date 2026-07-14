@@ -17,6 +17,7 @@ log = logging.getLogger(__name__)
 
 STAGE_TRIAGE = "triage_ms"
 STAGE_FEATURE_EXTRACT = "feature_extract_ms"
+STAGE_PLAN_PIPELINE = "plan_pipeline_ms"
 STAGE_CRE_ROUTE = "cre_and_route_ms"
 STAGE_MAP_SUMMARIZE = "map_summarize_ms"
 STAGE_VALIDATE = "validate_map_ms"
@@ -29,6 +30,7 @@ STAGE_TOTAL = "total_ms"
 STAGE_ORDER = [
     STAGE_TRIAGE,
     STAGE_FEATURE_EXTRACT,
+    STAGE_PLAN_PIPELINE,
     STAGE_CRE_ROUTE,
     STAGE_MAP_SUMMARIZE,
     STAGE_VALIDATE,
@@ -73,21 +75,48 @@ class IngestionLatencyTracker:
     def __init__(self, job_id: str = "") -> None:
         self.job_id = job_id
         self.stages: Dict[str, float] = {}
+        self.stage_detail: Dict[str, Dict[str, Any]] = {}
         self.meta: Dict[str, Any] = {}
         self.chunk_calls: List[Dict[str, Any]] = []
         self.pool_samples: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
         self._t0 = time.perf_counter()
+        self._cpu0 = time.process_time()
         self._active_workers = 0
         self._peak_active = 0
+        self._model_calls = 0
 
     @contextmanager
     def stage(self, name: str) -> Iterator[None]:
         start = time.perf_counter()
+        cpu0 = time.process_time()
+        detail: Dict[str, Any] = {
+            "start_offset_ms": round((start - self._t0) * 1000.0, 3),
+        }
+        try:
+            from src.perf.profiler import sample_resources
+
+            detail["resources_start"] = sample_resources()
+        except Exception:
+            pass
         try:
             yield
         finally:
-            self.stages[name] = round((time.perf_counter() - start) * 1000.0, 3)
+            end = time.perf_counter()
+            wall_ms = round((end - start) * 1000.0, 3)
+            cpu_ms = round((time.process_time() - cpu0) * 1000.0, 3)
+            self.stages[name] = wall_ms
+            detail["end_offset_ms"] = round((end - self._t0) * 1000.0, 3)
+            detail["wall_ms"] = wall_ms
+            detail["cpu_ms"] = cpu_ms
+            detail["io_wait_proxy_ms"] = round(max(0.0, wall_ms - cpu_ms), 3)
+            try:
+                from src.perf.profiler import sample_resources
+
+                detail["resources_end"] = sample_resources()
+            except Exception:
+                pass
+            self.stage_detail[name] = detail
 
     def set_stage(self, name: str, duration_ms: float) -> None:
         self.stages[name] = round(float(duration_ms), 3)
@@ -122,9 +151,14 @@ class IngestionLatencyTracker:
             self.pool_samples.append(sample)
         return active
 
+    def record_model_call(self) -> None:
+        with self._lock:
+            self._model_calls += 1
+
     def record_chunk_call(self, record: Dict[str, Any]) -> None:
         with self._lock:
             self.chunk_calls.append(record)
+            self._model_calls += 1
         log.info(
             "ingest_chunk_call job_id=%s chunk=%s tier=%s model=%s "
             "queue_ms=%.1f call_ms=%.1f ok=%s retries=%s http_status=%s attempts=%s",
@@ -146,6 +180,17 @@ class IngestionLatencyTracker:
                 (time.perf_counter() - self._t0) * 1000.0, 3
             )
         self.meta["pool_peak_active"] = self._peak_active
+        self.meta["model_calls"] = self._model_calls
+        self.meta["cpu_total_ms"] = round(
+            (time.process_time() - self._cpu0) * 1000.0, 3
+        )
+        try:
+            from src.perf.profiler import format_waterfall, rank_bottlenecks
+
+            self.meta["waterfall"] = format_waterfall(self.stages)
+            self.meta["bottleneck_rank"] = rank_bottlenecks(self.stages)
+        except Exception:
+            pass
         return self.as_dict()
 
     def as_dict(self) -> Dict[str, Any]:
@@ -162,12 +207,17 @@ class IngestionLatencyTracker:
         failures = [c for c in self.chunk_calls if not c.get("success")]
         return {
             "stages_ms": dict(self.stages),
+            "stage_detail": dict(self.stage_detail),
             "meta": dict(self.meta),
             "map_chunk_stats": {
                 "call_ms": summarize_durations_ms(call_ms),
                 "queue_ms": summarize_durations_ms(queue_ms),
                 "failures": len(failures),
                 "chunk_calls": len(self.chunk_calls),
+                "avg_latency_ms": (
+                    round(statistics.mean(call_ms), 1) if call_ms else None
+                ),
+                "model_calls": self._model_calls,
             },
             "chunk_calls": list(self.chunk_calls),
             "pool_samples": list(self.pool_samples[-200:]),  # cap payload size
@@ -175,6 +225,8 @@ class IngestionLatencyTracker:
             # Wall-clock origin for reconstructing tracker across LangGraph nodes
             "_t0_wall": time.time() - (time.perf_counter() - self._t0),
             "_elapsed_so_far_ms": round((time.perf_counter() - self._t0) * 1000.0, 3),
+            "_model_calls": self._model_calls,
+            "_cpu0": self._cpu0,
         }
 
 
@@ -230,4 +282,15 @@ def format_latency_table(latency: Dict[str, Any]) -> str:
     if meta:
         lines.append("")
         lines.append(f"routing: {meta.get('routing_summary') or meta}")
+    if meta.get("waterfall"):
+        lines.append("")
+        lines.append(str(meta["waterfall"]))
+    if meta.get("bottleneck_rank"):
+        lines.append("")
+        lines.append("=== Bottleneck rank ===")
+        for row in meta["bottleneck_rank"][:8]:
+            lines.append(
+                f"  #{row.get('rank')} {row.get('stage')}: "
+                f"{row.get('sec')}s ({row.get('pct_of_stages')}%)"
+            )
     return "\n".join(lines)

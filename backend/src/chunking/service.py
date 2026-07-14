@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.chunking.types import AdaptiveChunk, ParentNode, ChunkKind, ChunkType
 from src.core.config import settings
+from src.monitoring.chunking_forensics import ChunkForensicRecord
 
 log = logging.getLogger(__name__)
 
@@ -22,7 +23,12 @@ EmbedFn = Callable[[List[str]], List[List[float]]]
 
 
 def estimate_tokens(text: str) -> int:
-    return max(1, len(text or "") // 4)
+    try:
+        from src.perf.cache import get_token_count
+
+        return get_token_count(text)
+    except Exception:
+        return max(1, len(text or "") // 4)
 
 
 def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
@@ -86,6 +92,7 @@ class ChunkingService:
         min_tokens_before_sim_split: Optional[int] = None,
         max_chunk_count: Optional[int] = None,
         title_as_chunk: Optional[bool] = None,
+        forensics: Any = None,
     ):
         self.max_tokens = max_tokens if max_tokens is not None else settings.CHUNK_MAX_TOKENS
         self.sim_threshold = (
@@ -99,14 +106,19 @@ class ChunkingService:
         self.max_chunk_count = (
             max_chunk_count
             if max_chunk_count is not None
-            else int(getattr(settings, "CHUNK_MAX_COUNT", 48) or 48)
+            else int(getattr(settings, "CHUNK_MAX_COUNT", 512) or 512)
         )
         self.title_as_chunk = (
             title_as_chunk
             if title_as_chunk is not None
             else bool(getattr(settings, "CHUNK_TITLE_AS_CHUNK", False))
         )
+        self.overlap_tokens = int(getattr(settings, "CHUNK_OVERLAP_TOKENS", 40) or 0)
+        self.min_tokens = int(getattr(settings, "CHUNK_MIN_TOKENS", 120) or 120)
+        self.force_cap = bool(getattr(settings, "CHUNK_FORCE_CAP", False))
         self.embed_fn = embed_fn
+        # Observation only — never affects control flow when None/disabled.
+        self.forensics = forensics
 
     def build(
         self,
@@ -116,13 +128,16 @@ class ChunkingService:
         if not elements:
             return [], [], {"adaptive": True, "section_count": 0}
 
+        fx = self.forensics
         parents: List[ParentNode] = []
         chunks: List[AdaptiveChunk] = []
+        # Per-chunk forensic provenance recorded at emission time (observation only).
+        emit_meta: List[Dict[str, Any]] = []
 
         current_parent: Optional[ParentNode] = None
         buffer: List[Tuple[ChunkType, str]] = []  # pending text/list pieces
 
-        def flush_buffer():
+        def flush_buffer(*, reason: str = "forced_flush", detail: str = ""):
             nonlocal buffer
             if not buffer:
                 return
@@ -130,10 +145,29 @@ class ChunkingService:
             kinds = {t for t, _ in buffer}
             if kinds == {"List"}:
                 merged_type = "List"
+            piece_types = [t for t, _ in buffer]
             text = "\n\n".join(c for _, c in buffer if c.strip())
+            n_pieces = len(buffer)
+            buf_tokens = estimate_tokens(text)
             buffer = []
             if not text.strip():
                 return
+            if fx is not None and getattr(fx, "enabled", False):
+                fx.record_split(
+                    reason,
+                    detail=detail or f"flush {n_pieces} buffer piece(s)",
+                    buffer_tokens_before=buf_tokens,
+                    section_title=current_parent.title if current_parent else None,
+                    element_type=merged_type,
+                )
+                if n_pieces > 1:
+                    fx.record_merge(
+                        "same_section_buffer_pack",
+                        detail=f"merged {n_pieces} triage pieces under section",
+                        chunks_merged=n_pieces,
+                        tokens_after=buf_tokens,
+                        section_title=current_parent.title if current_parent else None,
+                    )
             self._append_chunk(
                 chunks,
                 parents,
@@ -142,6 +176,19 @@ class ChunkingService:
                 merged_type,
                 text,
                 kind="merged" if len(text) > 0 else "text",
+            )
+            emit_meta.append(
+                {
+                    "reason_split": reason,
+                    "reason_merge": (
+                        "same_section_buffer_pack" if n_pieces > 1 else "single_piece"
+                    ),
+                    "element_types": piece_types,
+                    "paragraphs": sum(
+                        1 for t in piece_types if t in ("Text", "Other", "Title")
+                    ),
+                    "tables": sum(1 for t in piece_types if t == "Table"),
+                }
             )
 
         def ensure_default_parent():
@@ -163,7 +210,7 @@ class ChunkingService:
                 continue
 
             if t == "Title":
-                flush_buffer()
+                flush_buffer(reason="new_heading", detail=f"heading={content[:80]}")
                 section_idx = len(parents)
                 current_parent = ParentNode(
                     id=f"{document_id}_section_{section_idx}",
@@ -183,14 +230,31 @@ class ChunkingService:
                         content,
                         kind="title",
                     )
+                    emit_meta.append(
+                        {
+                            "reason_split": "new_heading",
+                            "reason_merge": "title_as_chunk",
+                            "element_types": ["Title"],
+                            "paragraphs": 0,
+                            "tables": 0,
+                        }
+                    )
                 else:
                     # Fold heading into the next body buffer so it isn't a solo map call
                     buffer.append(("Text", content))
                 continue
 
             if t == "Table":
-                flush_buffer()
+                flush_buffer(reason="table_boundary", detail="flush before atomic table")
                 ensure_default_parent()
+                if fx is not None and getattr(fx, "enabled", False):
+                    fx.record_split(
+                        "table_boundary",
+                        detail="atomic table chunk",
+                        incoming_tokens=estimate_tokens(content),
+                        section_title=current_parent.title if current_parent else None,
+                        element_type="Table",
+                    )
                 self._append_chunk(
                     chunks,
                     parents,
@@ -199,6 +263,15 @@ class ChunkingService:
                     "Table",
                     content,
                     kind="table",
+                )
+                emit_meta.append(
+                    {
+                        "reason_split": "table_boundary",
+                        "reason_merge": "atomic_table",
+                        "element_types": ["Table"],
+                        "paragraphs": 0,
+                        "tables": 1,
+                    }
                 )
                 continue
 
@@ -210,28 +283,90 @@ class ChunkingService:
 
             prev_text = buffer[-1][1]
             should_split = False
+            split_reason = ""
+            sim_val: Optional[float] = None
 
             tentative = "\n\n".join([c for _, c in buffer] + [content])
             tentative_tokens = estimate_tokens(tentative)
             if tentative_tokens > self.max_tokens:
                 should_split = True
+                split_reason = "max_token_threshold"
             else:
                 buf_tokens = estimate_tokens("\n\n".join(c for _, c in buffer))
                 if buf_tokens >= self.min_tokens_before_sim_split:
-                    sim = self._similarity(prev_text, content)
-                    if sim < self.sim_threshold:
+                    sim_val = self._similarity(prev_text, content)
+                    if sim_val < self.sim_threshold:
                         should_split = True
+                        split_reason = "semantic_similarity_drop"
 
             if should_split:
-                flush_buffer()
+                # Capture overlap from the buffer before flush (max-size splits).
+                overlap_prefix = ""
+                if self.overlap_tokens > 0 and buffer:
+                    joined = "\n\n".join(c for _, c in buffer)
+                    # Approx chars for overlap tokens
+                    take = max(0, int(self.overlap_tokens) * 4)
+                    if take > 0 and len(joined) > take:
+                        overlap_prefix = joined[-take:]
+                detail = split_reason
+                if split_reason == "semantic_similarity_drop" and sim_val is not None:
+                    detail = f"sim={sim_val:.3f} < threshold={self.sim_threshold}"
+                elif split_reason == "max_token_threshold":
+                    detail = f"tentative_tokens={tentative_tokens} > max={self.max_tokens}"
+                flush_buffer(reason=split_reason or "forced_flush", detail=detail)
+                if overlap_prefix:
+                    buffer.append(("Text", overlap_prefix))
+            else:
+                if fx is not None and getattr(fx, "enabled", False):
+                    fx.record_merge(
+                        "same_section_continue",
+                        detail="appending triage piece into buffer",
+                        tokens_before=estimate_tokens(
+                            "\n\n".join(c for _, c in buffer)
+                        ),
+                        section_title=current_parent.title if current_parent else None,
+                        similarity=sim_val,
+                    )
             buffer.append((t, content))
 
-        flush_buffer()
+        flush_buffer(reason="end_of_document", detail="final buffer flush")
 
         raw_count = len(chunks)
+        if fx is not None and getattr(fx, "enabled", False):
+            fx.semantic_group_count = raw_count
+            fx.section_count = len(parents)
+
         if self._needs_consolidate(chunks):
             chunks = self._consolidate(chunks, parents, document_id)
+            # Consolidation rebuilds chunk list; emit_meta no longer 1:1 — rebuild below.
+            emit_meta = []
         self._reindex(chunks, parents)
+
+        if fx is not None and getattr(fx, "enabled", False):
+            fx.packed_chunk_count = len(chunks)
+            fx.chunk_records = []
+            for i, ch in enumerate(chunks):
+                meta_i = emit_meta[i] if i < len(emit_meta) else {}
+                paras = max(1, (ch.content or "").count("\n\n") + 1) if ch.content else 0
+                is_table = ch.chunk_kind == "table" or ch.type == "Table"
+                fx.chunk_records.append(
+                    ChunkForensicRecord(
+                        chunk_index=i,
+                        section=ch.section_path,
+                        heading=ch.section_path,
+                        element_types=list(meta_i.get("element_types") or [ch.type]),
+                        paragraphs=int(meta_i.get("paragraphs") or paras),
+                        tables=int(meta_i.get("tables") or (1 if is_table else 0)),
+                        images=0,
+                        estimated_tokens=estimate_tokens(ch.content or ""),
+                        char_count=len(ch.content or ""),
+                        reason_split=meta_i.get("reason_split")
+                        or ("table_boundary" if is_table else "section_or_consolidate_pack"),
+                        reason_merge=meta_i.get("reason_merge")
+                        or ("atomic_table" if is_table else "packed"),
+                        content_preview=(ch.content or "")[:240],
+                    )
+                )
 
         meta = {
             "adaptive": True,
@@ -276,23 +411,64 @@ class ChunkingService:
 
         pack_limit = max(64, int(self.max_tokens))
         hard_cap = max(1, int(self.max_chunk_count))
+        fx = self.forensics
 
-        for _ in range(8):
+        for round_i in range(8):
+            before = len(chunks)
             packed = self._pack_once(chunks, document_id, pack_limit)
+            after = len(packed)
+            if fx is not None and getattr(fx, "enabled", False):
+                fx.consolidate_rounds.append(
+                    {
+                        "round": round_i,
+                        "pack_limit": pack_limit,
+                        "before": before,
+                        "after": after,
+                        "hard_cap": hard_cap,
+                    }
+                )
+                if after < before:
+                    fx.record_merge(
+                        "consolidate_pack",
+                        detail=f"round={round_i} pack_limit={pack_limit}",
+                        chunks_merged=before - after,
+                        tokens_before=before,
+                        tokens_after=after,
+                    )
             if len(packed) <= hard_cap:
                 return packed
             # Still too many — allow larger packs
             pack_limit = max(pack_limit + 1, int(pack_limit * 1.75))
             chunks = packed
             log.warning(
-                "ChunkingService: %s chunks exceed cap %s — repacking with max_tokens=%s",
+                "ChunkingService: %s chunks exceed soft cap %s — repacking with max_tokens=%s",
                 len(chunks),
                 hard_cap,
                 pack_limit,
             )
 
-        # Last resort: force-merge into hard_cap buckets (tables still atomic-ish)
-        return self._force_cap(chunks, document_id, hard_cap)
+        if self.force_cap:
+            if fx is not None and getattr(fx, "enabled", False):
+                fx.record_split(
+                    "force_cap",
+                    detail=f"forcing down to {hard_cap} from {len(chunks)}",
+                )
+            return self._force_cap(chunks, document_id, hard_cap)
+        # Soft mode for large docs: keep structure; hierarchy handles fan-in.
+        log.warning(
+            "ChunkingService: leaving %s chunks (cap=%s, force_cap=False) for hierarchical compile",
+            len(chunks),
+            hard_cap,
+        )
+        if fx is not None and getattr(fx, "enabled", False):
+            fx.record_split(
+                "soft_cap_leave",
+                detail=(
+                    f"leaving {len(chunks)} chunks above cap={hard_cap} "
+                    f"(force_cap=False; parent-boundary packing)"
+                ),
+            )
+        return chunks
 
     def _pack_once(
         self,

@@ -8,6 +8,7 @@ Queue claim uses row locking (Postgres FOR UPDATE SKIP LOCKED; SQLite exclusive 
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -125,7 +126,15 @@ def enqueue_job(
 
 
 def set_progress(job_id: str, progress: float, message: str) -> None:
-    status = JOB_STATUSES.get(job_id, {}).get("status") or job_status_mod.STATUS_PROCESSING
+    current = JOB_STATUSES.get(job_id) or {}
+    status = current.get("status") or job_status_mod.STATUS_PROCESSING
+    # Never reopen a finished job via a late progress tick.
+    if str(status) in (
+        job_status_mod.STATUS_COMPLETE,
+        job_status_mod.STATUS_ERROR,
+        job_status_mod.STATUS_CANCELLED,
+    ):
+        return
     upsert_job(job_id, progress=progress, message=message, status=status)
 
 
@@ -137,9 +146,11 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """
     Read job status.
 
-    When durable DB mode is on, always refresh from Postgres/SQLite so the API
-    process sees worker claim/progress updates (in-memory cache is per-process).
+    When durable DB mode is on, refresh from Postgres/SQLite so a separate API
+    process sees worker updates. In the embedded-worker process, never clobber a
+    fresher in-memory progress/message with a stale DB row (throttle window).
     """
+    mem = JOB_STATUSES.get(job_id)
     if _db_enabled():
         try:
             from src.db.models import JobModel
@@ -149,23 +160,54 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
             try:
                 row = db.get(JobModel, job_id)
                 if not row:
-                    return JOB_STATUSES.get(job_id)
+                    return mem
                 status = _row_to_status(row)
+                if mem and str(mem.get("status") or "") in (
+                    job_status_mod.STATUS_PROCESSING,
+                    job_status_mod.STATUS_PENDING,
+                ):
+                    try:
+                        mem_prog = float(mem.get("progress") or 0.0)
+                        db_prog = float(status.get("progress") or 0.0)
+                    except (TypeError, ValueError):
+                        mem_prog, db_prog = 0.0, 0.0
+                    # Prefer live worker cache when it is ahead of durable row
+                    if mem_prog >= db_prog and mem.get("message"):
+                        status["progress"] = mem_prog
+                        status["message"] = mem.get("message") or status.get("message")
+                        if mem.get("partial") is not None:
+                            status["partial"] = mem.get("partial")
+                        if mem.get("status"):
+                            status["status"] = mem.get("status")
                 JOB_STATUSES[job_id] = status
                 return status
             finally:
                 db.close()
         except Exception as e:
             log.error(f"Failed to load job {job_id} from DB: {e}")
-            return JOB_STATUSES.get(job_id)
+            return mem
 
-    return JOB_STATUSES.get(job_id)
+    return mem
 
 
 def touch_job_heartbeat(job_id: str, worker_id: str) -> None:
-    """Refresh job + worker heartbeats while processing."""
+    """Refresh job + worker heartbeats while processing.
+
+    Never downgrade a terminal job back to ``processing`` (that race left jobs
+    stuck at "Finalizing results..." forever while ``result_json`` was already saved).
+    """
     now = _now()
-    upsert_job(job_id, heartbeat_at=now, claimed_by=worker_id, status=job_status_mod.STATUS_PROCESSING)
+    current = JOB_STATUSES.get(job_id) or {}
+    status = str(current.get("status") or "")
+    if status in (
+        job_status_mod.STATUS_COMPLETE,
+        job_status_mod.STATUS_ERROR,
+        job_status_mod.STATUS_CANCELLED,
+    ):
+        return
+    # Heartbeat-only write: do not force status=processing if absent from cache;
+    # _persist path below still guards terminal rows in DB.
+    upsert_job(job_id, heartbeat_at=now, claimed_by=worker_id)
     try:
         upsert_worker_heartbeat(worker_id, status="busy", meta={"current_job_id": job_id})
     except Exception as e:
@@ -284,6 +326,67 @@ def claim_next_job(worker_id: str) -> Optional[Dict[str, Any]]:
         db.close()
 
 
+def release_orphaned_claims_for_worker(worker_id: str) -> int:
+    """
+    On worker process start, any ``processing`` job still claimed by this
+    worker_id cannot still be running (this process just booted). Requeue them
+    immediately so restarts do not leave the UI stuck for WORKER_CLAIM_TIMEOUT_SEC.
+    """
+    if not _db_enabled() or not (worker_id or "").strip():
+        return 0
+
+    from src.db.models import JobModel
+    from src.db.session import get_session
+
+    wid = str(worker_id).strip()
+    now = _now()
+    backoff = int(getattr(settings, "WORKER_RETRY_BACKOFF_SEC", 30) or 30)
+    db = get_session()
+    touched = 0
+    try:
+        rows: List[JobModel] = (
+            db.execute(
+                select(JobModel).where(
+                    JobModel.status == job_status_mod.STATUS_PROCESSING,
+                    JobModel.claimed_by == wid,
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for row in rows:
+            attempts = int(row.attempt_count or 0)
+            row.status = job_status_mod.STATUS_PENDING
+            row.message = (
+                "Requeued after worker restart (orphaned claim). "
+                "Previous attempt was interrupted mid-pipeline."
+            )
+            row.error_detail = "orphaned_claim_on_worker_start"
+            row.claimed_by = None
+            row.claimed_at = None
+            row.heartbeat_at = None
+            row.available_at = now + timedelta(seconds=backoff * max(attempts, 1))
+            # Keep progress for UI history; claim path resets when processing resumes.
+            row.updated_at = now
+            JOB_STATUSES.pop(row.id, None)
+            touched += 1
+            log.warning(
+                "Released orphaned claim job=%s worker=%s attempt=%s",
+                row.id,
+                wid,
+                attempts,
+            )
+        if touched:
+            db.commit()
+        return touched
+    except Exception as e:
+        db.rollback()
+        log.error(f"release_orphaned_claims_for_worker failed: {e}")
+        return 0
+    finally:
+        db.close()
+
+
 def reclaim_stale_jobs(
     *,
     stale_after_sec: Optional[int] = None,
@@ -364,6 +467,9 @@ def fail_or_retry_job(
 ) -> Dict[str, Any]:
     """On worker exception: retry (pending) or terminal error."""
     current = get_job(job_id) or {}
+    if str(current.get("status") or "") == job_status_mod.STATUS_CANCELLED:
+        clear_cancel_request(job_id)
+        return current
     attempts = int(current.get("attempt_count") or 0)
     max_att = int(settings.WORKER_MAX_ATTEMPTS)
     backoff = int(getattr(settings, "WORKER_RETRY_BACKOFF_SEC", 30) or 30)
@@ -513,7 +619,173 @@ def _row_to_status(row) -> Dict[str, Any]:
         status["available_at"] = row.available_at
     if getattr(row, "heartbeat_at", None) is not None:
         status["heartbeat_at"] = row.heartbeat_at
+    if getattr(row, "created_at", None) is not None:
+        status["created_at"] = row.created_at
+    if getattr(row, "updated_at", None) is not None:
+        status["updated_at"] = row.updated_at
+    if getattr(row, "completed_at", None) is not None:
+        status["completed_at"] = row.completed_at
     return status
+
+
+_CANCEL_LOCK = threading.Lock()
+_CANCEL_REQUESTS: set = set()
+
+
+def request_cancel(job_id: str) -> None:
+    with _CANCEL_LOCK:
+        _CANCEL_REQUESTS.add(str(job_id))
+
+
+def clear_cancel_request(job_id: str) -> None:
+    with _CANCEL_LOCK:
+        _CANCEL_REQUESTS.discard(str(job_id))
+
+
+def is_cancel_requested(job_id: str) -> bool:
+    with _CANCEL_LOCK:
+        if str(job_id) in _CANCEL_REQUESTS:
+            return True
+    cur = JOB_STATUSES.get(job_id) or {}
+    if str(cur.get("status") or "") == job_status_mod.STATUS_CANCELLED:
+        return True
+    # Durable check (cross-process cancel from API → worker)
+    if _db_enabled():
+        try:
+            from src.db.models import JobModel
+            from src.db.session import get_session
+
+            db = get_session()
+            try:
+                row = db.get(JobModel, job_id)
+                return bool(
+                    row is not None
+                    and str(row.status) == job_status_mod.STATUS_CANCELLED
+                )
+            finally:
+                db.close()
+        except Exception:
+            return False
+    return False
+
+
+def cancel_job(job_id: str, *, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """
+    Mark a pending/processing job cancelled so the worker can free the slot.
+
+    Already-terminal jobs are returned unchanged (idempotent).
+    """
+    current = get_job(job_id)
+    if not current:
+        return None
+    if user_id is not None and current.get("user_id") is not None:
+        if int(current["user_id"]) != int(user_id):
+            raise PermissionError("Not the job owner")
+
+    status = str(current.get("status") or "")
+    if status in (
+        job_status_mod.STATUS_COMPLETE,
+        job_status_mod.STATUS_ERROR,
+        job_status_mod.STATUS_CANCELLED,
+    ):
+        return current
+
+    request_cancel(job_id)
+    return upsert_job(
+        job_id,
+        status=job_status_mod.STATUS_CANCELLED,
+        progress=float(current.get("progress") or 0.0),
+        message="Cancelled by user. Worker slot freed.",
+        error_detail="cancelled_by_user",
+        claimed_by=None,
+        claimed_at=None,
+        heartbeat_at=None,
+        understanding="skipped",
+    )
+
+
+def list_jobs_for_user(
+    user_id: int,
+    *,
+    limit: int = 50,
+    include_terminal: bool = True,
+) -> List[Dict[str, Any]]:
+    """Persistent job history for the signed-in user (all sessions)."""
+    if not _db_enabled():
+        # Fallback: in-memory only
+        out = []
+        for jid, st in JOB_STATUSES.items():
+            if st.get("user_id") is not None and int(st["user_id"]) != int(user_id):
+                continue
+            if not include_terminal and str(st.get("status")) in (
+                job_status_mod.STATUS_COMPLETE,
+                job_status_mod.STATUS_ERROR,
+                job_status_mod.STATUS_CANCELLED,
+            ):
+                continue
+            out.append(dict(st))
+        out.sort(key=lambda x: str(x.get("updated_at") or x.get("job_id") or ""), reverse=True)
+        return out[: max(1, limit)]
+
+    from src.db.models import JobModel
+    from src.db.session import get_session
+
+    db = get_session()
+    try:
+        q = select(JobModel).where(JobModel.user_id == int(user_id))
+        if not include_terminal:
+            q = q.where(
+                JobModel.status.in_(
+                    [
+                        job_status_mod.STATUS_PENDING,
+                        job_status_mod.STATUS_PROCESSING,
+                    ]
+                )
+            )
+        q = q.order_by(JobModel.created_at.desc()).limit(max(1, min(200, int(limit))))
+        rows = db.execute(q).scalars().all()
+        return [_row_to_status(r) for r in rows]
+    finally:
+        db.close()
+
+
+def queue_snapshot_for_user(user_id: int) -> Dict[str, Any]:
+    """Worker occupancy + this user's active/queued jobs (for live UI)."""
+    workers = list_worker_heartbeats()
+    alive = [w for w in workers if w.get("alive")]
+    active = list_jobs_for_user(user_id, limit=30, include_terminal=False)
+    # Also surface any processing job claimed by a live worker (even other users' —
+    # only show filename-safe occupancy flag, not others' content)
+    busy_workers = []
+    for w in alive:
+        meta = w.get("meta") if isinstance(w.get("meta"), dict) else {}
+        # meta may use meta_json key depending on serializer
+        if not meta:
+            meta = w.get("meta_json") if isinstance(w.get("meta_json"), dict) else {}
+        cur = meta.get("current_job_id") if isinstance(meta, dict) else None
+        busy_workers.append(
+            {
+                "worker_id": w.get("worker_id"),
+                "status": w.get("status"),
+                "alive": True,
+                "current_job_id": cur,
+                "busy": bool(cur) or str(w.get("status") or "") == "busy",
+            }
+        )
+    return {
+        "alive_workers": len(alive),
+        "workers": busy_workers,
+        "worker_busy": any(b.get("busy") for b in busy_workers) or any(
+            str(j.get("status")) == job_status_mod.STATUS_PROCESSING for j in active
+        ),
+        "active_jobs": active,
+        "queued_count": sum(
+            1 for j in active if str(j.get("status")) == job_status_mod.STATUS_PENDING
+        ),
+        "processing_count": sum(
+            1 for j in active if str(j.get("status")) == job_status_mod.STATUS_PROCESSING
+        ),
+    }
 
 
 def _persist(job_id: str, current: Dict[str, Any], fields: Dict[str, Any]) -> None:
@@ -529,11 +801,39 @@ def _persist(job_id: str, current: Dict[str, Any], fields: Dict[str, Any]) -> No
             db.add(row)
 
         if "status" in current:
-            row.status = str(current["status"])
+            new_status = str(current["status"])
+            # Never let a late heartbeat / progress write reopen a finished job.
+            if (
+                row.status
+                in (
+                    job_status_mod.STATUS_COMPLETE,
+                    job_status_mod.STATUS_ERROR,
+                    job_status_mod.STATUS_CANCELLED,
+                )
+                and new_status == job_status_mod.STATUS_PROCESSING
+            ):
+                log.warning(
+                    "Job %s: ignoring status downgrade %s → %s (result already terminal)",
+                    job_id,
+                    row.status,
+                    new_status,
+                )
+            else:
+                row.status = new_status
         if "progress" in current and current["progress"] is not None:
             row.progress = float(current["progress"])
         if "message" in current:
-            row.message = current.get("message")
+            # Keep the terminal completion message if we refused a downgrade.
+            if not (
+                row.status
+                in (
+                    job_status_mod.STATUS_COMPLETE,
+                    job_status_mod.STATUS_ERROR,
+                    job_status_mod.STATUS_CANCELLED,
+                )
+                and str(current.get("status") or "") == job_status_mod.STATUS_PROCESSING
+            ):
+                row.message = current.get("message")
         if "understanding" in current:
             row.understanding = current.get("understanding")
         if "result" in current:

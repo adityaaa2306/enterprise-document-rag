@@ -5,7 +5,7 @@ A production-ready intelligent document processing system with carbon-aware comp
 ## Features
 
 - **Intelligent Document Processing**: Multi-agent system for document summarization
-- **Carbon-Aware Computing**: Optimizes model selection based on grid carbon intensity
+- **Carbon-Aware Computing**: Estimates operational CO₂e (Boundary A) via tokens × J/token × PUE × live Electricity Maps intensity; smart routing selects lighter models when safe. See [`backend/docs/CARBON_ACCOUNTING.md`](backend/docs/CARBON_ACCOUNTING.md).
 - **Speculative RAG**: Efficient retrieval-augmented generation with draft-verify architecture
 - **Real-time Dashboard**: Monitor processing metrics, carbon savings, and efficiency
 - **Modern UI**: Glassmorphism design with dark mode support

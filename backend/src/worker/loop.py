@@ -110,7 +110,17 @@ def run_worker_forever(
     else:
         log.info("Worker: embedded mode — reusing API process DB/Chroma/NIM clients")
 
-    job_store.upsert_worker_heartbeat(wid, status="idle", hostname=socket.gethostname())
+    # Restart recovery: same WORKER_ID often keeps a dead "processing" claim that
+    # blocks the queue until WORKER_CLAIM_TIMEOUT_SEC (e.g. mid-compile kill).
+    released = job_store.release_orphaned_claims_for_worker(wid)
+    if released:
+        log.warning(
+            "Worker %s: released %s orphaned processing claim(s) from prior process",
+            wid,
+            released,
+        )
+
+    job_store.upsert_worker_heartbeat(wid, status="idle", hostname=socket.gethostname(), meta={})
     last_hb = 0.0
     last_reclaim = 0.0
     shutdown_deadline: Optional[float] = None

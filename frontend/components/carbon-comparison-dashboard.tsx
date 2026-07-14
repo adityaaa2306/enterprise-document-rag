@@ -49,12 +49,56 @@ export interface CarbonSummaryCards {
   carbon_saved_gco2e: number
   reduction_percent: number
   heavy_model_baseline_gco2e: number
+  estimated_optimized_pipeline_emissions_g?: number
+  estimated_baseline_pipeline_emissions_g?: number
+  emissions_direction?: string | null
+  reporting_boundary_label?: string | null
+}
+
+export interface ChunkBreakdownRow {
+  chunk_index?: number
+  tier?: string
+  model?: string
+  input_tokens?: number
+  map_tokens?: number
+  energy_kwh?: number
+  co2e_g?: number
+  j_per_token?: number
 }
 
 export interface ChartBarRow {
   model: string
   estimated_gco2e: number
   is_ours?: boolean
+}
+
+export interface StageEmissions {
+  parsing_gco2e?: number
+  chunking_gco2e?: number
+  embedding_gco2e?: number
+  retrieval_gco2e?: number
+  routing_gco2e?: number
+  inference_gco2e?: number
+  verification_gco2e?: number
+  infrastructure_gco2e?: number
+  total_gco2e?: number
+}
+
+export interface RoutingImpact {
+  total_chunks?: number
+  light_chunks?: number
+  medium_chunks?: number
+  heavy_chunks?: number
+  escalated_chunks?: number
+  compile_calls?: number
+  co2e_vs_all_heavy_map_g_saved?: number
+  pipeline_co2e_g_saved_vs_baseline?: number
+}
+
+export interface UncertaintyBand {
+  enabled?: boolean
+  baseline?: { low_gco2e?: number; typical_gco2e?: number; high_gco2e?: number }
+  optimized?: { low_gco2e?: number; typical_gco2e?: number; high_gco2e?: number }
 }
 
 export interface CarbonBreakdown {
@@ -69,10 +113,24 @@ export interface CarbonBreakdown {
   actual_co2e_g?: number
   carbon_saved_g?: number
   reduction_percent?: number
+  emissions_direction?: string | null
+  estimated_baseline_pipeline_emissions_g?: number
+  estimated_optimized_pipeline_emissions_g?: number
+  reporting_boundary_label?: string | null
+  pue?: number
   grid_zone?: string | null
   grid_datetime?: string | null
   grid_updated_at?: string | null
   grid_source?: string | null
+  baseline_stages_gco2e?: StageEmissions | null
+  optimized_stages_gco2e?: StageEmissions | null
+  routing_impact?: RoutingImpact | null
+  uncertainty?: UncertaintyBand | null
+  assumptions_panel?: string | null
+  equation?: string | null
+  baseline_definition?: string | null
+  optimized_definition?: string | null
+  chunk_breakdown?: ChunkBreakdownRow[] | null
 }
 
 export interface CarbonComparisonProps {
@@ -104,7 +162,15 @@ function shortChartLabel(name: string) {
 const CHART_TICK = "#d4d4d8"
 const CHART_AXIS = "#71717a"
 const DEFAULT_METHODOLOGY =
-  "Frontier estimates = document baseline energy × relative model intensity × live Electricity Maps grid intensity. Our system uses measured workflow energy × the same intensity. Not exact lifecycle LCAs."
+  "Operational emissions (Boundary A): tokens × J/token × PUE × live Electricity Maps intensity. Estimates only — training and hardware manufacturing excluded."
+
+function sanitizeMethodology(text?: string | null): string {
+  const raw = (text || "").trim()
+  if (!raw || /chatgpt-class|4\.32\s*g|15\s*mg|chunk count\s*×/i.test(raw)) {
+    return DEFAULT_METHODOLOGY
+  }
+  return raw
+}
 
 export function CarbonComparisonDashboard({
   comparisonModels,
@@ -127,44 +193,68 @@ export function CarbonComparisonDashboard({
   const cardsData = rebuilt?.summary_cards ?? summaryCards
   const badgeList = rebuilt?.badges ?? badges
   const bars = rebuilt?.chart_bars ?? chartBars
-  const methodText = rebuilt?.methodology ?? methodology
+  const methodText = sanitizeMethodology(rebuilt?.methodology ?? methodology)
 
   if (!cardsData || !models?.length || !system) {
     return null
   }
 
+  const baselineEst =
+    cardsData.estimated_baseline_pipeline_emissions_g ??
+    cardsData.heavy_model_baseline_gco2e
+  const optimizedEst =
+    cardsData.estimated_optimized_pipeline_emissions_g ??
+    cardsData.actual_emissions_gco2e
+  const boundaryLabel =
+    cardsData.reporting_boundary_label ||
+    breakdown?.reporting_boundary_label ||
+    "Operational Emissions (Boundary A)"
+  const savedVal = Number(cardsData.carbon_saved_gco2e)
+  const reductionVal = Number(cardsData.reduction_percent)
+  const increased =
+    cardsData.emissions_direction === "increased" ||
+    breakdown?.emissions_direction === "increased" ||
+    savedVal < 0
+  const chunkRows =
+    rebuilt?.chunk_breakdown ||
+    breakdown?.chunk_breakdown ||
+    carbonData?.chunk_breakdown ||
+    []
+
   const cards = [
     {
-      title: "Actual Emissions",
-      value: fmtG(cardsData.actual_emissions_gco2e),
+      title: "Estimated Optimized Pipeline",
+      value: fmtG(optimizedEst),
       unit: "g CO₂e",
       icon: Leaf,
       accent: "text-green-400",
-      tip: "Optimized pipeline energy × live Electricity Maps intensity",
+      tip: "Per-chunk Light/Medium/Heavy routing + selected compile tier (Boundary A)",
     },
     {
-      title: "Carbon Saved",
-      value: fmtG(cardsData.carbon_saved_gco2e),
+      title: increased ? "Increased Emissions" : "Estimated Carbon Saved",
+      value: fmtG(Math.abs(savedVal)),
       unit: "g CO₂e",
       icon: TrendingDown,
-      accent: "text-emerald-400",
-      tip: "baseline CO₂e − actual CO₂e (clamped at 0)",
+      accent: increased ? "text-rose-400" : "text-emerald-400",
+      tip: increased
+        ? "Optimized emitted more than the naive frontier baseline (signed: baseline − optimized)"
+        : "Baseline − optimized (signed; negative shown as increased emissions)",
     },
     {
-      title: "Reduction",
-      value: `${Math.round(cardsData.reduction_percent)}`,
+      title: "Estimated Reduction",
+      value: `${reductionVal > 0 ? "+" : ""}${Math.round(reductionVal)}`,
       unit: "%",
       icon: Gauge,
-      accent: "text-blue-400",
-      tip: "(carbon saved / baseline CO₂e) × 100",
+      accent: increased ? "text-rose-400" : "text-blue-400",
+      tip: "(carbon saved / baseline) × 100 — may be negative",
     },
     {
-      title: "Baseline Emissions",
-      value: fmtG(cardsData.heavy_model_baseline_gco2e),
+      title: "Estimated Baseline Pipeline",
+      value: fmtG(baselineEst),
       unit: "g CO₂e",
       icon: Scale,
       accent: "text-amber-400",
-      tip: "Conventional single-model pipeline energy × Electricity Maps intensity",
+      tip: "Naive single-frontier (heavy) model for all map + compile — no smart routing",
     },
   ]
 
@@ -266,8 +356,8 @@ export function CarbonComparisonDashboard({
           <div className="px-6 py-4 border-b border-border/40">
             <h3 className="font-semibold">Model comparison</h3>
             <p className="text-sm text-muted-foreground">
-              Estimates from baseline energy × relative model intensity × Electricity Maps
-              grid intensity.
+              What if the entire document workflow ran on a single model? Same
+              map+compile token mass as the naive frontier baseline.
             </p>
           </div>
           <div className="overflow-x-auto">
@@ -283,7 +373,7 @@ export function CarbonComparisonDashboard({
               <tbody>
                 {models.map((row) => {
                   const savedPositive = row.saved_gco2e > 0
-                  const reductionClamped = Math.max(0, Math.min(100, row.reduction_percent))
+                  const reductionAbs = Math.min(100, Math.abs(row.reduction_percent))
                   return (
                   <tr
                     key={row.model}
@@ -293,25 +383,33 @@ export function CarbonComparisonDashboard({
                     <td className="px-6 py-3 tabular-nums">{fmtG(row.estimated_gco2e)}</td>
                     <td
                       className={`px-6 py-3 tabular-nums ${
-                        savedPositive ? "text-emerald-400" : "text-muted-foreground"
+                        savedPositive
+                          ? "text-emerald-400"
+                          : row.saved_gco2e < 0
+                            ? "text-rose-400"
+                            : "text-muted-foreground"
                       }`}
                     >
-                      {savedPositive ? fmtG(row.saved_gco2e) : "—"}
+                      {row.saved_gco2e === 0
+                        ? "—"
+                        : `${savedPositive ? "" : "−"}${fmtG(Math.abs(row.saved_gco2e))}`}
                     </td>
                     <td className="px-6 py-3">
                       <div className="flex items-center gap-3 min-w-[140px]">
                         <div className="flex-1 h-2 rounded-full bg-muted/60 overflow-hidden">
                           <motion.div
-                            className="h-full rounded-full bg-sky-500/80"
+                            className={`h-full rounded-full ${
+                              savedPositive ? "bg-sky-500/80" : "bg-rose-500/70"
+                            }`}
                             initial={{ width: 0 }}
                             animate={{
-                              width: `${reductionClamped}%`,
+                              width: `${reductionAbs}%`,
                             }}
                             transition={{ duration: 0.6, ease: "easeOut" }}
                           />
                         </div>
-                        <span className="tabular-nums w-12 text-right text-foreground/90">
-                          {savedPositive ? `${fmtG(row.reduction_percent, 1)}%` : "—"}
+                        <span className="tabular-nums w-14 text-right text-foreground/90">
+                          {`${fmtG(row.reduction_percent, 1)}%`}
                         </span>
                       </div>
                     </td>
@@ -400,13 +498,133 @@ export function CarbonComparisonDashboard({
         </Card>
 
         {breakdown ? (
-          <Card className="p-6 border-border/50 bg-card/50 space-y-4">
+          <Card className="p-6 border-border/50 bg-card/50 space-y-6">
             <div>
-              <h3 className="font-semibold">Workflow energy → CO₂e breakdown</h3>
-              <p className="text-sm text-muted-foreground">
-                CO₂e = Energy (kWh) × Electricity Maps grid intensity (gCO₂e/kWh)
+              <h3 className="font-semibold">Operational emissions breakdown (Boundary A)</h3>
+              <p className="text-sm text-muted-foreground mt-1">
+                {breakdown.equation ||
+                  "CO₂e = (Σ tokens × J/token × PUE) / 3.6e6 × Electricity Maps intensity"}
               </p>
+              <p className="text-xs text-muted-foreground mt-1">{boundaryLabel}</p>
             </div>
+
+            {breakdown.uncertainty?.enabled && breakdown.uncertainty.optimized ? (
+              <div className="rounded-lg border border-border/40 px-4 py-3 space-y-1">
+                <p className="text-sm font-medium">Estimated Optimized CO₂e — Typical</p>
+                <p className="text-2xl font-bold tabular-nums">
+                  {fmtG(breakdown.uncertainty.optimized.typical_gco2e, 1)} g
+                </p>
+                <p className="text-sm text-muted-foreground">
+                  Range{" "}
+                  {fmtG(breakdown.uncertainty.optimized.low_gco2e, 1)} –{" "}
+                  {fmtG(breakdown.uncertainty.optimized.high_gco2e, 1)} g
+                </p>
+              </div>
+            ) : null}
+
+            {breakdown.optimized_stages_gco2e ? (
+              <div>
+                <p className="text-sm font-medium mb-2">Optimized pipeline by stage</p>
+                <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3 text-sm">
+                  {(
+                    [
+                      ["Inference", breakdown.optimized_stages_gco2e.inference_gco2e],
+                      ["Embeddings", breakdown.optimized_stages_gco2e.embedding_gco2e],
+                      ["Parsing", breakdown.optimized_stages_gco2e.parsing_gco2e],
+                      ["Chunking", breakdown.optimized_stages_gco2e.chunking_gco2e],
+                      ["Retrieval", breakdown.optimized_stages_gco2e.retrieval_gco2e],
+                      ["Routing", breakdown.optimized_stages_gco2e.routing_gco2e],
+                      ["Infrastructure (PUE)", breakdown.optimized_stages_gco2e.infrastructure_gco2e],
+                      ["Total", breakdown.optimized_stages_gco2e.total_gco2e],
+                    ] as [string, number | undefined][]
+                  ).map(([label, value]) =>
+                    value != null ? (
+                      <div key={label} className="rounded-lg border border-border/40 px-3 py-2">
+                        <p className="text-xs text-muted-foreground">{label}</p>
+                        <p className="font-medium tabular-nums mt-0.5">{fmtG(value, 1)} g</p>
+                      </div>
+                    ) : null
+                  )}
+                </div>
+              </div>
+            ) : null}
+
+            {breakdown.routing_impact ? (
+              <div>
+                <p className="text-sm font-medium mb-2">Routing impact / model distribution</p>
+                <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3 text-sm">
+                  {(
+                    [
+                      ["Total Chunks", breakdown.routing_impact.total_chunks],
+                      ["Light Chunks", breakdown.routing_impact.light_chunks],
+                      ["Medium Chunks", breakdown.routing_impact.medium_chunks],
+                      ["Heavy Chunks", breakdown.routing_impact.heavy_chunks],
+                      ["Escalated Chunks", breakdown.routing_impact.escalated_chunks],
+                      ["Compile Calls", breakdown.routing_impact.compile_calls],
+                      [
+                        "Saved vs all-heavy map",
+                        breakdown.routing_impact.co2e_vs_all_heavy_map_g_saved != null
+                          ? `${fmtG(breakdown.routing_impact.co2e_vs_all_heavy_map_g_saved, 1)} g`
+                          : undefined,
+                      ],
+                    ] as [string, string | number | undefined][]
+                  ).map(([label, value]) =>
+                    value != null ? (
+                      <div key={label} className="rounded-lg border border-border/40 px-3 py-2">
+                        <p className="text-xs text-muted-foreground">{label}</p>
+                        <p className="font-medium tabular-nums mt-0.5">{String(value)}</p>
+                      </div>
+                    ) : null
+                  )}
+                </div>
+              </div>
+            ) : null}
+
+            {chunkRows && chunkRows.length > 0 ? (
+              <div>
+                <p className="text-sm font-medium mb-2">Chunk breakdown</p>
+                <div className="overflow-x-auto rounded-lg border border-border/40">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-left text-muted-foreground border-b border-border/40">
+                        <th className="px-3 py-2 font-medium">Chunk</th>
+                        <th className="px-3 py-2 font-medium">Tier</th>
+                        <th className="px-3 py-2 font-medium">Model</th>
+                        <th className="px-3 py-2 font-medium">Tokens</th>
+                        <th className="px-3 py-2 font-medium">Energy (kWh)</th>
+                        <th className="px-3 py-2 font-medium">CO₂e (g)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {chunkRows.map((row) => (
+                        <tr
+                          key={row.chunk_index}
+                          className="border-b border-border/20 hover:bg-white/[0.02]"
+                        >
+                          <td className="px-3 py-2 tabular-nums">{row.chunk_index}</td>
+                          <td className="px-3 py-2 capitalize">{row.tier}</td>
+                          <td className="px-3 py-2 font-mono text-xs truncate max-w-[180px]">
+                            {row.model}
+                          </td>
+                          <td className="px-3 py-2 tabular-nums">
+                            {row.map_tokens?.toLocaleString()}
+                          </td>
+                          <td className="px-3 py-2 tabular-nums">
+                            {row.energy_kwh != null
+                              ? Number(row.energy_kwh).toExponential(2)
+                              : "—"}
+                          </td>
+                          <td className="px-3 py-2 tabular-nums">
+                            {fmtG(row.co2e_g, 3)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ) : null}
+
             <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-4 text-sm">
               {[
                 ["Input Tokens", breakdown.input_tokens?.toLocaleString()],
@@ -414,13 +632,13 @@ export function CarbonComparisonDashboard({
                 ["Generated Tokens", breakdown.generated_tokens?.toLocaleString()],
                 ["Effective Tokens", breakdown.effective_tokens?.toLocaleString()],
                 [
-                  "Baseline Energy",
+                  "Estimated Baseline Energy",
                   breakdown.baseline_energy_kwh != null
                     ? `${Number(breakdown.baseline_energy_kwh).toFixed(4)} kWh`
                     : undefined,
                 ],
                 [
-                  "Optimized Energy",
+                  "Estimated Optimized Energy",
                   breakdown.optimized_energy_kwh != null
                     ? `${Number(breakdown.optimized_energy_kwh).toFixed(4)} kWh`
                     : undefined,
@@ -432,25 +650,43 @@ export function CarbonComparisonDashboard({
                     : undefined,
                 ],
                 [
-                  "Baseline CO₂",
-                  breakdown.baseline_co2e_g != null
-                    ? `${Number(breakdown.baseline_co2e_g).toFixed(1)} g`
+                  "PUE",
+                  breakdown.pue != null ? String(breakdown.pue) : undefined,
+                ],
+                [
+                  "Estimated Baseline Pipeline",
+                  (breakdown.estimated_baseline_pipeline_emissions_g ??
+                    breakdown.baseline_co2e_g) != null
+                    ? `${Number(
+                        breakdown.estimated_baseline_pipeline_emissions_g ??
+                          breakdown.baseline_co2e_g
+                      ).toFixed(1)} g`
                     : undefined,
                 ],
                 [
-                  "Actual CO₂",
-                  breakdown.actual_co2e_g != null
-                    ? `${Number(breakdown.actual_co2e_g).toFixed(1)} g`
+                  "Estimated Optimized Pipeline",
+                  (breakdown.estimated_optimized_pipeline_emissions_g ??
+                    breakdown.actual_co2e_g) != null
+                    ? `${Number(
+                        breakdown.estimated_optimized_pipeline_emissions_g ??
+                          breakdown.actual_co2e_g
+                      ).toFixed(1)} g`
                     : undefined,
                 ],
                 [
-                  "Carbon Saved",
+                  "Estimated Carbon Saved",
                   breakdown.carbon_saved_g != null
-                    ? `${Number(breakdown.carbon_saved_g).toFixed(1)} g`
+                    ? `${Number(breakdown.carbon_saved_g) >= 0 ? "" : "−"}${Math.abs(
+                        Number(breakdown.carbon_saved_g),
+                      ).toFixed(1)} g${
+                        breakdown.emissions_direction === "increased"
+                          ? " (increased)"
+                          : ""
+                      }`
                     : undefined,
                 ],
                 [
-                  "Reduction",
+                  "Estimated Reduction",
                   breakdown.reduction_percent != null
                     ? `${Number(breakdown.reduction_percent).toFixed(1)}%`
                     : undefined,
@@ -475,10 +711,24 @@ export function CarbonComparisonDashboard({
         <Accordion type="single" collapsible className="rounded-xl border border-border/50 px-4 bg-card/40">
           <AccordionItem value="methodology" className="border-none">
             <AccordionTrigger className="text-sm font-medium hover:no-underline">
-              Methodology
+              Carbon Calculation Methodology
             </AccordionTrigger>
-            <AccordionContent className="text-sm text-muted-foreground leading-relaxed pb-4">
-              {methodText || DEFAULT_METHODOLOGY}
+            <AccordionContent className="text-sm text-muted-foreground leading-relaxed pb-4 whitespace-pre-line space-y-3">
+              {breakdown?.baseline_definition ? (
+                <p>
+                  <span className="text-foreground font-medium">Baseline: </span>
+                  {breakdown.baseline_definition}
+                </p>
+              ) : null}
+              {breakdown?.optimized_definition ? (
+                <p>
+                  <span className="text-foreground font-medium">Optimized: </span>
+                  {breakdown.optimized_definition}
+                </p>
+              ) : null}
+              {sanitizeMethodology(
+                breakdown?.assumptions_panel || methodText || DEFAULT_METHODOLOGY,
+              )}
             </AccordionContent>
           </AccordionItem>
         </Accordion>

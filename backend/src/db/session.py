@@ -86,6 +86,9 @@ def init_engine(url: Optional[str] = None, *, echo: bool = False) -> Engine:
         def _sqlite_on_connect(dbapi_conn, connection_record):  # noqa: ARG001
             cursor = dbapi_conn.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
+            # WAL: readers (job-status polls) do not block writers (progress/heartbeat)
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=5000")
             cursor.close()
 
     _SessionLocal = sessionmaker(

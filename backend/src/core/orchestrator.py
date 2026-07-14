@@ -1,9 +1,9 @@
 """
-Agentic Orchestrator — Capability-first routing pipeline.
+Agentic Orchestrator — Adaptive hierarchical carbon-aware pipeline.
 
-Upload → Triage → Feature Extraction → CRE → Intelligent Router →
-Map Summarize → Quality Validation → (+1 tier escalate if needed) →
-Compile → Store → Carbon/Telemetry
+Upload → Triage → Adaptive Chunking → Doc+Chunk Features → CRE →
+Per-chunk Router → Map (Light/Medium/Heavy) → QVA → Escalate ladder →
+Regional Hierarchy → Medium Compile → (Heavy if needed) → Store → Carbon
 """
 from __future__ import annotations
 
@@ -15,10 +15,12 @@ from typing import TypedDict, List, Dict, Any, Optional
 from langgraph.graph import StateGraph, END
 
 from src.agents import triage, models, feature_extraction, quality_validation
+from src.agents import chunk_features as chunk_features_mod
+from src.agents import summarization_agents
 from src.memory import storage
 from src.memory.document_ids import align_chunks_to_document_id
 from src.chunking import ChunkingService
-from src.core import scheduler, cre, intelligent_router
+from src.core import scheduler, cre, intelligent_router, chunk_router, hierarchy
 from src.core.config import settings
 from src.core import job_status as job_status_mod
 from src.monitoring import metrics, routing_telemetry
@@ -42,6 +44,31 @@ log = logging.getLogger(__name__)
 
 # Backward-compatible alias — durable when PERSIST_JOBS_TO_DB is enabled
 JOB_STATUSES = job_store.JOB_STATUSES
+
+_TIER_ORDER = ["light", "medium", "heavy"]
+
+
+def _next_tier(tier: str) -> Optional[str]:
+    t = (tier or "medium").lower()
+    if t == "large":
+        t = "heavy"
+    try:
+        i = _TIER_ORDER.index(t)
+    except ValueError:
+        return "heavy"
+    if i >= len(_TIER_ORDER) - 1:
+        return None
+    return _TIER_ORDER[i + 1]
+
+
+def _models_for_tier(tier: str, decision: Dict[str, Any]) -> List[str]:
+    if tier == (decision.get("tier") or "") and decision.get("fallbacks"):
+        return list(decision["fallbacks"])
+    if tier == "light":
+        return list(settings.light_models())
+    if tier == "heavy":
+        return list(settings.heavy_models())
+    return list(settings.medium_models())
 
 
 class AgentState(TypedDict, total=False):
@@ -71,12 +98,40 @@ class AgentState(TypedDict, total=False):
     job_started_ms: float
     triage_meta: Dict[str, Any]
     chunk_parents: List[Any]
+    # Adaptive pipeline
+    chunk_features: List[Dict[str, Any]]
+    chunk_routing: List[Dict[str, Any]]
+    routing_distribution: Dict[str, Any]
+    hierarchy: Dict[str, Any]
+    agent_telemetry: List[Dict[str, Any]]
+    carbon_budget_g: float
+    carbon_spent_g: float
+    carbon_remaining_g: float
+    predicted_final_carbon_g: float
+    map_checkpoint: Dict[str, Any]
+    compile_meta: Dict[str, Any]
+    # Pipeline intelligence (capability + strategy + explainability)
+    pipeline_intelligence: Dict[str, Any]
     # Diagnostic only — stage + per-chunk timings
     ingestion_latency: Dict[str, Any]
+    # Indices re-summarized in the last escalate step (incremental QVA)
+    last_escalated_indices: List[int]
 
 
-def _set_progress(job_id: str, progress: float, message: str) -> None:
-    job_store.set_progress(job_id, progress, message)
+def _set_progress(
+    job_id: str,
+    progress: float,
+    message: str,
+    *,
+    force: bool = False,
+) -> None:
+    """Throttled DB progress writes; milestones use force=True."""
+    try:
+        from src.perf.progress import set_progress_throttled
+
+        set_progress_throttled(job_id, progress, message, force=force)
+    except Exception:
+        job_store.set_progress(job_id, progress, message)
 
 
 def _get_latency(state: AgentState) -> IngestionLatencyTracker:
@@ -87,14 +142,20 @@ def _get_latency(state: AgentState) -> IngestionLatencyTracker:
     lat = IngestionLatencyTracker(job_id=state.get("job_id") or "")
     if isinstance(raw, dict):
         lat.stages.update(raw.get("stages_ms") or {})
+        lat.stage_detail.update(raw.get("stage_detail") or {})
         lat.meta.update(raw.get("meta") or {})
         lat.chunk_calls = list(raw.get("chunk_calls") or [])
         lat.pool_samples = list(raw.get("pool_samples") or [])
         lat._peak_active = int(raw.get("pool_peak_active") or 0)
+        lat._model_calls = int(raw.get("_model_calls") or 0)
         # Restore monotonic origin from elapsed_so_far so total_ms stays correct
         elapsed = raw.get("_elapsed_so_far_ms")
         if elapsed is not None:
             lat._t0 = time.perf_counter() - (float(elapsed) / 1000.0)
+        cpu0 = raw.get("_cpu0")
+        if cpu0 is not None:
+            # Keep relative CPU accounting approximate across node rebuilds
+            lat._cpu0 = float(cpu0)
     return lat
 
 
@@ -130,7 +191,7 @@ def triage_document(state: AgentState) -> Dict[str, Any]:
     job_id = state["job_id"]
     document_id = state.get("document_id") or job_id
     log.info(f"Job {job_id}: [2] Triaging document...")
-    _set_progress(job_id, 12.0, "Triage: analyzing document layout...")
+    _set_progress(job_id, 12.0, "Triage: analyzing document layout...", force=True)
     lat = _get_latency(state)
 
     with lat.stage(STAGE_TRIAGE):
@@ -149,7 +210,7 @@ def triage_document(state: AgentState) -> Dict[str, Any]:
         chunk_parents: List[Any] = []
 
         if settings.USE_ADAPTIVE_CHUNKING:
-            _set_progress(job_id, 14.0, "Adaptive chunking...")
+            _set_progress(job_id, 13.0, "Adaptive chunking...", force=True)
             embed_fn = None
             # Optional NIM similarity; fall back to lexical inside ChunkingService
             if models.get_nim_client() is not None:
@@ -157,9 +218,58 @@ def triage_document(state: AgentState) -> Dict[str, Any]:
                     embed_fn = models.embed_texts
                 except Exception:
                     embed_fn = None
-            chunks, parents, meta = ChunkingService(embed_fn=embed_fn).build(
-                raw_chunks, document_id=document_id
-            )
+            forensics = None
+            try:
+                from src.monitoring.chunking_forensics import (
+                    ChunkingForensics,
+                    default_forensics_path,
+                    forensics_enabled_from_env,
+                )
+
+                if forensics_enabled_from_env():
+                    forensics = ChunkingForensics(enabled=True, job_id=job_id)
+                    forensics.raw_block_count = len(raw_chunks)
+                    from collections import Counter
+
+                    forensics.element_counts = Counter(
+                        str(getattr(c, "type", "Other")) for c in raw_chunks
+                    )
+            except Exception as fe:
+                log.warning("Job %s: forensics init skipped: %s", job_id, fe)
+                forensics = None
+
+            if bool(getattr(settings, "USE_STRUCTURE_PARSER", True)):
+                from src.structure.pipeline import DocumentStructurePipeline
+
+                _set_progress(
+                    job_id, 14.0, "Parsing document structure...", force=True
+                )
+                chunks, parents, meta = DocumentStructurePipeline(
+                    embed_fn=embed_fn
+                ).run(raw_chunks, document_id=document_id)
+            else:
+                chunks, parents, meta = ChunkingService(
+                    embed_fn=embed_fn, forensics=forensics
+                ).build(raw_chunks, document_id=document_id)
+            if forensics is not None:
+                try:
+                    # Mirror structure diagnostics into forensics blob when present
+                    sd = (meta or {}).get("structure_diagnostics") or {}
+                    if sd:
+                        forensics.extras["structure_diagnostics"] = sd
+                        forensics.packed_chunk_count = int(
+                            meta.get("chunk_count") or len(chunks)
+                        )
+                        forensics.semantic_group_count = int(
+                            meta.get("semantic_sections") or 0
+                        )
+                        forensics.section_count = int(meta.get("section_count") or 0)
+                    path = forensics.save(default_forensics_path(job_id))
+                    log.info("Job %s: chunking forensics written to %s", job_id, path)
+                    meta = dict(meta)
+                    meta["forensics_path"] = path
+                except Exception as fe:
+                    log.warning("Job %s: forensics save failed: %s", job_id, fe)
             chunk_parents = parents
             triage_meta.update(meta)
             triage_meta["raw_triage_chunks"] = len(raw_chunks)
@@ -186,11 +296,12 @@ def triage_document(state: AgentState) -> Dict[str, Any]:
 
 def extract_features_node(state: AgentState) -> Dict[str, Any]:
     job_id = state["job_id"]
-    log.info(f"Job {job_id}: [3] Feature Extraction Agent...")
+    log.info(f"Job {job_id}: [3] Feature Extraction (document + per-chunk)...")
     _set_progress(job_id, 20.0, "Extracting capability features...")
     lat = _get_latency(state)
 
     triage_meta = state.get("triage_meta") or {"strategy": settings.TRIAGE_STRATEGY}
+    per_chunk: List[Dict[str, Any]] = []
     with lat.stage(STAGE_FEATURE_EXTRACT):
         try:
             features = feature_extraction.extract_features(state["chunks"], triage_meta)
@@ -200,7 +311,6 @@ def extract_features_node(state: AgentState) -> Dict[str, Any]:
                 (features or {}).get("classifier_method"),
             )
         except Exception as e:
-            # Optional metadata — never leave the job stuck; continue with defaults.
             log.warning(
                 "Job %s: feature extraction failed (%s) → using default metadata",
                 job_id,
@@ -214,28 +324,134 @@ def extract_features_node(state: AgentState) -> Dict[str, Any]:
             features = feature_extraction.default_features(
                 state["chunks"], triage_meta, reason=type(e).__name__
             )
+        try:
+            per_chunk = chunk_features_mod.extract_chunk_features(state["chunks"])
+            chunk_features_mod.attach_features_to_chunks(state["chunks"], per_chunk)
+        except Exception as e:
+            log.warning("Job %s: chunk feature extraction failed: %s", job_id, e)
+            per_chunk = []
     lat.add_meta(
         feature_classifier=(features or {}).get("classifier_method"),
         document_type=(features or {}).get("document_type"),
+        chunk_feature_count=len(per_chunk),
     )
-    return {"features": features, "ingestion_latency": _persist_latency(lat)}
+    return {
+        "features": features,
+        "chunk_features": per_chunk,
+        "ingestion_latency": _persist_latency(lat),
+    }
+
+
+def plan_pipeline(state: AgentState) -> Dict[str, Any]:
+    """Document capability analysis + adaptive strategy selection (pre-map)."""
+    job_id = state["job_id"]
+    if not bool(getattr(settings, "PIPELINE_INTELLIGENCE_ENABLED", True)):
+        return {}
+    log.info("Job %s: [3b] Pipeline intelligence — capability + strategy", job_id)
+    _set_progress(job_id, 24.0, "Analyzing document capability & selecting strategy...")
+    lat = _get_latency(state)
+    from src.core.pipeline_intelligence import plan_pipeline_intelligence
+
+    intensity = float((state.get("features") or {}).get("grid_intensity") or 0) or float(
+        getattr(settings, "LOCAL_GRID_INTENSITY", 700) or 700
+    )
+    with lat.stage("plan_pipeline_ms"):
+        intel = plan_pipeline_intelligence(
+            chunks=list(state.get("chunks") or []),
+            features=dict(state.get("features") or {}),
+            chunk_features=list(state.get("chunk_features") or []),
+            triage_meta=state.get("triage_meta"),
+            chunk_parents=state.get("chunk_parents"),
+            job_mode=state.get("job_mode") or "automatic",
+            carbon_intensity=intensity,
+        )
+    strat = (intel or {}).get("strategy") or {}
+    lat.add_meta(
+        strategy_id=strat.get("strategy_id"),
+        document_scale=(intel.get("capability_profile") or {}).get("document_scale"),
+        map_mode=strat.get("map_mode"),
+        compile_depth=strat.get("compile_depth_label"),
+    )
+    log.info(
+        "Job %s: strategy=%s scale=%s map_mode=%s compile=%s",
+        job_id,
+        strat.get("strategy_id"),
+        (intel.get("capability_profile") or {}).get("document_scale"),
+        strat.get("map_mode"),
+        strat.get("compile_depth_label"),
+    )
+    return {
+        "pipeline_intelligence": intel,
+        "ingestion_latency": _persist_latency(lat),
+    }
 
 
 def cre_and_route(state: AgentState) -> Dict[str, Any]:
     job_id = state["job_id"]
     mode = (state.get("job_mode") or "automatic").lower()
-    log.info(f"Job {job_id}: [4] CRE + Intelligent Router (preference={mode})...")
+    log.info(f"Job {job_id}: [4] CRE + Adaptive chunk router (preference={mode})...")
     _set_progress(job_id, 28.0, "Computing capability requirement & routing...")
     lat = _get_latency(state)
+
+    budget_g = float(getattr(settings, "CARBON_BUDGET_G", 40.0) or 40.0)
+    budget_enabled = bool(getattr(settings, "CARBON_BUDGET_ENABLED", True))
+    intel = state.get("pipeline_intelligence") or {}
+    strategy = dict(intel.get("strategy") or {})
+    if strategy.get("carbon_budget_g"):
+        budget_g = float(strategy["carbon_budget_g"])
+    intensity = float((state.get("features") or {}).get("grid_intensity") or 0) or float(
+        getattr(settings, "LOCAL_GRID_INTENSITY", 700) or 700
+    )
 
     with lat.stage(STAGE_CRE_ROUTE):
         cre_result = cre.compute_crs(state["features"])
         decision = intelligent_router.route(cre_result, state["features"], mode=mode)
 
+        chunk_feats = list(state.get("chunk_features") or [])
+        if not chunk_feats and state.get("chunks"):
+            chunk_feats = chunk_features_mod.extract_chunk_features(state["chunks"])
+
+        if bool(getattr(settings, "ADAPTIVE_CHUNK_ROUTING", True)) and chunk_feats:
+            chunk_decisions = chunk_router.route_chunks(
+                chunk_feats,
+                cre_result=cre_result.to_dict(),
+                routing_decision=decision.to_dict(),
+                carbon_remaining_g=budget_g if budget_enabled else None,
+                budget_enabled=budget_enabled,
+                strategy=strategy,
+                carbon_intensity=intensity,
+            )
+        else:
+            chunk_decisions = [
+                chunk_router.ChunkRouteDecision(
+                    chunk_index=i,
+                    tier=decision.tier,
+                    model=decision.selected_model,
+                    reason=f"Job-level tier={decision.tier}",
+                    expected_quality=0.95,
+                    expected_carbon_g=0.18,
+                    expected_latency_ms=1600,
+                )
+                for i in range(len(state.get("chunks") or []))
+            ]
+        dist = chunk_router.routing_distribution(chunk_decisions)
+        predicted = float(dist.get("predicted_carbon_g") or 0.0)
+
+        # Enrich intelligence report with routing mix
+        if intel:
+            from src.core.pipeline_intelligence import enrich_report_after_run
+
+            intel = enrich_report_after_run(
+                intel,
+                routing_distribution=dist,
+                cre_result=cre_result.to_dict(),
+            )
+
     routing_summary = (
         f"tier={decision.tier} model={decision.selected_model} "
         f"crs={cre_result.crs:.3f} min_tier={cre_result.min_tier} "
-        f"compile={decision.compile_tier} reason={decision.reason_summary}"
+        f"compile={decision.compile_tier} reason={decision.reason_summary} "
+        f"routes=L{dist.get('light',0)}/M{dist.get('medium',0)}/H{dist.get('heavy',0)}"
     )
     lat.add_meta(
         routing_summary=routing_summary,
@@ -246,6 +462,7 @@ def cre_and_route(state: AgentState) -> Dict[str, Any]:
         compile_tier=decision.compile_tier,
         fallbacks=list(decision.fallbacks or []),
         cre_route_ms=lat.stages.get(STAGE_CRE_ROUTE),
+        routing_distribution=dist,
     )
     log.info(
         "Job %s: routing decision in %.1fms → %s",
@@ -256,6 +473,14 @@ def cre_and_route(state: AgentState) -> Dict[str, Any]:
     return {
         "cre_result": cre_result.to_dict(),
         "routing_decision": decision.to_dict(),
+        "chunk_features": chunk_feats,
+        "chunk_routing": [d.to_dict() for d in chunk_decisions],
+        "routing_distribution": dist,
+        "carbon_budget_g": budget_g,
+        "carbon_spent_g": 0.0,
+        "carbon_remaining_g": budget_g,
+        "predicted_final_carbon_g": predicted,
+        "pipeline_intelligence": intel or state.get("pipeline_intelligence"),
         "ingestion_latency": _persist_latency(lat),
     }
 
@@ -263,115 +488,267 @@ def cre_and_route(state: AgentState) -> Dict[str, Any]:
 def map_summarize_routed(state: AgentState) -> Dict[str, Any]:
     job_id = state["job_id"]
     decision = state["routing_decision"]
-    tier = decision["tier"]
-    chain = decision.get("fallbacks") or [decision["selected_model"]]
+    default_tier = decision["tier"]
+    default_chain = decision.get("fallbacks") or [decision["selected_model"]]
     lat = _get_latency(state)
+    routes = {
+        int(r.get("chunk_index", i)): r
+        for i, r in enumerate(state.get("chunk_routing") or [])
+    }
 
-    # ONE-SHOT status at stage entry (not a heartbeat). Chunk progress updates
-    # only fire when as_completed yields — so a long first NIM call leaves this
-    # message unchanged for minutes.
-    log.info(f"Job {job_id}: [5] Map summarize with tier={tier} model={chain[0]}")
-    _set_progress(job_id, 35.0, f"Summarizing chunks with {tier} tier...")
+    log.info("Job %s: [5] Adaptive map summarize (per-chunk tiers)", job_id)
+    _set_progress(job_id, 35.0, "Summarizing chunks with adaptive routing...", force=True)
 
     chunks = state["chunks"]
     total = state["total_chunks"]
     summaries: List[str] = [""] * len(chunks)
-    max_workers = max(1, int(getattr(settings, "MAP_MAX_WORKERS", 3) or 3))
-    lat.add_meta(map_max_workers=max_workers, map_tier=tier, map_model_chain=list(chain))
-
+    agent_telemetry: List[Dict[str, Any]] = list(state.get("agent_telemetry") or [])
+    checkpoint = dict(state.get("map_checkpoint") or {})
+    done_set = set(int(x) for x in (checkpoint.get("completed_indices") or []))
+    max_workers = max(1, int(settings.effective_map_max_workers()))
+    intensity = float((state.get("features") or {}).get("grid_intensity") or 500.0)
+    lat.add_meta(
+        map_max_workers=max_workers,
+        adaptive_chunk_routing=True,
+        embedded_worker=bool(getattr(settings, "RUN_EMBEDDED_WORKER", False)),
+    )
     submit_times: Dict[int, float] = {}
     stage_t0 = time.perf_counter()
+    carbon_spent = float(state.get("carbon_spent_g") or 0.0)
+
+    # Overlap store embeddings with map/validate/compile (source text is immutable)
+    if bool(getattr(settings, "ENABLE_EMBED_PREFETCH", True)):
+        try:
+            from src.perf.prefetch import start_embed_prefetch
+
+            start_embed_prefetch(job_id, chunks)
+        except Exception as e:
+            log.debug("embed prefetch skip: %s", e)
 
     def _run(idx_chunk):
         idx, chunk = idx_chunk
+        route = routes.get(idx) or {}
+        tier = str(route.get("tier") or default_tier)
+        chain = _models_for_tier(tier, decision) or default_chain
         queue_ms = (time.perf_counter() - submit_times[idx]) * 1000.0
-        active = lat.worker_enter()
-        log.info(
-            "ingest_pool job_id=%s event=worker_enter chunk=%s active=%s/%s queue_ms=%.1f",
-            job_id,
-            idx,
-            active,
-            max_workers,
-            queue_ms,
-        )
-        call_meta: Dict[str, Any] = {}
+        lat.worker_enter()
         try:
-            text = models.run_tier_summarizer(
+            result = summarization_agents.run_summarization_agent(
                 chunk.content,
                 state,
                 tier=tier,
                 model_ids=chain,
-                call_meta=call_meta,
+                grid_intensity=intensity,
             )
-            success = bool(call_meta.get("success", True)) and not str(text).startswith(
-                ("Error:", "Summary generation failed")
-            )
-            if "success" not in call_meta:
-                call_meta["success"] = success
             lat.record_chunk_call(
                 {
                     "chunk_index": idx,
                     "tier": tier,
-                    "model_id": call_meta.get("model_id") or chain[0],
+                    "model_id": result.model_id or (chain[0] if chain else None),
                     "queue_ms": round(queue_ms, 1),
-                    "call_ms": round(float(call_meta.get("call_ms") or 0.0), 1),
-                    "success": bool(call_meta.get("success")),
-                    "retry_count": int(call_meta.get("retry_count") or 0),
-                    "attempt_count": int(call_meta.get("attempt_count") or 0),
-                    "http_status": call_meta.get("http_status"),
-                    "attempts": call_meta.get("attempts") or [],
+                    "call_ms": round(result.latency_ms, 1),
+                    "success": result.success,
+                    "retry_count": 0,
+                    "attempt_count": 1,
+                    "http_status": None,
+                    "attempts": [],
                     "phase": "map",
+                    "route_reason": route.get("reason"),
+                    "carbon_estimate_g": result.carbon_estimate_g,
                 }
             )
-            return idx, text
+            return idx, result
         finally:
-            active_after = lat.worker_exit()
-            log.info(
-                "ingest_pool job_id=%s event=worker_exit chunk=%s active=%s/%s",
-                job_id,
-                idx,
-                active_after,
-                max_workers,
-            )
+            lat.worker_exit()
 
     with lat.stage(STAGE_MAP_SUMMARIZE):
+        pending = [(i, c) for i, c in enumerate(chunks) if i not in done_set]
+        prev = checkpoint.get("summaries") or []
+        for i in done_set:
+            if 0 <= i < len(summaries) and i < len(prev):
+                summaries[i] = prev[i]
+        # Per-call worst case: retries × models × read timeout (+ cushion).
+        nim_read = float(getattr(settings, "NIM_HTTP_TIMEOUT_SEC", 90.0) or 90.0)
+        nim_retries = max(1, int(getattr(settings, "NIM_TRANSIENT_RETRIES", 2) or 2))
+        chain_len = max(1, len(default_chain or [1]))
+        per_future_timeout = max(120.0, nim_read * nim_retries * chain_len + 30.0)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for i, c in enumerate(chunks):
+            future_to_idx = {}
+            for i, c in pending:
                 submit_times[i] = time.perf_counter()
-                futures.append(executor.submit(_run, (i, c)))
-            done = 0
-            for fut in concurrent.futures.as_completed(futures):
-                idx, text = fut.result()
-                summaries[idx] = text
-                done += 1
-                progress = 35.0 + (done / max(total, 1)) * 25.0
-                _set_progress(job_id, progress, f"Summarizing... ({done}/{total})")
+                fut = executor.submit(_run, (i, c))
+                future_to_idx[fut] = i
+            done = len(done_set)
+            pending_futs = set(future_to_idx.keys())
+            while pending_futs:
+                finished, pending_futs = concurrent.futures.wait(
+                    pending_futs,
+                    timeout=15.0,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                # Abandon futures that have exceeded wall-clock budget since submit.
+                # cancel() cannot kill a running NIM thread, but we stop waiting on it
+                # so map can finish and the UI is not stuck at N-1 forever.
+                timed_out = [
+                    fut
+                    for fut in list(pending_futs)
+                    if (time.perf_counter() - submit_times.get(future_to_idx.get(fut, -1), stage_t0))
+                    >= per_future_timeout
+                ]
+                for fut in timed_out:
+                    idx = future_to_idx.get(fut, -1)
+                    fut.cancel()
+                    pending_futs.discard(fut)
+                    if idx < 0 or idx in done_set:
+                        continue
+                    log.error(
+                        "Job %s: map chunk %s exceeded %.0fs — marking empty",
+                        job_id,
+                        idx,
+                        per_future_timeout,
+                    )
+                    summaries[idx] = ""
+                    agent_telemetry.append(
+                        {
+                            "chunk_index": idx,
+                            "phase": "map",
+                            "success": False,
+                            "error": f"map_future_timeout_{per_future_timeout:.0f}s",
+                        }
+                    )
+                    done_set.add(idx)
+                    done += 1
+                    _set_progress(
+                        job_id,
+                        35.0 + (done / max(total, 1)) * 25.0,
+                        f"Summarizing... ({done}/{total})",
+                    )
+                if not finished:
+                    # Heartbeat so the UI does not look frozen on a slow NIM call.
+                    _set_progress(
+                        job_id,
+                        35.0 + (done / max(total, 1)) * 25.0,
+                        f"Summarizing... ({done}/{total}) — waiting on model...",
+                    )
+                    continue
+                for fut in finished:
+                    idx = future_to_idx.get(fut, -1)
+                    try:
+                        idx, result = fut.result(timeout=0)
+                    except Exception as e:
+                        log.error("Job %s: map chunk %s failed: %s", job_id, idx, e)
+                        if idx >= 0:
+                            summaries[idx] = ""
+                            agent_telemetry.append(
+                                {
+                                    "chunk_index": idx,
+                                    "phase": "map",
+                                    "success": False,
+                                    "error": str(e)[:300],
+                                }
+                            )
+                            done_set.add(idx)
+                        done += 1
+                        _set_progress(
+                            job_id,
+                            35.0 + (done / max(total, 1)) * 25.0,
+                            f"Summarizing... ({done}/{total})",
+                        )
+                        continue
+                    summaries[idx] = result.summary
+                    agent_telemetry.append(
+                        result.to_dict() | {"chunk_index": idx, "phase": "map"}
+                    )
+                    carbon_spent += float(result.carbon_estimate_g or 0.0)
+                    done_set.add(idx)
+                    done += 1
+                    progress = 35.0 + (done / max(total, 1)) * 25.0
+                    _set_progress(job_id, progress, f"Summarizing... ({done}/{total})")
+                    # Stream partial chunk completions for UI (Phase 13)
+                    if done == 1 or done == total or done % max(1, total // 8) == 0:
+                        try:
+                            job_store.JOB_STATUSES.setdefault(job_id, {})
+                            job_store.JOB_STATUSES[job_id]["partial"] = {
+                                "chunks_done": done,
+                                "chunks_total": total,
+                                "latest_chunk_index": idx,
+                                "latest_summary_preview": (result.summary or "")[:240],
+                            }
+                        except Exception:
+                            pass
 
-    lat.add_meta(
-        map_wall_ms=round((time.perf_counter() - stage_t0) * 1000.0, 1),
-        map_first_complete_note=(
-            "UI stays on 'Summarizing chunks with {tier} tier...' until the first "
-            "future completes; that message is set once at stage start, not a heartbeat."
-        ),
-    )
-    return {"summaries": summaries, "ingestion_latency": _persist_latency(lat)}
+    budget = float(state.get("carbon_budget_g") or settings.CARBON_BUDGET_G)
+    lat.add_meta(map_wall_ms=round((time.perf_counter() - stage_t0) * 1000.0, 1))
+    return {
+        "summaries": summaries,
+        "agent_telemetry": agent_telemetry,
+        "carbon_spent_g": round(carbon_spent, 4),
+        "carbon_remaining_g": round(max(0.0, budget - carbon_spent), 4),
+        "map_checkpoint": {
+            "completed_indices": sorted(done_set),
+            "summaries": summaries,
+        },
+        "ingestion_latency": _persist_latency(lat),
+    }
 
 
 def validate_map(state: AgentState) -> Dict[str, Any]:
     job_id = state["job_id"]
     log.info(f"Job {job_id}: [6] Quality Validation (map)...")
-    _set_progress(job_id, 65.0, "Validating summary quality...")
+    _set_progress(job_id, 65.0, "Validating summary quality...", force=True)
     lat = _get_latency(state)
 
     with lat.stage(STAGE_VALIDATE):
-        verdict = quality_validation.validate_chunks(state["chunks"], state["summaries"])
+        strat = ((state.get("pipeline_intelligence") or {}).get("strategy") or {})
+        tau = strat.get("qva_confidence_threshold")
+        only_idx = list(state.get("last_escalated_indices") or [])
+        prior_raw = ((state.get("validation_verdict") or {}).get("details") or {}).get(
+            "chunk_verdicts"
+        )
+        prior_verdicts = None
+        if only_idx and prior_raw and len(prior_raw) == len(state.get("summaries") or []):
+            prior_verdicts = []
+            for d in prior_raw:
+                if not isinstance(d, dict):
+                    prior_verdicts.append(None)
+                    continue
+                prior_verdicts.append(
+                    quality_validation.ValidationVerdict(
+                        passed=bool(d.get("passed")),
+                        confidence=float(d.get("confidence") or 0),
+                        faithfulness=float(d.get("faithfulness") or 0),
+                        coverage=float(d.get("coverage") or 0),
+                        hallucination_rate=float(d.get("hallucination_rate") or 0),
+                        contradiction_rate=float(d.get("contradiction_rate") or 0),
+                        codes=list(d.get("codes") or []),
+                        details=dict(d.get("details") or {}),
+                        semantic_similarity=float(d.get("semantic_similarity") or 0),
+                        entity_retention=float(d.get("entity_retention") or 0),
+                        compression_ratio=float(d.get("compression_ratio") or 0),
+                        redundancy=float(d.get("redundancy") or 0),
+                        readability=float(d.get("readability") or 0),
+                    )
+                )
+            verdict = quality_validation.validate_chunks(
+                state["chunks"],
+                state["summaries"],
+                confidence_threshold=float(tau) if tau is not None else None,
+                only_indices=only_idx,
+                prior_verdicts=prior_verdicts,
+            )
+        else:
+            verdict = quality_validation.validate_chunks(
+                state["chunks"],
+                state["summaries"],
+                confidence_threshold=float(tau) if tau is not None else None,
+            )
     log.info(
         f"Job {job_id}: QVA map passed={verdict.passed} conf={verdict.confidence} "
         f"codes={verdict.codes}"
     )
     return {
         "validation_verdict": verdict.to_dict(),
+        "last_escalated_indices": [],
         "ingestion_latency": _persist_latency(lat),
     }
 
@@ -379,7 +756,12 @@ def validate_map(state: AgentState) -> Dict[str, Any]:
 def should_escalate(state: AgentState) -> str:
     verdict = state.get("validation_verdict") or {}
     esc = int(state.get("escalation_count") or 0)
-    max_esc = settings.QVA_MAX_ESCALATIONS
+    strat = ((state.get("pipeline_intelligence") or {}).get("strategy") or {})
+    max_esc = int(
+        strat.get("max_escalations")
+        if strat.get("max_escalations") is not None
+        else settings.QVA_MAX_ESCALATIONS
+    )
 
     if verdict.get("passed"):
         log.info(f"Job {state['job_id']}: Validation passed → compile")
@@ -396,14 +778,13 @@ def should_escalate(state: AgentState) -> str:
 
 
 def escalate_once(state: AgentState) -> Dict[str, Any]:
-    """Confidence-based escalation: bump exactly one tier and re-summarize."""
+    """Escalate ONLY failed chunks one tier (Light→Medium→Heavy)."""
     job_id = state["job_id"]
     verdict = state.get("validation_verdict") or {}
     codes = verdict.get("codes") or ["validation_failed"]
     lat = _get_latency(state)
 
     raw = dict(state["routing_decision"])
-    # Reconstruct dataclass safely
     fields = intelligent_router.RoutingDecision.__dataclass_fields__
     kwargs = {k: raw.get(k) for k in fields if k in raw}
     kwargs.setdefault("escalations", list(raw.get("escalations") or []))
@@ -416,109 +797,128 @@ def escalate_once(state: AgentState) -> Dict[str, Any]:
     if not failed_idx:
         failed_idx = list(range(len(state["chunks"])))
 
-    # Prefer worst chunks first (lowest confidence), then cap — lexical QVA can
-    # mark nearly every abstractive summary as failed and drown the heavy tier.
     confidences = details.get("chunk_confidences") or []
     if confidences and len(confidences) == len(state.get("summaries") or []):
         failed_idx = sorted(
             failed_idx,
             key=lambda i: confidences[i] if 0 <= i < len(confidences) else 0.0,
         )
-    max_esc_chunks = max(1, int(getattr(settings, "QVA_MAX_ESCALATE_CHUNKS", 8) or 8))
+    max_esc_chunks = max(
+        1,
+        int(
+            (
+                ((state.get("pipeline_intelligence") or {}).get("strategy") or {}).get(
+                    "max_escalate_chunks"
+                )
+            )
+            or getattr(settings, "QVA_MAX_ESCALATE_CHUNKS", 8)
+            or 8
+        ),
+    )
     if len(failed_idx) > max_esc_chunks:
-        log.info(
-            "Job %s: capping escalate from %s → %s worst chunks (QVA_MAX_ESCALATE_CHUNKS)",
-            job_id,
-            len(failed_idx),
-            max_esc_chunks,
-        )
         failed_idx = failed_idx[:max_esc_chunks]
 
-    log.info(
-        f"Job {job_id}: [6b] Escalating {len(failed_idx)} chunks to {decision.tier}"
-    )
-    # Distinct message from map_summarize intro — not a re-emit of map status.
-    _set_progress(
-        job_id, 70.0, f"Escalating to {decision.tier} tier ({len(failed_idx)} chunks)..."
-    )
-
+    routes = {
+        int(r.get("chunk_index", i)): dict(r)
+        for i, r in enumerate(state.get("chunk_routing") or [])
+    }
     summaries = list(state["summaries"])
-    chain = decision.fallbacks
-    tier = decision.tier
-    max_workers = max(1, int(getattr(settings, "MAP_MAX_WORKERS", 3) or 3))
+    agent_telemetry = list(state.get("agent_telemetry") or [])
+    carbon_spent = float(state.get("carbon_spent_g") or 0.0)
+    intensity = float((state.get("features") or {}).get("grid_intensity") or 500.0)
+    max_workers = max(1, int(settings.effective_map_max_workers()))
     submit_times: Dict[int, float] = {}
-    total_esc = len(failed_idx)
-    done = 0
 
-    def _run(i):
-        queue_ms = (time.perf_counter() - submit_times[i]) * 1000.0
-        active = lat.worker_enter()
-        log.info(
-            "ingest_pool job_id=%s event=escalate_enter chunk=%s active=%s/%s queue_ms=%.1f",
-            job_id,
-            i,
-            active,
-            max_workers,
-            queue_ms,
-        )
-        call_meta: Dict[str, Any] = {}
+    log.info(
+        "Job %s: [6b] Escalating %s failed chunks (ladder step %s)",
+        job_id,
+        len(failed_idx),
+        esc_count,
+    )
+    _set_progress(
+        job_id,
+        70.0,
+        f"Escalating failed chunks ({len(failed_idx)}) step {esc_count}...",
+        force=True,
+    )
+
+    def _run(idx):
+        route = routes.get(idx) or {}
+        cur = str(route.get("tier") or decision.tier)
+        nxt = _next_tier(cur) or "heavy"
+        chain = _models_for_tier(nxt, decision.to_dict())
+        queue_ms = (time.perf_counter() - submit_times[idx]) * 1000.0
+        lat.worker_enter()
         try:
-            chunk = state["chunks"][i]
-            text = models.run_tier_summarizer(
-                chunk.content, state, tier=tier, model_ids=chain, call_meta=call_meta
+            result = summarization_agents.run_summarization_agent(
+                state["chunks"][idx].content,
+                state,
+                tier=nxt,
+                model_ids=chain,
+                grid_intensity=intensity,
             )
             lat.record_chunk_call(
                 {
-                    "chunk_index": i,
-                    "tier": tier,
-                    "model_id": call_meta.get("model_id") or (chain[0] if chain else None),
+                    "chunk_index": idx,
+                    "tier": nxt,
+                    "model_id": result.model_id,
                     "queue_ms": round(queue_ms, 1),
-                    "call_ms": round(float(call_meta.get("call_ms") or 0.0), 1),
-                    "success": bool(call_meta.get("success", True)),
-                    "retry_count": int(call_meta.get("retry_count") or 0),
-                    "attempt_count": int(call_meta.get("attempt_count") or 0),
-                    "http_status": call_meta.get("http_status"),
-                    "attempts": call_meta.get("attempts") or [],
+                    "call_ms": round(result.latency_ms, 1),
+                    "success": result.success,
+                    "retry_count": 0,
+                    "attempt_count": 1,
                     "phase": "escalate",
+                    "from_tier": cur,
                 }
             )
-            return i, text
+            return idx, nxt, result
         finally:
             lat.worker_exit()
 
     with lat.stage(STAGE_ESCALATE):
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
-            for i in failed_idx:
-                if i >= len(summaries):
-                    continue
-                submit_times[i] = time.perf_counter()
-                futures.append(executor.submit(_run, i))
+            for idx in failed_idx:
+                submit_times[idx] = time.perf_counter()
+                futures.append(executor.submit(_run, idx))
+            done = 0
             for fut in concurrent.futures.as_completed(futures):
-                i, text = fut.result()
-                summaries[i] = text
+                idx, nxt, result = fut.result()
+                summaries[idx] = result.summary
+                agent_telemetry.append(
+                    result.to_dict()
+                    | {"chunk_index": idx, "phase": "escalate", "escalation_step": esc_count}
+                )
+                carbon_spent += float(result.carbon_estimate_g or 0.0)
+                if idx in routes:
+                    routes[idx]["tier"] = nxt
+                    routes[idx]["reason"] = (
+                        f"Escalated to {nxt} after QVA failure (step {esc_count})"
+                    )
+                    routes[idx]["model"] = result.model_id
                 done += 1
-                progress = 70.0 + (10.0 * done / max(total_esc, 1))
                 _set_progress(
                     job_id,
-                    progress,
-                    f"Escalating ({decision.tier})... ({done}/{total_esc})",
+                    70.0 + (10.0 * done / max(len(failed_idx), 1)),
+                    f"Escalating... ({done}/{len(failed_idx)})",
                 )
 
-    new_verdict = quality_validation.validate_chunks(state["chunks"], summaries)
-    lat.add_meta(
-        escalated_chunks=len(failed_idx),
-        escalate_tier=tier,
-        escalate_model_chain=list(chain or []),
-    )
-
+    # Validation runs once in validate_map (incremental for escalated indices).
+    # Do NOT revalidate here — that duplicated full QVA every escalate cycle.
+    budget = float(state.get("carbon_budget_g") or settings.CARBON_BUDGET_G)
+    lat.add_meta(escalated_chunks=len(failed_idx), escalate_step=esc_count)
     return {
         "routing_decision": decision.to_dict(),
+        "chunk_routing": list(routes.values())
+        if routes
+        else list(state.get("chunk_routing") or []),
         "summaries": summaries,
         "escalation_count": esc_count,
-        "chunks_escalated": len(failed_idx),
-        "validation_verdict": new_verdict.to_dict(),
-        "accept_with_warning": not new_verdict.passed,
+        "chunks_escalated": int(state.get("chunks_escalated") or 0) + len(failed_idx),
+        "last_escalated_indices": list(failed_idx),
+        "agent_telemetry": agent_telemetry,
+        "carbon_spent_g": round(carbon_spent, 4),
+        "carbon_remaining_g": round(max(0.0, budget - carbon_spent), 4),
         "ingestion_latency": _persist_latency(lat),
     }
 
@@ -530,28 +930,193 @@ def mark_warning(state: AgentState) -> Dict[str, Any]:
 def reduce_compile(state: AgentState) -> Dict[str, Any]:
     job_id = state["job_id"]
     decision = state["routing_decision"]
-    compile_chain = decision.get("compile_fallbacks") or settings.heavy_models()
     lat = _get_latency(state)
+    strat = ((state.get("pipeline_intelligence") or {}).get("strategy") or {})
+    compile_meta: Dict[str, Any] = {
+        "medium_first": bool(strat.get("medium_first", True)),
+        "used_heavy": False,
+        "strategy_id": strat.get("strategy_id"),
+        "compile_depth_label": strat.get("compile_depth_label"),
+        "branch_recompiles": [],
+    }
 
-    log.info(
-        f"Job {job_id}: [7] Compile with tier={decision.get('compile_tier')} "
-        f"model={compile_chain[0]}"
-    )
-    _set_progress(job_id, 82.0, "Compiling executive summary...")
+    log.info("Job %s: [7] Adaptive hierarchical compile", job_id)
+    _set_progress(job_id, 82.0, "Building hierarchy & compiling summary...", force=True)
+
+    def _compile_call(label: str, progress: float, inputs: List[str], chain: List[str]) -> str:
+        """Run a blocking NIM compile with UI heartbeats so status does not look frozen."""
+        _set_progress(job_id, progress, label)
+        max_wait = float(getattr(settings, "COMPILE_CALL_MAX_SEC", 600.0) or 600.0)
+        started = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(models.run_compile_with_models, inputs, state, chain)
+            while True:
+                try:
+                    return fut.result(timeout=15.0)
+                except concurrent.futures.TimeoutError:
+                    elapsed = time.monotonic() - started
+                    if elapsed >= max_wait:
+                        log.error(
+                            "Job %s: compile call timed out after %.0fs (%s)",
+                            job_id,
+                            elapsed,
+                            label,
+                        )
+                        raise TimeoutError(
+                            f"Compile step exceeded {max_wait:.0f}s while: {label}"
+                        )
+                    if job_store.is_cancel_requested(job_id):
+                        raise RuntimeError("Compile cancelled by user")
+                    _set_progress(
+                        job_id,
+                        progress,
+                        f"{label} — waiting on model... ({int(elapsed)}s)",
+                    )
 
     with lat.stage(STAGE_COMPILE):
-        # Pass the list so compile can hierarchically batch large docs and skip
-        # failed chunk summaries. Cross-tier fallback lives in models.run_compile_with_models.
-        final_summary = models.run_compile_with_models(
-            state["summaries"], state, compile_chain
+        levels = []
+        compile_inputs = list(state.get("summaries") or [])
+        fan_in = max(
+            2,
+            int(
+                strat.get("hierarchy_fan_in")
+                or getattr(settings, "COMPILE_BATCH_SIZE", 8)
+                or 8
+            ),
         )
-        final_verdict = quality_validation.validate_final(state["summaries"], final_summary)
-    accept_warn = bool(state.get("accept_with_warning")) or not final_verdict.passed
+        max_depth = max(2, int(strat.get("hierarchy_max_depth") or 12))
+        skip_regional = int(strat.get("skip_regional_below") or 0)
+        if bool(getattr(settings, "ADAPTIVE_REGIONAL_HIERARCHY", True)):
+            levels = hierarchy.build_hierarchy_levels(
+                state.get("chunks") or [],
+                state.get("summaries") or [],
+                fan_in=fan_in,
+                max_depth=max_depth,
+                skip_regional_below=skip_regional,
+            )
+            regional = hierarchy.regional_texts_for_compile(levels)
+            if regional:
+                compile_inputs = regional
+            compile_meta["hierarchy_depth"] = len(levels)
+            compile_meta["hierarchy_fan_in"] = fan_in
+            compile_meta["hierarchy"] = hierarchy.hierarchy_tree_for_ui(levels)
 
+        # Medium-first compile chain (or strategy hint)
+        medium_chain = list(settings.medium_models())
+        heavy_chain = list(
+            decision.get("compile_fallbacks") or settings.heavy_models()
+        )
+        hint = str(strat.get("compile_tier_hint") or "medium").lower()
+        first_chain = heavy_chain if hint == "heavy" and not strat.get("medium_first", True) else medium_chain
+        final_summary = _compile_call(
+            "Compiling executive summary...",
+            82.0,
+            compile_inputs,
+            first_chain,
+        )
+        compile_tau = float(
+            strat.get("qva_compile_threshold")
+            if strat.get("qva_compile_threshold") is not None
+            else getattr(settings, "QVA_COMPILE_CONFIDENCE_THRESHOLD", 0.58) or 0.58
+        )
+        final_verdict = quality_validation.validate_final(compile_inputs, final_summary)
+        need_heavy = (not final_verdict.passed) or (
+            float(final_verdict.confidence) < compile_tau
+        )
+        if need_heavy and bool(
+            strat.get("medium_first", getattr(settings, "COMPILE_MEDIUM_FIRST", True))
+        ):
+            log.info("Job %s: medium compile QVA failed → heavy compile", job_id)
+            final_summary = _compile_call(
+                "Heavy compile (quality gate)...",
+                86.0,
+                compile_inputs,
+                heavy_chain,
+            )
+            final_verdict = quality_validation.validate_final(
+                compile_inputs, final_summary
+            )
+            compile_meta["used_heavy"] = True
+            compile_meta["branch_recompiles"].append(
+                {
+                    "branch": "global",
+                    "reason": "compile_qva_failed_or_low_confidence",
+                    "confidence": final_verdict.confidence,
+                }
+            )
+
+        # Branch-level repair: if regional nodes exist and global still weak,
+        # re-summarize only the lowest-confidence regional inputs (not full doc).
+        if (
+            levels
+            and (not final_verdict.passed or float(final_verdict.confidence) < compile_tau)
+            and len(compile_inputs) > 1
+        ):
+            scores = []
+            for i, text in enumerate(compile_inputs):
+                v = quality_validation.validate_pair(
+                    text, final_summary[: max(200, len(text) // 4)], confidence_threshold=compile_tau
+                )
+                scores.append((float(v.confidence), i))
+            scores.sort()
+            # Recompile up to 2 weakest branches only
+            for _, bi in scores[:2]:
+                branch_text = compile_inputs[bi]
+                repaired = _compile_call(
+                    f"Repairing weak branch {bi + 1}...",
+                    88.0,
+                    [branch_text],
+                    heavy_chain,
+                )
+                if repaired and repaired.strip():
+                    compile_inputs[bi] = repaired
+                    compile_meta["branch_recompiles"].append(
+                        {
+                            "branch": f"regional-{bi}",
+                            "reason": "low_branch_confidence",
+                            "confidence": scores[0][0] if scores else None,
+                        }
+                    )
+            final_summary = _compile_call(
+                "Recompiling after branch repair...",
+                90.0,
+                compile_inputs,
+                heavy_chain,
+            )
+            final_verdict = quality_validation.validate_final(
+                compile_inputs, final_summary
+            )
+            compile_meta["used_heavy"] = True
+
+        compile_meta["compile_confidence"] = final_verdict.confidence
+        compile_meta["compile_passed"] = final_verdict.passed
+
+    # Refresh intelligence report
+    intel = state.get("pipeline_intelligence") or {}
+    if intel:
+        from src.core.pipeline_intelligence import enrich_report_after_run
+
+        intel = enrich_report_after_run(
+            intel,
+            routing_distribution=state.get("routing_distribution"),
+            cre_result=state.get("cre_result"),
+            escalations={
+                "chunks_escalated": state.get("chunks_escalated"),
+                "escalation_count": state.get("escalation_count"),
+            },
+            compile_meta=compile_meta,
+            validation=final_verdict.to_dict(),
+            latency_by_stage=(state.get("ingestion_latency") or {}).get("stages_ms"),
+        )
+
+    accept_warn = bool(state.get("accept_with_warning")) or not final_verdict.passed
     return {
         "final_summary": final_summary,
         "validation_verdict": final_verdict.to_dict(),
         "accept_with_warning": accept_warn,
+        "hierarchy": compile_meta.get("hierarchy") or {},
+        "compile_meta": compile_meta,
+        "pipeline_intelligence": intel or state.get("pipeline_intelligence"),
         "ingestion_latency": _persist_latency(lat),
     }
 
@@ -559,8 +1124,19 @@ def reduce_compile(state: AgentState) -> Dict[str, Any]:
 def store_for_rag(state: AgentState) -> Dict[str, Any]:
     job_id = state["job_id"]
     log.info(f"Job {job_id}: [8] Storing for RAG...")
-    _set_progress(job_id, 90.0, "Indexing for search...")
+    _set_progress(job_id, 90.0, "Indexing for search...", force=True)
     lat = _get_latency(state)
+
+    prefetched = None
+    if bool(getattr(settings, "ENABLE_EMBED_PREFETCH", True)):
+        try:
+            from src.perf.prefetch import get_embed_prefetch
+
+            prefetched = get_embed_prefetch(job_id, timeout_sec=90.0)
+            if prefetched:
+                lat.add_meta(embed_prefetch_hits=sum(1 for v in prefetched if v))
+        except Exception as e:
+            log.debug("embed prefetch retrieve failed: %s", e)
 
     with lat.stage(STAGE_STORE):
         try:
@@ -569,6 +1145,7 @@ def store_for_rag(state: AgentState) -> Dict[str, Any]:
                 summary=state["final_summary"],
                 chunks=state["chunks"],
                 routing_decision=state.get("routing_decision"),
+                prefetched_embeddings=prefetched,
             )
             log.info("Job %s: stored in Chroma / document store", job_id)
         except Exception as e:
@@ -582,7 +1159,13 @@ def store_for_rag(state: AgentState) -> Dict[str, Any]:
 def finalize_metrics(state: AgentState) -> Dict[str, Any]:
     job_id = state["job_id"]
     log.info(f"Job {job_id}: [9] Carbon + telemetry...")
-    _set_progress(job_id, 98.0, "Recording metrics...")
+    _set_progress(job_id, 98.0, "Recording metrics...", force=True)
+    try:
+        from src.perf.progress import flush_progress
+
+        flush_progress(job_id)
+    except Exception:
+        pass
     lat = _get_latency(state)
 
     with lat.stage(STAGE_FINALIZE):
@@ -685,6 +1268,7 @@ workflow = StateGraph(AgentState)
 workflow.add_node("start_job", start_job)
 workflow.add_node("triage_document", triage_document)
 workflow.add_node("extract_features", extract_features_node)
+workflow.add_node("plan_pipeline", plan_pipeline)
 workflow.add_node("cre_and_route", cre_and_route)
 workflow.add_node("map_summarize", map_summarize_routed)
 workflow.add_node("validate_map", validate_map)
@@ -697,7 +1281,8 @@ workflow.add_node("finalize_metrics", finalize_metrics)
 workflow.set_entry_point("start_job")
 workflow.add_edge("start_job", "triage_document")
 workflow.add_edge("triage_document", "extract_features")
-workflow.add_edge("extract_features", "cre_and_route")
+workflow.add_edge("extract_features", "plan_pipeline")
+workflow.add_edge("plan_pipeline", "cre_and_route")
 workflow.add_edge("cre_and_route", "map_summarize")
 workflow.add_edge("map_summarize", "validate_map")
 
@@ -711,7 +1296,7 @@ workflow.add_conditional_edges(
     },
 )
 
-workflow.add_edge("escalate_once", "reduce_compile")
+workflow.add_edge("escalate_once", "validate_map")
 workflow.add_edge("mark_warning", "reduce_compile")
 workflow.add_edge("reduce_compile", "store_for_rag")
 workflow.add_edge("store_for_rag", "finalize_metrics")

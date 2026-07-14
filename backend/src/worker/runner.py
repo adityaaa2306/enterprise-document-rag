@@ -130,6 +130,10 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
                     )
                     return
                 try:
+                    if job_store.is_cancel_requested(job_id):
+                        abandoned.set()
+                        log.info("Job %s: cancel detected — abandoning graph", job_id)
+                        return
                     job_store.touch_job_heartbeat(job_id, worker_id)
                 except Exception as he:
                     log.warning(f"Job {job_id}: heartbeat failed: {he}")
@@ -167,7 +171,27 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
                         f"Job exceeded max runtime of {max_runtime:.0f}s "
                         f"(likely hung external API call). Marking failed."
                     )
+                if abandoned.is_set() or job_store.is_cancel_requested(job_id):
+                    abandoned.set()
+                    log.info("Job %s: cancelled — stopping wait on graph thread", job_id)
+                    break
                 graph_thread.join(timeout=min(5.0, max(0.1, remaining)))
+
+            if abandoned.is_set() or job_store.is_cancel_requested(job_id):
+                # Keep cancelled status; do not retry or overwrite with complete.
+                job_store.clear_cancel_request(job_id)
+                if str((job_store.get_job(job_id) or {}).get("status")) != job_status_mod.STATUS_CANCELLED:
+                    job_store.upsert_job(
+                        job_id,
+                        status=job_status_mod.STATUS_CANCELLED,
+                        message="Cancelled by user. Worker slot freed.",
+                        error_detail="cancelled_by_user",
+                        claimed_by=None,
+                        heartbeat_at=None,
+                    )
+                reached_terminal = True
+                log.info("Job %s: processing → cancelled", job_id)
+                return
 
             if "err" in error_box:
                 raise error_box["err"]
@@ -182,12 +206,27 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
             # Late completion after we already decided to fail — do not overwrite.
             log.warning("Job %s: ignoring late graph result after abandon", job_id)
             if not reached_terminal:
+                if job_store.is_cancel_requested(job_id) or str(
+                    (job_store.get_job(job_id) or {}).get("status")
+                ) == job_status_mod.STATUS_CANCELLED:
+                    job_store.clear_cancel_request(job_id)
+                    reached_terminal = True
+                    return
                 job_store.fail_or_retry_job(
                     job_id,
                     error="Job abandoned after runtime limit; late result ignored.",
                     worker_id=worker_id,
                 )
                 reached_terminal = True
+            return
+
+        # Race: cancelled while graph finishing
+        if job_store.is_cancel_requested(job_id) or str(
+            (job_store.get_job(job_id) or {}).get("status")
+        ) == job_status_mod.STATUS_CANCELLED:
+            job_store.clear_cancel_request(job_id)
+            log.info("Job %s: cancelled after graph finish — not writing complete", job_id)
+            reached_terminal = True
             return
 
         log.info("Job %s: pipeline finished → attaching result / complete", job_id)
@@ -211,6 +250,35 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
             "grid_source": raw_carbon.get("grid_source"),
             "breakdown": raw_carbon.get("breakdown") if isinstance(raw_carbon.get("breakdown"), dict) else None,
             "methodology": raw_carbon.get("methodology"),
+            "estimated_baseline_pipeline_emissions_g": float(
+                raw_carbon.get("estimated_baseline_pipeline_emissions_g")
+                or raw_carbon.get("baseline_cost_gco2e")
+                or 0.0
+            ),
+            "estimated_optimized_pipeline_emissions_g": float(
+                raw_carbon.get("estimated_optimized_pipeline_emissions_g")
+                or raw_carbon.get("actual_cost_gco2e")
+                or 0.0
+            ),
+            "estimated_carbon_saved_g": float(
+                raw_carbon.get("estimated_carbon_saved_g")
+                or raw_carbon.get("carbon_saved_grams")
+                or 0.0
+            ),
+            "estimated_reduction_percent": float(
+                raw_carbon.get("estimated_reduction_percent")
+                or raw_carbon.get("efficiency_percent")
+                or 0.0
+            ),
+            "reporting_boundary": raw_carbon.get("reporting_boundary"),
+            "reporting_boundary_label": raw_carbon.get("reporting_boundary_label"),
+            "routing_impact": raw_carbon.get("routing_impact"),
+            "uncertainty": raw_carbon.get("uncertainty"),
+            "assumptions_panel": raw_carbon.get("assumptions_panel"),
+            "pue": raw_carbon.get("pue"),
+            "chunk_breakdown": raw_carbon.get("chunk_breakdown"),
+            "emissions_direction": raw_carbon.get("emissions_direction"),
+            "baseline_reference": raw_carbon.get("baseline_reference"),
         }
 
         insights = build_processing_insights(
@@ -220,6 +288,19 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
             validation_verdict=final_state.get("validation_verdict"),
             job_mode=mode,
             latency_ms=final_state.get("job_latency_ms"),
+            routing_distribution=final_state.get("routing_distribution"),
+            chunk_routing=final_state.get("chunk_routing"),
+            hierarchy=final_state.get("hierarchy"),
+            agent_telemetry=final_state.get("agent_telemetry"),
+            compile_meta=final_state.get("compile_meta"),
+            carbon_budget_g=final_state.get("carbon_budget_g"),
+            carbon_spent_g=final_state.get("carbon_spent_g")
+            or raw_carbon.get("actual_cost_gco2e"),
+            carbon_remaining_g=final_state.get("carbon_remaining_g"),
+            predicted_final_carbon_g=final_state.get("predicted_final_carbon_g"),
+            ingestion_latency=final_state.get("ingestion_latency"),
+            triage_meta=final_state.get("triage_meta"),
+            pipeline_intelligence=final_state.get("pipeline_intelligence"),
         )
 
         understanding_status = "pending" if settings.ENABLE_UNDERSTANDING else "skipped"
@@ -237,6 +318,11 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
                 "job_id": job_id,
                 "processing_insights": insights,
                 "ingestion_latency": final_state.get("ingestion_latency"),
+                "hierarchy": final_state.get("hierarchy"),
+                "routing_distribution": final_state.get("routing_distribution"),
+                "chunk_routing": final_state.get("chunk_routing"),
+                "compile_meta": final_state.get("compile_meta"),
+                "carbon_budget": insights.get("carbon_budget"),
             },
             routing_decision=final_state.get("routing_decision"),
             latency_ms=final_state.get("job_latency_ms"),

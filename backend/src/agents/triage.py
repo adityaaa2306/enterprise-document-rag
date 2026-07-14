@@ -147,58 +147,30 @@ def _append_chunk(
 
 def _texts_to_chunks(texts: List[str], document_id: str, *, source: str) -> List[Chunk]:
     """
-    Convert plain text blocks into typed chunks.
+    Convert plain text pages/blocks into layout Text chunks.
 
-    When a block looks like a multi-line page, scan for heading lines and emit
-    Title elements so adaptive chunking can build real section paths (instead of
-    dumping the whole PDF under a single default parent).
+    Heading detection is intentionally NOT applied here. The structure parser
+    validates headings with a multi-signal confidence model. Emitting Title for
+    every Title-Case line was the root cause of 200+ false sections.
     """
     chunks: List[Chunk] = []
     for part in texts[:200]:
         content = (part or "").strip()
         if not content:
             continue
-        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
-        if len(lines) >= 4 and any(_looks_like_heading(ln) for ln in lines[:40]):
-            body_buf: List[str] = []
-            for ln in lines:
-                if _looks_like_heading(ln):
-                    if body_buf:
-                        _append_chunk(
-                            chunks,
-                            document_id=document_id,
-                            chunk_type="Text",
-                            content="\n".join(body_buf),
-                        )
-                        body_buf = []
-                    _append_chunk(
-                        chunks,
-                        document_id=document_id,
-                        chunk_type="Title",
-                        content=ln.lstrip("#").strip(),
-                    )
-                else:
-                    body_buf.append(ln)
-            if body_buf:
-                _append_chunk(
-                    chunks,
-                    document_id=document_id,
-                    chunk_type="Text",
-                    content="\n".join(body_buf),
-                )
-        else:
-            _append_chunk(
-                chunks,
-                document_id=document_id,
-                chunk_type="Text",
-                content=content[:20000],
-            )
+        # Keep page text intact (newlines preserved) so the structure parser
+        # can score line-level heading candidates with whitespace context.
+        _append_chunk(
+            chunks,
+            document_id=document_id,
+            chunk_type="Text",
+            content=content[:20000],
+        )
     if chunks:
-        log.warning(
-            "Triage: %s produced %s chunk(s) (%s titles)",
+        log.info(
+            "Triage: %s produced %s layout text block(s) (heading validation deferred)",
             source,
             len(chunks),
-            sum(1 for c in chunks if c.type == "Title"),
         )
     return chunks
 

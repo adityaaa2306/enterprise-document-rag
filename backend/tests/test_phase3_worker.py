@@ -159,6 +159,32 @@ def test_reclaim_stale_processing(phase3_env):
     assert job.get("claimed_by") is None
 
 
+def test_release_orphaned_claims_on_worker_start(phase3_env):
+    """Restart with the same WORKER_ID must not leave a zombie processing claim."""
+    from src.db import jobs as job_store
+    from src.core.job_status import STATUS_PENDING, STATUS_PROCESSING
+
+    jid = str(uuid.uuid4())
+    job_store.enqueue_job(jid, filename="orphan.pdf")
+    claimed = job_store.claim_next_job("local-dev-1")
+    assert claimed["status"] == STATUS_PROCESSING
+    assert claimed["claimed_by"] == "local-dev-1"
+
+    n = job_store.release_orphaned_claims_for_worker("local-dev-1")
+    assert n == 1
+    job = job_store.get_job(jid)
+    assert job["status"] == STATUS_PENDING
+    assert job.get("claimed_by") is None
+    assert "orphaned" in (job.get("message") or "").lower()
+
+    # Other workers' claims are untouched
+    jid2 = str(uuid.uuid4())
+    job_store.enqueue_job(jid2, filename="other.pdf")
+    job_store.claim_next_job("other-worker")
+    assert job_store.release_orphaned_claims_for_worker("local-dev-1") == 0
+    assert job_store.get_job(jid2)["status"] == STATUS_PROCESSING
+
+
 def test_fail_or_retry_then_terminal(phase3_env):
     from src.db import jobs as job_store
     from src.core.job_status import STATUS_PENDING, STATUS_ERROR

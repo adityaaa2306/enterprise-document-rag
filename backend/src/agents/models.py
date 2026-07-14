@@ -538,14 +538,37 @@ def _normalize_compile_summaries(
     return usable
 
 
-def _compile_model_chains(primary: Optional[List[str]]) -> List[List[str]]:
-    """Ordered unique model chains: primary tier → medium → light."""
+def _compile_model_chains(
+    primary: Optional[List[str]],
+    *,
+    medium_first: Optional[bool] = None,
+) -> List[List[str]]:
+    """
+    Ordered unique model chains for compile.
+
+    When COMPILE_MEDIUM_FIRST (default), try medium → heavy → light so Heavy
+    is an exception path, not the default.
+    """
+    use_medium_first = (
+        bool(settings.COMPILE_MEDIUM_FIRST)
+        if medium_first is None
+        else bool(medium_first)
+    )
     chains: List[List[str]] = []
-    for chain in (
-        list(primary or []) or list(settings.heavy_models()),
-        list(settings.medium_models()),
-        list(settings.light_models()),
-    ):
+    if use_medium_first:
+        ordered = (
+            list(primary or []) or list(settings.medium_models()),
+            list(settings.medium_models()),
+            list(settings.heavy_models()),
+            list(settings.light_models()),
+        )
+    else:
+        ordered = (
+            list(primary or []) or list(settings.heavy_models()),
+            list(settings.medium_models()),
+            list(settings.light_models()),
+        )
+    for chain in ordered:
         cleaned: List[str] = []
         seen: set = set()
         for mid in chain:
@@ -648,12 +671,55 @@ def _hierarchical_compile(
     """
     Batch large summary sets into intermediate compiles, then final compile.
     Falls through model chains on each step.
+
+    Intermediate batches within a round run concurrently (COMPILE_MAX_WORKERS)
+    — same inputs/outputs as sequential; lower wall-clock only.
     """
+    import concurrent.futures
+
     batch_size = max(3, int(getattr(settings, "COMPILE_BATCH_SIZE", 8) or 8))
     max_tokens = int(getattr(settings, "COMPILE_MAX_INPUT_TOKENS", 10000) or 10000)
+    compile_workers = max(1, int(getattr(settings, "COMPILE_MAX_WORKERS", 4) or 4))
 
     working = list(summaries)
     round_idx = 0
+
+    def _compile_one_batch(bi: int, batch: List[str], batch_total: int) -> tuple:
+        batch_text = "\n\n".join(batch)
+        last_err: Optional[Exception] = None
+        job_id = state.get("job_id")
+        if job_id:
+            try:
+                from src.db import jobs as jobs_db
+
+                jobs_db.set_progress(
+                    job_id,
+                    min(90.0, 82.0 + (8.0 * bi / max(batch_total, 1))),
+                    f"Compiling summary batches... ({bi}/{batch_total})",
+                )
+            except Exception:
+                pass
+        log.info(
+            "Compile round %s batch %s/%s (~%s tokens) models=%s",
+            round_idx,
+            bi,
+            batch_total,
+            _estimate_compile_tokens(batch_text),
+            [c[0] for c in chains if c],
+        )
+        for chain in chains:
+            try:
+                text, used = _call_compile_llm(batch_text, chain, intermediate=True)
+                return bi, text, used, len(batch_text), None
+            except Exception as e:
+                last_err = e
+                log.warning("Intermediate compile batch failed on %s: %s", chain, e)
+        log.error(
+            "Intermediate compile dropped to raw batch after failures: %s",
+            last_err,
+        )
+        return bi, batch_text, None, len(batch_text), last_err
+
     while True:
         joined = "\n\n".join(working)
         tokens = _estimate_compile_tokens(joined)
@@ -670,57 +736,39 @@ def _hierarchical_compile(
             tokens,
             batch_size,
         )
-        next_level: List[str] = []
+        batches = []
         batch_total = (len(working) + batch_size - 1) // batch_size
         for bi, i in enumerate(range(0, len(working), batch_size), start=1):
-            batch = working[i : i + batch_size]
-            batch_text = "\n\n".join(batch)
-            last_err: Optional[Exception] = None
-            produced = False
-            job_id = state.get("job_id")
-            if job_id:
-                try:
-                    from db import jobs as jobs_db
+            batches.append((bi, working[i : i + batch_size]))
 
-                    jobs_db.set_progress(
-                        job_id,
-                        min(90.0, 82.0 + (8.0 * bi / max(batch_total, 1))),
-                        f"Compiling summary batches... ({bi}/{batch_total})",
-                    )
-                except Exception:
-                    pass
-            log.info(
-                "Compile round %s batch %s/%s (~%s tokens) models=%s",
-                round_idx,
-                bi,
-                batch_total,
-                _estimate_compile_tokens(batch_text),
-                [c[0] for c in chains if c],
+        results_by_bi: Dict[int, tuple] = {}
+        workers = min(compile_workers, len(batches))
+        if workers <= 1 or len(batches) == 1:
+            for bi, batch in batches:
+                bi2, text, used, nchars, err = _compile_one_batch(bi, batch, batch_total)
+                results_by_bi[bi2] = (text, used, nchars)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = [
+                    pool.submit(_compile_one_batch, bi, batch, batch_total)
+                    for bi, batch in batches
+                ]
+                for fut in concurrent.futures.as_completed(futs):
+                    bi2, text, used, nchars, err = fut.result()
+                    results_by_bi[bi2] = (text, used, nchars)
+
+        next_level: List[str] = []
+        for bi in range(1, batch_total + 1):
+            text, used, nchars = results_by_bi[bi]
+            next_level.append(text)
+            state.setdefault("model_usage_chars", {"light": 0, "medium": 0, "large": 0})
+            state["model_usage_chars"]["large"] = (
+                state["model_usage_chars"].get("large", 0) + int(nchars or 0)
             )
-            for chain in chains:
-                try:
-                    text, used = _call_compile_llm(batch_text, chain, intermediate=True)
-                    next_level.append(text)
-                    produced = True
-                    state.setdefault("model_usage_chars", {"light": 0, "medium": 0, "large": 0})
-                    state["model_usage_chars"]["large"] = (
-                        state["model_usage_chars"].get("large", 0) + len(batch_text)
-                    )
-                    if used:
-                        state.setdefault("models_used", [])
-                        if used not in state["models_used"]:
-                            state["models_used"].append(used)
-                    break
-                except Exception as e:
-                    last_err = e
-                    log.warning("Intermediate compile batch failed on %s: %s", chain, e)
-            if not produced:
-                # Keep raw batch text so final pass still has content
-                log.error(
-                    "Intermediate compile dropped to raw batch after failures: %s",
-                    last_err,
-                )
-                next_level.append(batch_text)
+            if used:
+                state.setdefault("models_used", [])
+                if used not in state["models_used"]:
+                    state["models_used"].append(used)
         working = next_level
 
     final_text = "\n\n".join(working)

@@ -1,20 +1,25 @@
 "use client"
 
 import { motion } from "framer-motion"
-import { useState, useEffect, Suspense } from "react"
-import { useSearchParams } from "next/navigation"
+import { useState, useEffect, Suspense, useCallback } from "react"
+import { useSearchParams, useRouter } from "next/navigation"
 import { Sidebar } from "@/components/sidebar"
 import { TopBar } from "@/components/top-bar"
 import { LiveFeed } from "@/components/live-feed"
+import { JobQueuePanel } from "@/components/job-queue-panel"
 import { Card } from "@/components/ui/card"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Leaf, Zap, Star, Copy, Download, Info } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { apiFetch } from "@/lib/api"
+import { getLastJobId, rememberJobId } from "@/lib/job-session"
 import {
   ProcessingInsightsPanel,
   type ProcessingInsightsData,
 } from "@/components/processing-insights"
+import { AdaptivePipelinePanel } from "@/components/adaptive-pipeline-panel"
+import { DocumentStructureViewer } from "@/components/document-structure-viewer"
+import { PipelineIntelligencePanel } from "@/components/pipeline-intelligence-panel"
 import {
   CarbonComparisonDashboard,
   type ComparisonModelRow,
@@ -30,8 +35,30 @@ import { DeveloperDetails } from "@/components/developer-details"
 import { unwrapOuterMarkdownFence } from "@/lib/utils"
 import { resolveFrontierComparison } from "@/lib/frontier-carbon-compare"
 
-/** Poll every 3s (within the 2–5s target range). */
-const POLL_INTERVAL_MS = 3000
+/** Canonical Boundary A copy — never show legacy ChatGPT-class chunk×grams text. */
+const BOUNDARY_A_ASSUMPTIONS =
+  "This system estimates operational carbon emissions using:\n" +
+  "• Energy-per-token estimates (literature-aligned J/token by model tier)\n" +
+  "• Live regional electricity carbon intensity (Electricity Maps)\n" +
+  "• Datacenter Power Usage Effectiveness (PUE)\n\n" +
+  "Excluded:\n" +
+  "• Model training emissions\n" +
+  "• Hardware manufacturing\n" +
+  "• End-of-life lifecycle emissions\n\n" +
+  "Reporting boundary: A_operational (Operational Emissions — Boundary A)."
+
+function pickAssumptionsText(...candidates: Array<string | null | undefined>): string {
+  for (const raw of candidates) {
+    const text = (raw || "").trim()
+    if (!text) continue
+    if (/chatgpt-class|4\.32\s*g|15\s*mg|chunk count\s*×/i.test(text)) continue
+    return text
+  }
+  return BOUNDARY_A_ASSUMPTIONS
+}
+
+/** Poll every 1.5s; skip ticks while a request is in flight (avoids stampede). */
+const POLL_INTERVAL_MS = 1500
 /** Stop polling after this wall-clock budget so the UI never spins forever. */
 const POLL_TIMEOUT_MS = Number(
   process.env.NEXT_PUBLIC_JOB_POLL_TIMEOUT_MS || 45 * 60 * 1000,
@@ -64,13 +91,17 @@ function isSuccessStatus(raw: string | undefined | null): boolean {
 
 function isErrorStatus(raw: string | undefined | null): boolean {
   const s = normalizeStatus(raw)
-  return s === "error" || s === "failed" || s === "failure"
+  return s === "error" || s === "failed" || s === "failure" || s === "cancelled" || s === "canceled"
 }
 
 interface JobStatus {
   status: string
   progress: number
   message: string
+  stage?: string | null
+  chunks_done?: number | null
+  chunks_total?: number | null
+  partial?: Record<string, unknown> | null
 }
 
 interface CarbonData {
@@ -87,8 +118,45 @@ interface CarbonData {
   actual_energy_kwh?: number
   grid_zone?: string | null
   grid_datetime?: string | null
-  breakdown?: CarbonBreakdown | null
+  breakdown?: CarbonBreakdown | Record<string, unknown> | null
   methodology?: string | null
+  assumptions_panel?: string | null
+  reporting_boundary_label?: string | null
+  estimated_baseline_pipeline_emissions_g?: number
+  estimated_optimized_pipeline_emissions_g?: number
+  input_tokens?: number
+  retrieved_context_tokens?: number
+  generated_tokens?: number
+  effective_tokens?: number
+  grid_updated_at?: string | null
+  report_card?: Record<string, unknown> | null
+  routing_impact?: Record<string, number | string> | null
+  uncertainty?: {
+    enabled?: boolean
+    optimized?: {
+      low_gco2e?: number
+      typical_gco2e?: number
+      high_gco2e?: number
+    }
+  } | null
+  pue?: number
+}
+
+function asBreakdown(raw: unknown): Record<string, unknown> {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>
+  }
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw)
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return {}
 }
 
 interface JobResult {
@@ -132,23 +200,63 @@ function formatPreferenceLabel(pref?: string | null) {
 
 function ResultsContent() {
   const searchParams = useSearchParams()
-  const jobId = searchParams.get("job_id")
+  const router = useRouter()
+  const urlJobId = searchParams.get("job_id")
+  const [jobId, setJobId] = useState<string | null>(urlJobId)
 
   const [isComplete, setIsComplete] = useState(false)
   const [jobFailed, setJobFailed] = useState(false)
   const [pollTimedOut, setPollTimedOut] = useState(false)
   const [failureMessage, setFailureMessage] = useState<string | null>(null)
   const [logs, setLogs] = useState<any[]>([])
+  const [liveProgress, setLiveProgress] = useState(0)
+  const [liveStage, setLiveStage] = useState<string | null>(null)
+  const [chunkProgress, setChunkProgress] = useState<string | null>(null)
   const [result, setResult] = useState<JobResult | null>(null)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [chatInput, setChatInput] = useState("")
   const [isChatLoading, setIsChatLoading] = useState(false)
 
+  // Restore last job when visiting /results without query (sidebar nav)
+  useEffect(() => {
+    if (urlJobId) {
+      setJobId(urlJobId)
+      rememberJobId(urlJobId)
+      return
+    }
+    const last = getLastJobId()
+    if (last) {
+      setJobId(last)
+      router.replace(`/results?job_id=${last}`)
+    }
+  }, [urlJobId, router])
+
+  const selectJob = useCallback(
+    (id: string) => {
+      rememberJobId(id)
+      setJobId(id)
+      setIsComplete(false)
+      setJobFailed(false)
+      setPollTimedOut(false)
+      setFailureMessage(null)
+      setLogs([])
+      setResult(null)
+      setLiveProgress(0)
+      setLiveStage(null)
+      setChunkProgress(null)
+      setChatMessages([])
+      router.replace(`/results?job_id=${id}`)
+    },
+    [router],
+  )
+
   useEffect(() => {
     if (!jobId) return
+    rememberJobId(jobId)
 
     let cancelled = false
     let pollInterval: ReturnType<typeof setInterval> | undefined
+    let inFlight = false
     const startedAt = Date.now()
 
     const stopPolling = () => {
@@ -173,10 +281,12 @@ function ResultsContent() {
     }
 
     const pollStatus = async () => {
-      if (cancelled) return
+      if (cancelled || inFlight) return
+      inFlight = true
 
       if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
         stopPolling()
+        inFlight = false
         if (!cancelled) {
           setPollTimedOut(true)
           setFailureMessage(
@@ -209,8 +319,27 @@ function ResultsContent() {
 
         if (response.ok) {
           const data: JobStatus = await response.json()
+          setLiveProgress(Number(data.progress) || 0)
+          if (data.stage) setLiveStage(data.stage)
+          if (
+            data.chunks_done != null &&
+            data.chunks_total != null &&
+            data.chunks_total > 0
+          ) {
+            setChunkProgress(`${data.chunks_done}/${data.chunks_total} chunks`)
+          }
+          const detail =
+            data.stage || data.chunks_done != null
+              ? `${data.message || data.status}${
+                  data.stage ? ` · ${data.stage}` : ""
+                }${
+                  data.chunks_done != null && data.chunks_total
+                    ? ` · ${data.chunks_done}/${data.chunks_total}`
+                    : ""
+                }`
+              : data.message || `Status: ${data.status}`
           appendLog(
-            data.message || `Status: ${data.status}`,
+            detail,
             isErrorStatus(data.status) ? "error" : "info",
           )
 
@@ -218,7 +347,10 @@ function ResultsContent() {
             setIsComplete(true)
             stopPolling()
             fetchResult()
-          } else if (isErrorStatus(data.status) || isTerminalStatus(data.status)) {
+          } else if (
+            isErrorStatus(data.status) ||
+            isTerminalStatus(data.status)
+          ) {
             setJobFailed(true)
             setFailureMessage(data.message || "Job failed.")
             stopPolling()
@@ -226,7 +358,11 @@ function ResultsContent() {
         }
       } catch (error) {
         console.error("Polling error:", error)
-        // Keep polling on transient network errors until POLL_TIMEOUT_MS
+        // Keep polling on transient network errors until POLL_TIMEOUT_MS.
+        // Show a heartbeat so the UI does not look frozen when the API is busy.
+        appendLog("Waiting for status (API busy or reconnecting)…", "info")
+      } finally {
+        inFlight = false
       }
     }
 
@@ -366,15 +502,22 @@ function ResultsContent() {
         <main className="p-8">
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
             <h1 className="text-3xl font-bold mb-2">Job Status & Results</h1>
-            <p className="text-muted-foreground mb-8">Job ID: {jobId || "Loading..."}</p>
+            <p className="text-muted-foreground mb-8">
+              Job ID: {jobId || "Select a job below"}
+            </p>
 
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
-              <motion.div
-                initial={{ opacity: 0, x: -20 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{ delay: 0.2 }}
-                className="lg:col-span-1 space-y-4"
-              >
+            <div className="grid grid-cols-1 xl:grid-cols-4 gap-6 mb-8">
+              <div className="xl:col-span-1 space-y-4">
+                <JobQueuePanel currentJobId={jobId} onSelectJob={selectJob} />
+              </div>
+              <div className="xl:col-span-3 space-y-6">
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                  <motion.div
+                    initial={{ opacity: 0, x: -20 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ delay: 0.2 }}
+                    className="lg:col-span-1 space-y-4"
+                  >
                 <Card className="p-6 bg-gradient-to-br from-card to-card/50 border-border/50">
                   <h3 className="text-lg font-semibold mb-4">Job Report Card</h3>
 
@@ -391,109 +534,322 @@ function ResultsContent() {
                       </div>
 
                       {(() => {
-                        const cd = result.carbon_data
-                        const bd = cd.breakdown
+                        const cd = result.carbon_data as typeof result.carbon_data & {
+                          estimated_baseline_pipeline_emissions_g?: number
+                          estimated_optimized_pipeline_emissions_g?: number
+                          assumptions_panel?: string
+                          reporting_boundary_label?: string
+                          routing_impact?: Record<string, number | string>
+                          report_card?: Record<string, unknown> | null
+                          uncertainty?: {
+                            enabled?: boolean
+                            optimized?: {
+                              low_gco2e?: number
+                              typical_gco2e?: number
+                              high_gco2e?: number
+                            }
+                          }
+                          pue?: number
+                        }
+                        const rc = asBreakdown(cd.report_card)
+                        const bd = { ...asBreakdown(cd.breakdown), ...rc }
+                        const numOr = (...vals: unknown[]) => {
+                          for (const v of vals) {
+                            if (v == null || v === "") continue
+                            const n = Number(v)
+                            if (Number.isFinite(n)) return n
+                          }
+                          return undefined
+                        }
                         const fmtTok = (n?: number) =>
                           n != null ? Number(n).toLocaleString() : "—"
                         const fmtKwh = (n?: number) =>
                           n != null ? `${Number(n).toFixed(4)} kWh` : "—"
                         const fmtG = (n?: number, d = 1) =>
                           n != null ? `${Number(n).toFixed(d)} g` : "—"
-                        const intensity =
-                          bd?.grid_carbon_intensity_gco2_kwh ?? cd.local_grid_gco2_kwh
-                        const zone = bd?.grid_zone || cd.grid_zone || cd.compute_location
+                        const intensity = numOr(
+                          rc.grid_carbon_intensity_gco2_kwh,
+                          bd.grid_carbon_intensity_gco2_kwh,
+                          cd.local_grid_gco2_kwh,
+                        )
+                        const zone =
+                          rc.grid_zone ||
+                          bd.grid_zone ||
+                          cd.grid_zone ||
+                          cd.compute_location
                         const updated =
-                          bd?.grid_updated_at || bd?.grid_datetime || cd.grid_datetime
+                          rc.grid_updated_at ||
+                          bd.grid_updated_at ||
+                          bd.grid_datetime ||
+                          cd.grid_updated_at ||
+                          cd.grid_datetime
+                        const baselineEst = numOr(
+                          rc.estimated_baseline_pipeline_emissions_g,
+                          cd.estimated_baseline_pipeline_emissions_g,
+                          bd.estimated_baseline_pipeline_emissions_g,
+                          bd.baseline_co2e_g,
+                          cd.baseline_cost_gco2e,
+                        )
+                        const optimizedEst = numOr(
+                          rc.estimated_optimized_pipeline_emissions_g,
+                          cd.estimated_optimized_pipeline_emissions_g,
+                          bd.estimated_optimized_pipeline_emissions_g,
+                          bd.actual_co2e_g,
+                          cd.actual_cost_gco2e,
+                        )
+                        const inputTokens = numOr(
+                          rc.input_tokens,
+                          bd.input_tokens,
+                          cd.input_tokens,
+                        )
+                        const retrievedTokens = numOr(
+                          rc.retrieved_context_tokens,
+                          bd.retrieved_context_tokens,
+                          cd.retrieved_context_tokens,
+                        )
+                        const generatedTokens = numOr(
+                          rc.generated_tokens,
+                          bd.generated_tokens,
+                          cd.generated_tokens,
+                        )
+                        const effectiveTokens = numOr(
+                          rc.effective_tokens,
+                          bd.effective_tokens,
+                          cd.effective_tokens,
+                          inputTokens != null ||
+                            retrievedTokens != null ||
+                            generatedTokens != null
+                            ? (inputTokens || 0) +
+                                (retrievedTokens || 0) +
+                                (generatedTokens || 0)
+                            : undefined,
+                        )
+                        const baselineEnergy = numOr(
+                          rc.baseline_energy_kwh,
+                          bd.baseline_energy_kwh,
+                          cd.baseline_energy_kwh,
+                        )
+                        const optimizedEnergy = numOr(
+                          rc.optimized_energy_kwh,
+                          bd.optimized_energy_kwh,
+                          cd.actual_energy_kwh,
+                        )
+                        const stages = asBreakdown(
+                          rc.optimized_stages_gco2e || bd.optimized_stages_gco2e,
+                        )
+                        const hasStages = Object.keys(stages).length > 0
+                        const routing = asBreakdown(
+                          rc.routing_impact || bd.routing_impact || cd.routing_impact,
+                        )
+                        const hasRouting = Object.keys(routing).length > 0
+                        const uncertainty = (rc.uncertainty ||
+                          bd.uncertainty ||
+                          cd.uncertainty) as
+                          | {
+                              enabled?: boolean
+                              optimized?: {
+                                low_gco2e?: number
+                                typical_gco2e?: number
+                                high_gco2e?: number
+                              }
+                            }
+                          | undefined
+                        const assumptionsText = pickAssumptionsText(
+                          rc.assumptions_panel as string | undefined,
+                          cd.assumptions_panel,
+                          bd.assumptions_panel as string | undefined,
+                          cd.methodology,
+                          result.methodology,
+                        )
+                        const savedGrams = numOr(
+                          bd?.carbon_saved_g,
+                          cd.carbon_saved_grams,
+                          0,
+                        )
+                        const reductionPct = Number(
+                          numOr(
+                            bd?.reduction_percent,
+                            cd.efficiency_percent,
+                            0,
+                          ),
+                        )
+                        const emissionsIncreased =
+                          bd?.emissions_direction === "increased" ||
+                          (cd as { emissions_direction?: string }).emissions_direction ===
+                            "increased" ||
+                          savedGrams < 0
                         const rows: [string, string][] = [
-                          ["Input Tokens", fmtTok(bd?.input_tokens)],
-                          ["Retrieved Context", fmtTok(bd?.retrieved_context_tokens)],
-                          ["Generated Tokens", fmtTok(bd?.generated_tokens)],
-                          ["Effective Tokens", fmtTok(bd?.effective_tokens)],
-                          [
-                            "Baseline Energy",
-                            fmtKwh(bd?.baseline_energy_kwh ?? cd.baseline_energy_kwh),
-                          ],
-                          [
-                            "Optimized Energy",
-                            fmtKwh(bd?.optimized_energy_kwh ?? cd.actual_energy_kwh),
-                          ],
+                          ["Input Tokens", fmtTok(inputTokens)],
+                          ["Retrieved Context", fmtTok(retrievedTokens)],
+                          ["Generated Tokens", fmtTok(generatedTokens)],
+                          ["Effective Tokens", fmtTok(effectiveTokens)],
+                          ["Estimated Baseline Energy", fmtKwh(baselineEnergy)],
+                          ["Estimated Optimized Energy", fmtKwh(optimizedEnergy)],
                           [
                             "Grid Intensity",
                             intensity != null
                               ? `${Number(intensity).toFixed(0)} gCO₂e/kWh`
                               : "—",
                           ],
+                          ["Estimated Baseline Pipeline", fmtG(baselineEst)],
+                          ["Estimated Optimized Pipeline", fmtG(optimizedEst)],
                           [
-                            "Baseline CO₂",
-                            fmtG(bd?.baseline_co2e_g ?? cd.baseline_cost_gco2e),
+                            emissionsIncreased
+                              ? "Increased Emissions"
+                              : "Estimated Carbon Saved",
+                            fmtG(Math.abs(savedGrams)),
                           ],
                           [
-                            "Actual CO₂",
-                            fmtG(bd?.actual_co2e_g ?? cd.actual_cost_gco2e),
-                          ],
-                          [
-                            "Carbon Saved",
-                            fmtG(bd?.carbon_saved_g ?? cd.carbon_saved_grams),
-                          ],
-                          [
-                            "Reduction",
-                            `${Number(bd?.reduction_percent ?? cd.efficiency_percent ?? 0).toFixed(1)}%`,
+                            "Estimated Reduction",
+                            `${reductionPct.toFixed(1)}%`,
                           ],
                           ["Region", String(zone || "—")],
                           ["Last Updated", String(updated || "—")],
                         ]
                         return (
                           <>
+                            <p className="text-xs text-muted-foreground">
+                              {String(
+                                cd.reporting_boundary_label ||
+                                  bd.reporting_boundary_label ||
+                                  "Operational Emissions (Boundary A) — estimates",
+                              )}
+                            </p>
                             <div className="grid grid-cols-2 gap-3">
                               <div className="rounded-lg border border-border/40 px-3 py-2">
                                 <div className="flex items-center gap-1.5 mb-1">
                                   <Leaf className="w-3.5 h-3.5 text-green-400" />
                                   <span className="text-xs text-muted-foreground">
-                                    Carbon Saved
+                                    {emissionsIncreased
+                                      ? "Increased Emissions"
+                                      : "Est. Carbon Saved"}
                                   </span>
                                 </div>
-                                <p className="text-xl font-bold tabular-nums">
-                                  {fmtG(cd.carbon_saved_grams)}
+                                <p
+                                  className={`text-xl font-bold tabular-nums ${
+                                    emissionsIncreased ? "text-rose-400" : ""
+                                  }`}
+                                >
+                                  {fmtG(Math.abs(savedGrams))}
                                 </p>
                               </div>
                               <div className="rounded-lg border border-border/40 px-3 py-2">
                                 <div className="flex items-center gap-1.5 mb-1">
                                   <Zap className="w-3.5 h-3.5 text-blue-400" />
                                   <span className="text-xs text-muted-foreground">
-                                    Reduction
+                                    Est. Reduction
                                   </span>
                                 </div>
-                                <p className="text-xl font-bold tabular-nums">
-                                  {Number(cd.efficiency_percent ?? 0).toFixed(1)}%
+                                <p
+                                  className={`text-xl font-bold tabular-nums ${
+                                    emissionsIncreased ? "text-rose-400" : ""
+                                  }`}
+                                >
+                                  {reductionPct.toFixed(1)}%
                                 </p>
                               </div>
                               <div className="rounded-lg border border-border/40 px-3 py-2">
                                 <div className="flex items-center gap-1.5 mb-1">
                                   <Star className="w-3.5 h-3.5 text-amber-400" />
                                   <span className="text-xs text-muted-foreground">
-                                    Baseline CO₂
+                                    Est. Baseline Pipeline
                                   </span>
                                 </div>
                                 <p className="text-lg font-semibold tabular-nums">
-                                  {fmtG(cd.baseline_cost_gco2e)}
+                                  {fmtG(baselineEst)}
                                 </p>
                               </div>
                               <div className="rounded-lg border border-border/40 px-3 py-2">
                                 <div className="flex items-center gap-1.5 mb-1">
                                   <Leaf className="w-3.5 h-3.5 text-emerald-400" />
                                   <span className="text-xs text-muted-foreground">
-                                    Actual CO₂
+                                    Est. Optimized Pipeline
                                   </span>
                                 </div>
                                 <p className="text-lg font-semibold tabular-nums">
-                                  {fmtG(cd.actual_cost_gco2e)}
+                                  {fmtG(optimizedEst)}
                                 </p>
                               </div>
                             </div>
 
+                            {uncertainty?.enabled && uncertainty.optimized ? (
+                              <div className="rounded-lg border border-border/40 px-3 py-2 space-y-0.5">
+                                <p className="text-xs text-muted-foreground">
+                                  Estimated CO₂e (typical / range)
+                                </p>
+                                <p className="text-sm font-semibold tabular-nums">
+                                  {fmtG(uncertainty.optimized.typical_gco2e)}{" "}
+                                  <span className="text-muted-foreground font-normal">
+                                    ({fmtG(uncertainty.optimized.low_gco2e)} –{" "}
+                                    {fmtG(uncertainty.optimized.high_gco2e)})
+                                  </span>
+                                </p>
+                              </div>
+                            ) : null}
+
+                            {hasStages ? (
+                              <div className="space-y-1.5">
+                                <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                                  Stage emissions (optimized)
+                                </p>
+                                {(
+                                  [
+                                    ["Inference", stages.inference_gco2e],
+                                    ["Embeddings", stages.embedding_gco2e],
+                                    ["Parsing", stages.parsing_gco2e],
+                                    ["Chunking", stages.chunking_gco2e],
+                                    ["Infrastructure", stages.infrastructure_gco2e],
+                                    ["Total", stages.total_gco2e],
+                                  ] as [string, unknown][]
+                                ).map(([label, value]) =>
+                                  value != null ? (
+                                    <div
+                                      key={label}
+                                      className="flex justify-between gap-3 text-sm"
+                                    >
+                                      <span className="text-muted-foreground">{label}</span>
+                                      <span className="tabular-nums font-medium">
+                                        {fmtG(numOr(value))}
+                                      </span>
+                                    </div>
+                                  ) : null
+                                )}
+                              </div>
+                            ) : null}
+
+                            {hasRouting ? (
+                              <div className="space-y-1.5">
+                                <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                                  Routing impact
+                                </p>
+                                {(
+                                  [
+                                    ["Total chunks", routing.total_chunks],
+                                    ["Light", routing.light_chunks],
+                                    ["Medium", routing.medium_chunks],
+                                    ["Heavy", routing.heavy_chunks],
+                                    ["Escalated", routing.escalated_chunks],
+                                    ["Compile calls", routing.compile_calls],
+                                  ] as [string, unknown][]
+                                ).map(([label, value]) =>
+                                  value != null ? (
+                                    <div
+                                      key={label}
+                                      className="flex justify-between gap-3 text-sm"
+                                    >
+                                      <span className="text-muted-foreground">{label}</span>
+                                      <span className="tabular-nums font-medium">
+                                        {String(value)}
+                                      </span>
+                                    </div>
+                                  ) : null
+                                )}
+                              </div>
+                            ) : null}
+
                             <div className="space-y-1.5 pt-1">
                               <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
-                                Energy → grid → CO₂e
+                                Energy → PUE → grid → CO₂e
                               </p>
                               {rows.map(([label, value]) => (
                                 <div
@@ -510,16 +866,16 @@ function ResultsContent() {
                               ))}
                             </div>
 
-                            {(cd.methodology || result.methodology) && (
+                            {(assumptionsText) && (
                               <div className="rounded-lg border border-border/40 bg-muted/20 px-3 py-2.5 space-y-1.5">
                                 <div className="flex items-center gap-1.5">
                                   <Info className="w-3.5 h-3.5 text-muted-foreground" />
                                   <p className="text-xs font-medium text-muted-foreground">
-                                    Methodology
+                                    Assumptions
                                   </p>
                                 </div>
-                                <p className="text-xs text-muted-foreground leading-relaxed">
-                                  {cd.methodology || result.methodology}
+                                <p className="text-xs text-muted-foreground leading-relaxed whitespace-pre-line">
+                                  {assumptionsText}
                                 </p>
                               </div>
                             )}
@@ -538,7 +894,17 @@ function ResultsContent() {
                 </Card>
 
                 {isComplete ? (
-                  <ProcessingInsightsPanel insights={result?.processing_insights} />
+                  <>
+                    <ProcessingInsightsPanel insights={result?.processing_insights} />
+                    <PipelineIntelligencePanel insights={result?.processing_insights as any} />
+                    <DocumentStructureViewer
+                      tree={(result?.processing_insights as any)?.document_structure_tree}
+                      diagnostics={(result?.processing_insights as any)?.structure_diagnostics}
+                    />
+                    <AdaptivePipelinePanel
+                      insights={result?.processing_insights as any}
+                    />
+                  </>
                 ) : null}
               </motion.div>
 
@@ -549,7 +915,26 @@ function ResultsContent() {
                 className="lg:col-span-2"
               >
                 {showLiveFeed ? (
-                  <LiveFeed logs={logs} />
+                  <div className="space-y-4">
+                    <Card className="p-4 bg-card/50 border-border/50 space-y-2">
+                      <div className="flex items-center justify-between text-sm">
+                        <span className="text-muted-foreground">
+                          {liveStage ? `Stage: ${liveStage}` : "Processing…"}
+                          {chunkProgress ? ` · ${chunkProgress}` : ""}
+                        </span>
+                        <span className="tabular-nums font-medium">
+                          {Math.round(liveProgress)}%
+                        </span>
+                      </div>
+                      <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
+                        <div
+                          className="h-full bg-primary transition-all duration-300 ease-out"
+                          style={{ width: `${Math.min(100, Math.max(0, liveProgress))}%` }}
+                        />
+                      </div>
+                    </Card>
+                    <LiveFeed logs={logs} />
+                  </div>
                 ) : showFailure ? (
                   <Card className="p-6 bg-card/50 border-border/50">
                     <h3 className="text-lg font-semibold mb-2 text-red-400">
@@ -680,26 +1065,28 @@ function ResultsContent() {
                   </Tabs>
                 )}
               </motion.div>
-            </div>
+                </div>
 
-            {frontier?.summary_cards && frontier.comparison_models?.length ? (
-              <div className="mt-2 mb-4">
-                <CarbonComparisonDashboard
-                  comparisonModels={frontier.comparison_models}
-                  ourSystem={frontier.our_system}
-                  summaryCards={frontier.summary_cards}
-                  badges={frontier.badges}
-                  chartBars={frontier.chart_bars}
-                  methodology={
-                    frontier.methodology ||
-                    result?.methodology ||
-                    result?.carbon_data?.methodology
-                  }
-                  breakdown={result?.carbon_data?.breakdown || null}
-                  carbonData={result?.carbon_data || null}
-                />
+                {frontier?.summary_cards && frontier.comparison_models?.length ? (
+                  <div className="mt-2 mb-4">
+                    <CarbonComparisonDashboard
+                      comparisonModels={frontier.comparison_models}
+                      ourSystem={frontier.our_system}
+                      summaryCards={frontier.summary_cards}
+                      badges={frontier.badges}
+                      chartBars={frontier.chart_bars}
+                      methodology={
+                        frontier.methodology ||
+                        result?.methodology ||
+                        result?.carbon_data?.methodology
+                      }
+                      breakdown={result?.carbon_data?.breakdown || null}
+                      carbonData={result?.carbon_data || null}
+                    />
+                  </div>
+                ) : null}
               </div>
-            ) : null}
+            </div>
           </motion.div>
         </main>
       </div>

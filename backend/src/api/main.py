@@ -1,11 +1,15 @@
 from fastapi import FastAPI, UploadFile, HTTPException, Request, Depends, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
+import asyncio
+import json
 import logging
+import re
 import uuid
 import os
 import shutil
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, AsyncIterator
 
 from src.api.schemas import (
     SummaryResponse, CarbonData, RagQueryRequest,
@@ -13,6 +17,7 @@ from src.api.schemas import (
     UserRegister, UserLogin, Token, UserResponse,
     ChatRequest, ProcessingInsights,
     RefreshRequest, LogoutRequest,
+    JobListResponse, JobListItem, QueueSnapshotResponse, CancelJobResponse,
 )
 from src.core.frontier_carbon_compare import build_frontier_comparison
 from src.db import jobs as job_store
@@ -222,6 +227,83 @@ def worker_health(response: Response):
     return body
 
 
+def _serialize_job_ts(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _job_list_item(raw: Dict[str, Any]) -> JobListItem:
+    return JobListItem(
+        job_id=str(raw.get("job_id") or ""),
+        status=str(raw.get("status") or "pending"),
+        progress=float(raw.get("progress") or 0.0),
+        message=str(raw.get("message") or ""),
+        filename=raw.get("filename"),
+        job_mode=raw.get("job_mode"),
+        claimed_by=raw.get("claimed_by"),
+        attempt_count=int(raw.get("attempt_count") or 0),
+        created_at=_serialize_job_ts(raw.get("created_at")),
+        updated_at=_serialize_job_ts(raw.get("updated_at")),
+    )
+
+
+@app.get("/jobs", response_model=JobListResponse)
+def list_my_jobs(
+    limit: int = Query(50, ge=1, le=200),
+    active_only: bool = Query(False),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Persistent job history for the signed-in user (survives navigation / sessions)."""
+    rows = job_store.list_jobs_for_user(
+        int(current_user["id"]),
+        limit=limit,
+        include_terminal=not active_only,
+    )
+    items = [_job_list_item(r) for r in rows]
+    return JobListResponse(jobs=items, count=len(items))
+
+
+@app.get("/queue", response_model=QueueSnapshotResponse)
+def get_queue_snapshot(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Live worker occupancy + this user's pending/processing jobs."""
+    snap = job_store.queue_snapshot_for_user(int(current_user["id"]))
+    return QueueSnapshotResponse(
+        alive_workers=int(snap.get("alive_workers") or 0),
+        worker_busy=bool(snap.get("worker_busy")),
+        queued_count=int(snap.get("queued_count") or 0),
+        processing_count=int(snap.get("processing_count") or 0),
+        workers=list(snap.get("workers") or []),
+        active_jobs=[_job_list_item(j) for j in (snap.get("active_jobs") or [])],
+    )
+
+
+@app.post("/jobs/{job_id}/cancel", response_model=CancelJobResponse)
+def cancel_my_job(
+    job_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Cancel a pending/processing job and free the worker slot."""
+    assert_document_owner(int(current_user["id"]), job_id)
+    try:
+        updated = job_store.cancel_job(job_id, user_id=int(current_user["id"]))
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Not allowed to cancel this job.")
+    if not updated:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    status = str(updated.get("status") or "")
+    return CancelJobResponse(
+        job_id=job_id,
+        status=status,
+        message=str(updated.get("message") or "Cancelled."),
+        freed_worker=status == job_status_mod.STATUS_CANCELLED,
+    )
+
+
 @app.post("/summarize", response_model=SummarizeJobResponse)
 async def summarize_document(
     file: UploadFile,
@@ -253,6 +335,58 @@ async def summarize_document(
     )
 
 
+def _parse_chunk_progress(message: str) -> tuple:
+    """Extract (done, total) from messages like 'Summarizing... (3/12)'."""
+    m = re.search(r"\((\d+)\s*/\s*(\d+)\)", message or "")
+    if not m:
+        return None, None
+    return int(m.group(1)), int(m.group(2))
+
+
+def _stage_from_progress(progress: float, message: str) -> str:
+    p = float(progress or 0)
+    msg = (message or "").lower()
+    if p >= 98:
+        return "finalize"
+    if p >= 90:
+        return "store"
+    if p >= 82:
+        return "compile"
+    if "escalat" in msg:
+        return "escalate"
+    if p >= 65:
+        return "validate"
+    if p >= 35:
+        return "map"
+    if p >= 24:
+        return "plan"
+    if p >= 20:
+        return "features"
+    if p >= 12:
+        return "triage"
+    return "queued"
+
+
+def _job_status_payload(job_id: str, status_dict: Dict[str, Any]) -> JobStatus:
+    status = str(status_dict.get("status") or "pending")
+    progress = float(status_dict.get("progress") or 0.0)
+    message = str(status_dict.get("message") or "")
+    done, total = _parse_chunk_progress(message)
+    stage = _stage_from_progress(progress, message)
+    partial = status_dict.get("partial") if isinstance(status_dict.get("partial"), dict) else None
+    return JobStatus(
+        job_id=job_id,
+        status=status,
+        progress=progress,
+        message=message,
+        understanding=status_dict.get("understanding"),
+        partial=partial,
+        chunks_done=done,
+        chunks_total=total,
+        stage=stage,
+    )
+
+
 @app.get("/job-status/{job_id}", response_model=JobStatus)
 def get_job_status(
     job_id: str,
@@ -265,18 +399,86 @@ def get_job_status(
     status_dict = job_store.get_job(job_id)
     if not status_dict:
         raise HTTPException(status_code=404, detail="Job not found.")
-    
-    try:
-        return JobStatus(
-            job_id=job_id,
-            status=str(status_dict.get("status") or "pending"),
-            progress=float(status_dict.get("progress") or 0.0),
-            message=str(status_dict.get("message") or ""),
-            understanding=status_dict.get("understanding"),
+
+    # Heal race: result already persisted but a late heartbeat left status=processing.
+    status = str(status_dict.get("status") or "pending")
+    if (
+        status == job_status_mod.STATUS_PROCESSING
+        and isinstance(status_dict.get("result"), dict)
+        and status_dict["result"].get("final_summary")
+        and float(status_dict.get("progress") or 0.0) >= 100.0
+    ):
+        job_store.upsert_job(
+            job_id,
+            status=job_status_mod.STATUS_COMPLETE,
+            progress=100.0,
+            message="Job complete. Results are ready.",
+            result=status_dict.get("result"),
+            claimed_by=None,
+            heartbeat_at=None,
         )
+        status_dict = job_store.get_job(job_id) or status_dict
+        status = str(status_dict.get("status") or status)
+
+    try:
+        return _job_status_payload(job_id, status_dict)
     except Exception as e:
         log.error(f"Error validating job status for {job_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Error validating status: {status_dict}")
+
+
+@app.get("/job-events/{job_id}")
+async def job_events_sse(
+    job_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Server-Sent Events stream of job progress (Phase 13).
+
+    Emits ``progress`` events as status changes; closes on terminal status.
+    Auth via same Bearer token as polling (EventSource polyfill / fetch stream).
+    """
+    assert_document_owner(int(current_user["id"]), job_id)
+
+    async def _gen() -> AsyncIterator[str]:
+        last_key = None
+        terminal = {
+            job_status_mod.STATUS_COMPLETE,
+            job_status_mod.STATUS_ERROR,
+            job_status_mod.STATUS_CANCELLED,
+            "complete",
+            "error",
+            "cancelled",
+            "failed",
+        }
+        # Cap stream lifetime (~45 min)
+        for _ in range(2700):
+            status_dict = job_store.get_job(job_id) or {}
+            if not status_dict:
+                yield f"event: error\ndata: {json.dumps({'error': 'not_found'})}\n\n"
+                return
+            payload = _job_status_payload(job_id, status_dict)
+            key = (payload.status, round(payload.progress, 1), payload.message)
+            if key != last_key:
+                last_key = key
+                data = payload.model_dump()
+                yield f"event: progress\ndata: {json.dumps(data)}\n\n"
+                if str(payload.status).lower() in terminal or payload.progress >= 100.0:
+                    yield f"event: done\ndata: {json.dumps(data)}\n\n"
+                    return
+            await asyncio.sleep(0.5)
+
+        yield f"event: timeout\ndata: {json.dumps({'error': 'stream_timeout'})}\n\n"
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/job-result/{job_id}", response_model=SummaryResponse)
@@ -345,14 +547,112 @@ def get_job_result(
     result["chart_bars"] = comparison["chart_bars"]
     result["methodology"] = comparison["methodology"]
     result["carbon_comparison"] = comparison
-    # Ensure breakdown/methodology live on carbon_data for the UI
+    # Always serve canonical Boundary-A copy + a complete breakdown so the
+    # Job Report Card cannot show legacy ChatGPT-class text or empty tokens.
     if isinstance(result.get("carbon_data"), dict):
+        from src.carbon.accounting import (
+            ASSUMPTIONS_PANEL_TEXT,
+            METHODOLOGY_TEXT as CARBON_METHODOLOGY_TEXT,
+        )
+
         cd = dict(result["carbon_data"])
-        if comparison.get("breakdown") and not cd.get("breakdown"):
-            cd["breakdown"] = comparison["breakdown"]
-        if comparison.get("methodology") and not cd.get("methodology"):
-            cd["methodology"] = comparison["methodology"]
+        bd = cd.get("breakdown") if isinstance(cd.get("breakdown"), dict) else {}
+        bd = dict(bd)
+        if comparison.get("breakdown") and isinstance(comparison["breakdown"], dict):
+            # Prefer richer stored breakdown; fill any missing keys from comparison.
+            for k, v in comparison["breakdown"].items():
+                bd.setdefault(k, v)
+        # Promote top-level energy/grid fields into breakdown when absent
+        # (older recomputes sometimes stored grams without token rows).
+        _promote = {
+            "baseline_energy_kwh": cd.get("baseline_energy_kwh"),
+            "optimized_energy_kwh": cd.get("actual_energy_kwh"),
+            "grid_carbon_intensity_gco2_kwh": cd.get("local_grid_gco2_kwh"),
+            "grid_zone": cd.get("grid_zone") or cd.get("compute_location"),
+            "grid_datetime": cd.get("grid_datetime"),
+            "baseline_co2e_g": cd.get("baseline_cost_gco2e"),
+            "actual_co2e_g": cd.get("actual_cost_gco2e"),
+            "carbon_saved_g": cd.get("carbon_saved_grams"),
+            "reduction_percent": cd.get("efficiency_percent"),
+            "estimated_baseline_pipeline_emissions_g": cd.get(
+                "estimated_baseline_pipeline_emissions_g"
+            )
+            or cd.get("baseline_cost_gco2e"),
+            "estimated_optimized_pipeline_emissions_g": cd.get(
+                "estimated_optimized_pipeline_emissions_g"
+            )
+            or cd.get("actual_cost_gco2e"),
+        }
+        for k, v in _promote.items():
+            if k not in bd and v is not None:
+                bd[k] = v
+            elif bd.get(k) is None and v is not None:
+                bd[k] = v
+        bd["assumptions_panel"] = ASSUMPTIONS_PANEL_TEXT
+        bd["reporting_boundary_label"] = (
+            bd.get("reporting_boundary_label")
+            or cd.get("reporting_boundary_label")
+            or "Operational Emissions (Boundary A)"
+        )
+        cd["breakdown"] = bd
+        cd["assumptions_panel"] = ASSUMPTIONS_PANEL_TEXT
+        cd["methodology"] = CARBON_METHODOLOGY_TEXT
+        cd["reporting_boundary_label"] = bd["reporting_boundary_label"]
+        # Flatten every Job Report Card field onto carbon_data top-level so the
+        # UI never depends on nested breakdown surviving transport/caching.
+        _flat_copy = {
+            "input_tokens": bd.get("input_tokens"),
+            "retrieved_context_tokens": bd.get("retrieved_context_tokens"),
+            "generated_tokens": bd.get("generated_tokens"),
+            "effective_tokens": bd.get("effective_tokens"),
+            "grid_updated_at": bd.get("grid_updated_at") or bd.get("grid_datetime"),
+            "baseline_energy_kwh": bd.get("baseline_energy_kwh")
+            or cd.get("baseline_energy_kwh"),
+            "actual_energy_kwh": bd.get("optimized_energy_kwh")
+            or cd.get("actual_energy_kwh"),
+            "routing_impact": bd.get("routing_impact") or cd.get("routing_impact"),
+            "uncertainty": bd.get("uncertainty") or cd.get("uncertainty"),
+        }
+        for k, v in _flat_copy.items():
+            if v is not None:
+                cd[k] = v
+        # Dedicated report-card block (frontend reads this first).
+        cd["report_card"] = {
+            "input_tokens": cd.get("input_tokens"),
+            "retrieved_context_tokens": cd.get("retrieved_context_tokens"),
+            "generated_tokens": cd.get("generated_tokens"),
+            "effective_tokens": cd.get("effective_tokens"),
+            "baseline_energy_kwh": cd.get("baseline_energy_kwh"),
+            "optimized_energy_kwh": cd.get("actual_energy_kwh"),
+            "grid_carbon_intensity_gco2_kwh": cd.get("local_grid_gco2_kwh"),
+            "grid_zone": cd.get("grid_zone") or cd.get("compute_location"),
+            "grid_updated_at": cd.get("grid_updated_at") or cd.get("grid_datetime"),
+            "estimated_baseline_pipeline_emissions_g": cd.get(
+                "estimated_baseline_pipeline_emissions_g"
+            )
+            or cd.get("baseline_cost_gco2e"),
+            "estimated_optimized_pipeline_emissions_g": cd.get(
+                "estimated_optimized_pipeline_emissions_g"
+            )
+            or cd.get("actual_cost_gco2e"),
+            "estimated_carbon_saved_g": cd.get("carbon_saved_grams"),
+            "estimated_reduction_percent": cd.get("efficiency_percent"),
+            "emissions_direction": cd.get("emissions_direction")
+            or bd.get("emissions_direction"),
+            "optimized_stages_gco2e": bd.get("optimized_stages_gco2e"),
+            "baseline_stages_gco2e": bd.get("baseline_stages_gco2e"),
+            "chunk_breakdown": cd.get("chunk_breakdown") or bd.get("chunk_breakdown"),
+            "routing_impact": cd.get("routing_impact"),
+            "uncertainty": cd.get("uncertainty"),
+            "assumptions_panel": ASSUMPTIONS_PANEL_TEXT,
+            "baseline_definition": bd.get("baseline_definition"),
+            "optimized_definition": bd.get("optimized_definition"),
+            "reporting_boundary_label": cd.get("reporting_boundary_label"),
+        }
         result["carbon_data"] = cd
+        # Keep frontier methodology for the comparison panel, but ensure
+        # carbon_data.methodology is always Boundary-A operational copy.
+        result["methodology"] = comparison["methodology"]
     return SummaryResponse(**result)
 
 

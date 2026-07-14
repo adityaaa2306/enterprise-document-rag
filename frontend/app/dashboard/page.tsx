@@ -220,21 +220,21 @@ export default function Dashboard() {
 
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
               <KPICard
-                title="Actual Emissions"
+                title="Estimated Optimized Emissions"
                 value={fmt(stats.total_carbon_consumed)}
                 unit="g CO₂e"
                 icon={Leaf}
                 delay={0}
               />
               <KPICard
-                title="Baseline Emissions"
+                title="Estimated Baseline Pipeline"
                 value={fmt(stats.total_baseline_carbon)}
                 unit="g CO₂e"
                 icon={Scale}
                 delay={0.05}
               />
               <KPICard
-                title="Carbon Saved"
+                title="Estimated Carbon Saved"
                 value={fmt(stats.total_carbon_saved)}
                 unit="g CO₂e"
                 icon={TrendingDown}

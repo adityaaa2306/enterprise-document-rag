@@ -34,12 +34,28 @@ def fetch_grid_carbon_intensity(
 
     Keys:
       intensity_gco2_kwh, zone, datetime, updated_at, source, is_estimated
+
+    Responses are TTL-cached (ELECTRICITY_MAPS_CACHE_TTL_SEC) so repeated jobs
+    in the same zone do not block on HTTP. Cache miss path is unchanged.
     """
     key = (api_key if api_key is not None else settings.ELECTRICITY_MAPS_API_KEY) or ""
     key = str(key).strip()
     z = (zone if zone is not None else getattr(settings, "ELECTRICITY_MAPS_ZONE", "") or "").strip()
     latitude = lat if lat is not None else float(getattr(settings, "ELECTRICITY_MAPS_LAT", 18.52) or 18.52)
     longitude = lon if lon is not None else float(getattr(settings, "ELECTRICITY_MAPS_LON", 73.85) or 73.85)
+
+    from src.perf.cache import (
+        get_cached_grid_intensity,
+        grid_cache_key,
+        put_cached_grid_intensity,
+    )
+
+    cache_key = grid_cache_key(zone=z, lat=latitude, lon=longitude)
+    cached = get_cached_grid_intensity(cache_key)
+    if cached is not None:
+        cached = dict(cached)
+        cached["cache_hit"] = True
+        return cached
 
     fallback = {
         "intensity_gco2_kwh": float(getattr(settings, "LOCAL_GRID_INTENSITY", 700.0) or 700.0),
@@ -49,11 +65,17 @@ def fetch_grid_carbon_intensity(
         "source": "fallback_local_grid_intensity",
         "is_estimated": True,
         "error": None,
+        "cache_hit": False,
     }
 
     if not key or key.lower() in {"your_electricity_maps_key_here", "changeme"}:
         fallback["error"] = "ELECTRICITY_MAPS_API_KEY not set"
         log.warning("Electricity Maps: no API key — using LOCAL_GRID_INTENSITY=%.1f", fallback["intensity_gco2_kwh"])
+        put_cached_grid_intensity(
+            cache_key,
+            fallback,
+            ttl_sec=float(getattr(settings, "ELECTRICITY_MAPS_CACHE_TTL_SEC", 300) or 300),
+        )
         return fallback
 
     params: Dict[str, Any] = {}
@@ -82,7 +104,7 @@ def fetch_grid_carbon_intensity(
             log.warning("Electricity Maps: %s", fallback["error"])
             return fallback
 
-        return {
+        payload = {
             "intensity_gco2_kwh": float(intensity),
             "zone": str(data.get("zone") or z or "unknown"),
             "datetime": data.get("datetime"),
@@ -93,7 +115,14 @@ def fetch_grid_carbon_intensity(
             "emission_factor_type": data.get("emissionFactorType"),
             "error": None,
             "raw": data,
+            "cache_hit": False,
         }
+        put_cached_grid_intensity(
+            cache_key,
+            payload,
+            ttl_sec=float(getattr(settings, "ELECTRICITY_MAPS_CACHE_TTL_SEC", 300) or 300),
+        )
+        return payload
     except Exception as e:
         fallback["error"] = str(e)
         log.warning("Electricity Maps exception: %s — using fallback intensity", e)

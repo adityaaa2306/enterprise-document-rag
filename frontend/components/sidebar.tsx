@@ -1,22 +1,30 @@
 "use client"
 
 import { motion } from "framer-motion"
+import { useEffect, useState } from "react"
 import { usePathname, useRouter } from "next/navigation"
 import Link from "next/link"
 import { BarChart3, FileText, LogOut, Settings, Zap } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { apiLogout } from "@/lib/api"
+import { getLastJobId } from "@/lib/job-session"
 
 export function Sidebar() {
   const pathname = usePathname()
   const router = useRouter()
+  const [resultsHref, setResultsHref] = useState("/results")
+
+  useEffect(() => {
+    const last = getLastJobId()
+    setResultsHref(last ? `/results?job_id=${last}` : "/results")
+  }, [pathname])
 
   const navItems = [
-    { href: "/", label: "Home", icon: Zap },
-    { href: "/dashboard", label: "Dashboard", icon: BarChart3 },
-    { href: "/new-job", label: "New Job", icon: FileText },
-    { href: "/results", label: "Results", icon: BarChart3 },
-    { href: "/settings", label: "Settings", icon: Settings },
+    { href: "/", label: "Home", icon: Zap, match: "/" },
+    { href: "/dashboard", label: "Dashboard", icon: BarChart3, match: "/dashboard" },
+    { href: "/new-job", label: "New Job", icon: FileText, match: "/new-job" },
+    { href: resultsHref, label: "Results", icon: BarChart3, match: "/results" },
+    { href: "/settings", label: "Settings", icon: Settings, match: "/settings" },
   ]
 
   const handleLogout = async () => {
@@ -43,20 +51,30 @@ export function Sidebar() {
       <nav className="p-4 space-y-2 flex-1">
         {navItems.map((item) => {
           const Icon = item.icon
-          const isActive = pathname === item.href
+          const isActive =
+            item.match === "/"
+              ? pathname === "/"
+              : pathname === item.match || pathname.startsWith(item.match + "/")
 
           return (
-            <motion.div key={item.href} whileHover={{ x: 4 }} whileTap={{ scale: 0.98 }}>
+            <motion.div key={item.label} whileHover={{ x: 4 }} whileTap={{ scale: 0.98 }}>
               <Link
                 href={item.href}
                 className={cn(
                   "flex items-center gap-3 px-4 py-3 rounded-lg transition-colors",
-                  isActive ? "bg-primary/20 text-primary font-medium" : "text-muted-foreground hover:bg-card/50",
+                  isActive
+                    ? "bg-primary/20 text-primary font-medium"
+                    : "text-muted-foreground hover:bg-card/50",
                 )}
               >
                 <Icon className="w-5 h-5" />
                 <span>{item.label}</span>
-                {isActive && <motion.div layoutId="active-indicator" className="ml-auto w-1 h-6 bg-primary rounded" />}
+                {isActive && (
+                  <motion.div
+                    layoutId="active-indicator"
+                    className="ml-auto w-1 h-6 bg-primary rounded"
+                  />
+                )}
               </Link>
             </motion.div>
           )

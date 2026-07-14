@@ -8,7 +8,9 @@ import { TopBar } from "@/components/top-bar"
 import { UploadZone } from "@/components/upload-zone"
 import { SmartRoutingPanel } from "@/components/smart-routing-panel"
 import { apiFetch } from "@/lib/api"
+import { rememberJobId } from "@/lib/job-session"
 import type { RoutingPreference } from "@/lib/routing"
+import { JobQueuePanel } from "@/components/job-queue-panel"
 
 export default function NewJobPage() {
   const router = useRouter()
@@ -46,6 +48,7 @@ export default function NewJobPage() {
       }
 
       const data = await response.json()
+      rememberJobId(data.job_id)
       router.push(`/results?job_id=${data.job_id}`)
     } catch (error) {
       console.error("Error uploading file:", error)
@@ -72,21 +75,28 @@ export default function NewJobPage() {
               Upload a file. Smart Routing selects models automatically — no manual mode choice.
             </p>
 
-            {step === "upload" || !selectedFile ? (
-              <UploadZone onFileSelect={handleFileSelect} />
-            ) : (
-              <SmartRoutingPanel
-                fileName={selectedFile.name}
-                preference={preference}
-                onPreferenceChange={setPreference}
-                onSubmit={handleSubmit}
-                onBack={() => {
-                  setSelectedFile(null)
-                  setStep("upload")
-                }}
-                isSubmitting={isSubmitting}
-              />
-            )}
+            <div className="grid grid-cols-1 xl:grid-cols-4 gap-6">
+              <div className="xl:col-span-1">
+                <JobQueuePanel />
+              </div>
+              <div className="xl:col-span-3">
+                {step === "upload" || !selectedFile ? (
+                  <UploadZone onFileSelect={handleFileSelect} />
+                ) : (
+                  <SmartRoutingPanel
+                    fileName={selectedFile.name}
+                    preference={preference}
+                    onPreferenceChange={setPreference}
+                    onSubmit={handleSubmit}
+                    onBack={() => {
+                      setSelectedFile(null)
+                      setStep("upload")
+                    }}
+                    isSubmitting={isSubmitting}
+                  />
+                )}
+              </div>
+            </div>
           </motion.div>
         </main>
       </div>

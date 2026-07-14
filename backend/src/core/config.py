@@ -122,8 +122,20 @@ class Settings(BaseSettings):
     # Soft token budget for a single compile prompt; over this we hierarchical-batch.
     COMPILE_MAX_INPUT_TOKENS: int = 10000
     COMPILE_BATCH_SIZE: int = 8
-    # Parallel map summarization workers (lower = less NIM connection pressure)
-    MAP_MAX_WORKERS: int = 3
+    # Parallel map summarization workers (NIM-bound; raise for lower wall-clock)
+    MAP_MAX_WORKERS: int = 8
+    # When API+worker share one process, cap map concurrency so /job-status stays responsive
+    EMBEDDED_MAP_MAX_WORKERS: int = 3
+    # Parallel intermediate compile batches within one hierarchical round
+    COMPILE_MAX_WORKERS: int = 4
+    # Parallel QVA chunk validation workers (CPU-bound lexical checks)
+    VALIDATE_MAX_WORKERS: int = 8
+    # Throttle durable progress DB writes (in-memory always updates)
+    PROGRESS_WRITE_INTERVAL_SEC: float = 0.75
+    # Prefetch chunk embeddings during map/validate/compile overlap
+    ENABLE_EMBED_PREFETCH: bool = True
+    # Electricity Maps response cache TTL (seconds)
+    ELECTRICITY_MAPS_CACHE_TTL_SEC: float = 300.0
 
     # --- Quality Validation Agent ---
     QVA_CONFIDENCE_THRESHOLD: float = 0.60
@@ -131,9 +143,15 @@ class Settings(BaseSettings):
     # Lexical "hallucination" flags paraphrases; 0.15 was failing almost all abstractive maps.
     QVA_HALLUCINATION_MAX: float = 0.35
     QVA_CONTRADICTION_MAX: float = 0.10
-    QVA_MAX_ESCALATIONS: int = 1  # exactly +1 tier
+    # Light→Medium→Heavy ladder: up to 2 escalations (failed chunks only).
+    QVA_MAX_ESCALATIONS: int = 2
     # Cap heavy re-summarize so one strict QVA pass cannot escalate every chunk.
     QVA_MAX_ESCALATE_CHUNKS: int = 8
+    # Embedding cosine semantic similarity floor (0 disables the check).
+    QVA_SEMANTIC_SIM_MIN: float = 0.35
+    QVA_ENTITY_RETENTION_MIN: float = 0.40
+    # Accept compile when confidence >= this (medium-first compile gate).
+    QVA_COMPILE_CONFIDENCE_THRESHOLD: float = 0.58
 
     # --- Telemetry ---
     ROUTING_TELEMETRY_PATH: str = "./local_db/routing_telemetry.jsonl"
@@ -162,7 +180,9 @@ class Settings(BaseSettings):
     # --- Durable worker (Phase 3) — Postgres/SQLite job queue; no Celery/Redis ---
     WORKER_ID: str = ""  # empty → auto hostname-pid-uuid
     WORKER_POLL_INTERVAL_SEC: float = 2.0
-    WORKER_CLAIM_TIMEOUT_SEC: int = 900  # reclaim processing jobs after this (heartbeat stale)
+    # Heartbeats refresh ~10s while a job is live; 180s is enough slack for DB
+    # contention without leaving restart zombies stuck for 15 minutes.
+    WORKER_CLAIM_TIMEOUT_SEC: int = 180
     WORKER_HEARTBEAT_INTERVAL_SEC: float = 10.0
     WORKER_HEARTBEAT_STALE_SEC: int = 60  # API health: worker considered dead after this
     WORKER_MAX_ATTEMPTS: int = 3
@@ -173,6 +193,10 @@ class Settings(BaseSettings):
     # Hard wall-clock limit for a single claim attempt (stops orphaned "processing")
     # Large PDFs with medium/heavy tiers + NIM fallbacks need >10 minutes.
     JOB_MAX_RUNTIME_SEC: float = 1800.0
+    # Cap a single compile NIM invocation (branch repair / heavy compile).
+    # Progress UI polls every 15s inside the wait; without a cap, a hung HTTP
+    # client can leave the job at "waiting on model..." indefinitely.
+    COMPILE_CALL_MAX_SEC: float = 600.0
     # Feature extraction LLM/embed probe is optional metadata — never abort the job
     FEATURE_EXTRACTION_OPTIONAL: bool = True
     # When true, API process starts durable worker as an in-process thread
@@ -193,18 +217,48 @@ class Settings(BaseSettings):
 
     # --- Phase 2.A Adaptive Chunking ---
     USE_ADAPTIVE_CHUNKING: bool = True
-    # Target size for each map-summarize unit (chars≈tokens*4). Larger → fewer chunks.
+    # Production structure parser (heading validation → sections → pack).
+    # When True, replaces naive Title→parent chunking for map units.
+    USE_STRUCTURE_PARSER: bool = True
+    HEADING_CONFIDENCE_THRESHOLD: float = 0.55
+    STRUCTURE_TARGET_TOKENS: int = 800
+    STRUCTURE_MIN_TOKENS: int = 450
+    STRUCTURE_MAX_TOKENS: int = 1200
+    STRUCTURE_MERGE_SIM_MIN: float = 0.28
+    # Target size for each map-summarize unit (legacy ChunkingService path).
     CHUNK_MAX_TOKENS: int = 1500
+    # Soft minimum before merging tiny sections together.
+    CHUNK_MIN_TOKENS: int = 120
     CHUNK_SIM_THRESHOLD: float = 0.15  # split when adjacent similarity falls below
     # Do not split on low similarity until the buffer is at least this full.
     # Prevents thousands of tiny unstructured elements from each becoming a chunk.
     CHUNK_MIN_TOKENS_BEFORE_SIM_SPLIT: int = 500
-    # Hard cap on map chunks; excess is re-packed into larger units.
-    CHUNK_MAX_COUNT: int = 48
+    # Soft cap for large docs (500–1000+ pages). Hierarchy handles fan-in;
+    # force-cap only when CHUNK_FORCE_CAP is true.
+    CHUNK_MAX_COUNT: int = 512
+    CHUNK_FORCE_CAP: bool = False
+    # Overlap tokens appended from previous chunk when splitting on max size.
+    CHUNK_OVERLAP_TOKENS: int = 40
     # Titles open sections; keep False so headings are not summarized alone.
     CHUNK_TITLE_AS_CHUNK: bool = False
     # Optional override; empty → use CHROMA_COLLECTION_NAME
     CHUNK_COLLECTION_NAME: str = ""
+
+    # --- Adaptive hierarchical pipeline ---
+    ADAPTIVE_CHUNK_ROUTING: bool = True
+    ADAPTIVE_REGIONAL_HIERARCHY: bool = True
+    # Medium-first compile; escalate to heavy only if QVA fails.
+    COMPILE_MEDIUM_FIRST: bool = True
+    # Pipeline intelligence (capability analyzer + strategy selection)
+    PIPELINE_INTELLIGENCE_ENABLED: bool = True
+    PIPELINE_INTEL_POLICY_VERSION: str = "intel-v1"
+    # Carbon budget (routing constraint; does not alter Boundary-A math).
+    CARBON_BUDGET_ENABLED: bool = True
+    CARBON_BUDGET_G: float = 40.0
+    # Naive baseline frontier reference: heavy | gpt-4 | gpt-4o | claude-opus | gpt-o3 | ...
+    CARBON_BASELINE_REFERENCE: str = "heavy"
+    # Negligible Heavy quality gain vs Medium → prefer Medium (0–1).
+    HEAVY_QUALITY_GAIN_MIN: float = 0.02
 
     # --- Authentication Settings ---
     # Empty by default — production MUST set JWT_SECRET_KEY via env.
@@ -324,6 +378,14 @@ class Settings(BaseSettings):
 
     def chroma_collection(self) -> str:
         return self.CHUNK_COLLECTION_NAME or self.CHROMA_COLLECTION_NAME
+
+    def effective_map_max_workers(self) -> int:
+        """Map concurrency; capped for in-process embedded worker so API polls stay live."""
+        base = max(1, int(self.MAP_MAX_WORKERS or 3))
+        if bool(self.RUN_EMBEDDED_WORKER):
+            cap = max(1, int(getattr(self, "EMBEDDED_MAP_MAX_WORKERS", 3) or 3))
+            return min(base, cap)
+        return base
 
     def validate_for_runtime(self, *, require_cors: bool | None = None) -> None:
         """
