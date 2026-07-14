@@ -43,6 +43,8 @@ class CarbonData(BaseModel):
     effective_tokens: Optional[int] = None
     # Pre-built Job Report Card payload (tokens/energy/stages/routing)
     report_card: Optional[dict] = None
+    # Carbon-Aware Region Scheduler decision (single-region today)
+    region_decision: Optional[dict] = None
 
 
 class FrontierComparisonModel(BaseModel):

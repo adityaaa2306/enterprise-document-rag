@@ -279,6 +279,8 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
             "chunk_breakdown": raw_carbon.get("chunk_breakdown"),
             "emissions_direction": raw_carbon.get("emissions_direction"),
             "baseline_reference": raw_carbon.get("baseline_reference"),
+            "region_decision": raw_carbon.get("region_decision"),
+            "grid_updated_at": raw_carbon.get("grid_updated_at"),
         }
 
         insights = build_processing_insights(

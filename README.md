@@ -6,6 +6,7 @@ A production-ready intelligent document processing system with carbon-aware comp
 
 - **Intelligent Document Processing**: Multi-agent system for document summarization
 - **Carbon-Aware Computing**: Estimates operational CO₂e (Boundary A) via tokens × J/token × PUE × live Electricity Maps intensity; smart routing selects lighter models when safe. See [`backend/docs/CARBON_ACCOUNTING.md`](backend/docs/CARBON_ACCOUNTING.md).
+- **Carbon-Aware Region Scheduler**: Production-shaped region scheduling with a provider abstraction. **Current mode is single-region** (configured India / Electricity Maps free-tier zone)—not fake global routing. See [`backend/docs/REGION_SCHEDULER.md`](backend/docs/REGION_SCHEDULER.md).
 - **Speculative RAG**: Efficient retrieval-augmented generation with draft-verify architecture
 - **Real-time Dashboard**: Monitor processing metrics, carbon savings, and efficiency
 - **Modern UI**: Glassmorphism design with dark mode support

@@ -7,6 +7,7 @@ import { Sidebar } from "@/components/sidebar"
 import { TopBar } from "@/components/top-bar"
 import { LiveFeed } from "@/components/live-feed"
 import { JobQueuePanel } from "@/components/job-queue-panel"
+import { ExecutionRegionPanel } from "@/components/execution-region-panel"
 import { Card } from "@/components/ui/card"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Leaf, Zap, Star, Copy, Download, Info } from "lucide-react"
@@ -140,6 +141,27 @@ interface CarbonData {
     }
   } | null
   pue?: number
+  region_decision?: {
+    selected_region_name?: string
+    selected_region_id?: string
+    selected_region?: {
+      display_name?: string
+      id?: string
+      grid_zone?: string
+      provider?: string
+    } | null
+    provider?: string
+    grid_carbon_intensity_gco2_kwh?: number
+    grid_zone?: string
+    scheduling_mode?: string
+    data_source?: string
+    data_freshness?: string
+    confidence?: string
+    execution_status?: string
+    future_support?: string
+    reason?: string
+    timestamp?: string
+  } | null
 }
 
 function asBreakdown(raw: unknown): Record<string, unknown> {
@@ -895,6 +917,12 @@ function ResultsContent() {
 
                 {isComplete ? (
                   <>
+                    <ExecutionRegionPanel
+                      decision={result?.carbon_data?.region_decision}
+                      fallbackIntensity={result?.carbon_data?.local_grid_gco2_kwh}
+                      fallbackZone={result?.carbon_data?.grid_zone}
+                      fallbackSource={result?.carbon_data?.grid_source}
+                    />
                     <ProcessingInsightsPanel insights={result?.processing_insights} />
                     <PipelineIntelligencePanel insights={result?.processing_insights as any} />
                     <DocumentStructureViewer

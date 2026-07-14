@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     ELECTRICITY_MAPS_ZONE: str = ""
     ELECTRICITY_MAPS_LAT: float = 18.52
     ELECTRICITY_MAPS_LON: float = 73.85
+    # --- Carbon-Aware Region Scheduler (single live region today) ---
+    # Modes: single-region (enabled) | carbon-optimized (future multi-region)
+    REGION_SCHEDULER_MODE: str = "single-region"
+    REGION_SCHEDULER_DEFAULT_REGION: str = "india"
+    REGION_SCHEDULER_DEFAULT_REGION_NAME: str = "India"
+    REGION_SCHEDULER_PROVIDER: str = "electricity_maps"
     # Per-request HTTP timeout for chat/embeddings (prevents infinite "processing")
     NIM_HTTP_TIMEOUT_SEC: float = 90.0
     # Longer read timeout for final compile (large multi-chunk prompts)

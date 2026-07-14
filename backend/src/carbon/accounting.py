@@ -28,7 +28,6 @@ import math
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from src.carbon import assumptions as A
-from src.carbon.electricity_maps import fetch_grid_carbon_intensity
 from src.carbon.energy_model import (
     BASELINE_RETRIEVED_CHUNK_CAP,
     GPT4O_MINI_MEDIUM_WH,
@@ -480,7 +479,16 @@ def estimate_workflow_carbon(
         max(int(input_tokens * 1.25), input_tokens) if input_tokens > 0 else 0
     )
 
-    grid_info = dict(grid) if grid is not None else fetch_grid_carbon_intensity()
+    grid_info = dict(grid) if grid is not None else None
+    region_decision_dict: Optional[Dict[str, Any]] = None
+    if grid_info is None:
+        # Grid intensity ALWAYS flows through the Region Scheduler → Carbon Provider.
+        # Accounting never calls Electricity Maps directly.
+        from src.carbon.scheduler import estimate_workload_from_state, schedule_region
+
+        decision = schedule_region(estimate_workload_from_state(state))
+        region_decision_dict = decision.to_dict()
+        grid_info = decision.grid.to_legacy_dict()
     intensity = float(grid_info.get("intensity_gco2_kwh") or 0.0)
 
     baseline_ref, baseline_j = _resolve_baseline_j_per_token()
@@ -692,4 +700,5 @@ def estimate_workflow_carbon(
         "methodology": METHODOLOGY_TEXT,
         "pue": A.PUE,
         "baseline_reference": baseline_ref,
+        "region_decision": region_decision_dict,
     }

@@ -21,12 +21,21 @@ from src.carbon.assumptions import (
     ReportingBoundary,
     assumption_snapshot,
 )
-from src.carbon.electricity_maps import fetch_grid_carbon_intensity
 from src.carbon.energy_model import estimate_tokens
+from src.carbon.scheduler import schedule_region
+
+# Legacy re-export: prefer schedule_region() / CarbonProvider for new code.
+def fetch_grid_carbon_intensity(*args, **kwargs):
+    """Deprecated path — routes through Region Scheduler for compatibility."""
+    from src.carbon.electricity_maps import fetch_grid_carbon_intensity as _legacy
+
+    return _legacy(*args, **kwargs)
+
 
 __all__ = [
     "estimate_workflow_carbon",
     "fetch_grid_carbon_intensity",
+    "schedule_region",
     "estimate_tokens",
     "METHODOLOGY_TEXT",
     "ASSUMPTIONS_PANEL_TEXT",

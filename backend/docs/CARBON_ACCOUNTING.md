@@ -26,8 +26,12 @@ E (kWh)        = E_facility / 3_600_000
 CO₂e (g)       = E (kWh) × grid_intensity (gCO₂e/kWh)
 ```
 
-Grid intensity comes from the live **Electricity Maps** API
-(`GET /v3/carbon-intensity/latest`), with fallback to `LOCAL_GRID_INTENSITY`.
+Grid intensity comes from the **Carbon-Aware Region Scheduler** →
+`CarbonProvider` (currently Electricity Maps
+`GET /v3/carbon-intensity/latest` for the configured single live region),
+with fallback to `LOCAL_GRID_INTENSITY`. Accounting code does **not** call
+Electricity Maps directly — see [`REGION_SCHEDULER.md`](REGION_SCHEDULER.md).
+The CO₂e **equations above are unchanged**.
 
 ```
 Carbon Saved (g)  = Baseline − Optimized     (signed; may be negative)
