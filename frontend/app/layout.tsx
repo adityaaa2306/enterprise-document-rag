@@ -10,7 +10,21 @@ export const metadata: Metadata = {
   title: "Green Agentic | Carbon-Aware Document Intelligence",
   description:
     "A document processing pipeline that decides, per chunk, which model to run — and where — for transparent carbon accounting.",
-  generator: "v0.app",
+  metadataBase: new URL("https://enterprise-document-rag.vercel.app"),
+  openGraph: {
+    title: "Green Agentic | Carbon-Aware Document Intelligence",
+    description:
+      "Adaptive routing, carbon-aware scheduling, and transparent accounting — chunk by chunk.",
+    url: "https://enterprise-document-rag.vercel.app",
+    siteName: "Green Agentic",
+    type: "website",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Green Agentic | Carbon-Aware Document Intelligence",
+    description:
+      "Adaptive routing, carbon-aware scheduling, and transparent accounting — chunk by chunk.",
+  },
   icons: {
     icon: [
       {

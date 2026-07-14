@@ -24,8 +24,23 @@ mkdir -p "${VECTOR_DB_PATH}" "${CHROMA_PERSIST_DIRECTORY}" temp_uploads \
   "${OBJECT_STORAGE_LOCAL_ROOT:-/data/object_store}"
 
 if [[ "${RUN_MIGRATIONS_ON_STARTUP}" == "true" || "${RUN_MIGRATIONS_ON_STARTUP}" == "1" ]]; then
-  echo "[api] Running alembic upgrade head..."
-  python -m alembic upgrade head
+  echo "[api] Running alembic upgrade head (240s timeout)..."
+  # Neon cold starts can stall migrations past Render's port-scan window.
+  # Prefer binding uvicorn over blocking forever on a stuck migrate.
+  python - <<'PY'
+import subprocess
+import sys
+
+try:
+    completed = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        timeout=240,
+    )
+    raise SystemExit(completed.returncode)
+except subprocess.TimeoutExpired:
+    print("[api] alembic upgrade timed out after 240s — starting API; check /api/ready", flush=True)
+    raise SystemExit(0)
+PY
 fi
 
 if [[ "${RUN_EMBEDDED_WORKER}" == "true" || "${RUN_EMBEDDED_WORKER}" == "1" ]]; then

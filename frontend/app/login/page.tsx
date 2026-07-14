@@ -10,6 +10,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Loader2, Lock, Mail, Zap } from "lucide-react"
 import Link from "next/link"
 import { setTokens } from "@/lib/api"
+import { seedCurrentUserCache } from "@/lib/current-user-cache"
 import { API_BASE_URL } from "@/config"
 
 export default function LoginPage() {
@@ -40,10 +41,19 @@ export default function LoginPage() {
       }
 
       setTokens(data.access_token, data.refresh_token)
-      router.push("/dashboard")
+      if (data.user?.id != null) {
+        seedCurrentUserCache({
+          id: data.user.id,
+          email: data.user.email,
+          full_name: data.user.full_name,
+          is_active: data.user.is_active,
+          created_at: data.user.created_at ?? null,
+        })
+      }
+      // Navigate immediately — do not wait for dashboard chunk beyond replace.
+      router.replace("/dashboard")
     } catch (err: any) {
       setError(err.message || "An error occurred during login")
-    } finally {
       setLoading(false)
     }
   }

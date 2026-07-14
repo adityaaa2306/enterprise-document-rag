@@ -4,12 +4,12 @@ import { motion, useScroll, useTransform } from "framer-motion";
 import { useRef } from "react";
 
 const REGIONS = [
-  { id: "us-west-2",  name: "us-west-2",  x: 130, y: 200, grid: 210, tier: "primary", city: "Oregon" },
-  { id: "us-east-1",  name: "us-east-1",  x: 320, y: 220, grid: 420, tier: "reference", city: "Virginia" },
-  { id: "eu-north-1", name: "eu-north-1", x: 560, y: 130, grid: 45,  tier: "reference", city: "Stockholm" },
-  { id: "eu-west-1",  name: "eu-west-1",  x: 500, y: 190, grid: 290, tier: "reference", city: "Ireland" },
-  { id: "ap-south-1", name: "ap-south-1", x: 760, y: 260, grid: 710, tier: "reference", city: "Mumbai" },
-  { id: "ap-ne-1",    name: "ap-ne-1",    x: 900, y: 200, grid: 480, tier: "reference", city: "Tokyo" },
+  { id: "us-west-2",  name: "us-west-2",  x: 130, y: 210, grid: 210, tier: "primary", city: "Oregon" },
+  { id: "us-east-1",  name: "us-east-1",  x: 320, y: 230, grid: 420, tier: "reference", city: "Virginia" },
+  { id: "eu-north-1", name: "eu-north-1", x: 560, y: 140, grid: 45,  tier: "reference", city: "Stockholm" },
+  { id: "eu-west-1",  name: "eu-west-1",  x: 500, y: 200, grid: 290, tier: "reference", city: "Ireland" },
+  { id: "ap-south-1", name: "ap-south-1", x: 760, y: 270, grid: 710, tier: "reference", city: "Mumbai" },
+  { id: "ap-ne-1",    name: "ap-ne-1",    x: 880, y: 210, grid: 480, tier: "reference", city: "Tokyo" },
 ];
 
 export default function RegionScheduling() {
@@ -42,20 +42,24 @@ export default function RegionScheduling() {
             <span>fig. 04 — candidate regions</span>
             <span className="text-amber-400/80">status · architecture-ready</span>
           </div>
-          <div className="relative">
-            <svg viewBox="0 0 1000 380" className="w-full h-[420px]">
+          <div className="relative overflow-hidden">
+            <svg
+              viewBox="0 0 1000 420"
+              className="w-full h-auto min-h-[280px] md:min-h-[360px]"
+              preserveAspectRatio="xMidYMid meet"
+            >
               {/* faint grid */}
               {Array.from({ length: 12 }).map((_, i) => (
-                <line key={i} x1={i * 84} y1={0} x2={i * 84} y2={380} stroke="rgba(255,255,255,0.03)" />
+                <line key={i} x1={i * 84} y1={0} x2={i * 84} y2={420} stroke="rgba(255,255,255,0.03)" />
               ))}
-              {Array.from({ length: 6 }).map((_, i) => (
-                <line key={"h" + i} x1={0} y1={i * 76} x2={1000} y2={i * 76} stroke="rgba(255,255,255,0.03)" />
+              {Array.from({ length: 7 }).map((_, i) => (
+                <line key={"h" + i} x1={0} y1={i * 70} x2={1000} y2={i * 70} stroke="rgba(255,255,255,0.03)" />
               ))}
               {/* connecting lines to primary */}
               {REGIONS.filter((r) => r.tier === "reference").map((r) => (
                 <line
                   key={"c" + r.id}
-                  x1={130} y1={200} x2={r.x} y2={r.y}
+                  x1={130} y1={210} x2={r.x} y2={r.y}
                   stroke="rgba(255,255,255,0.06)"
                   strokeDasharray="3 4"
                 />
@@ -63,49 +67,49 @@ export default function RegionScheduling() {
               {REGIONS.map((r, i) => {
                 const isPrimary = r.tier === "primary";
                 return (
-                  <motion.g
-                    key={r.id}
-                    initial={{ opacity: 0, scale: 0.6 }}
-                    whileInView={{ opacity: 1, scale: 1 }}
-                    viewport={{ once: true }}
-                    transition={{ delay: i * 0.08, duration: 0.6 }}
-                    transform={`translate(${r.x}, ${r.y})`}
-                  >
-                    {isPrimary && (
-                      <>
-                        <motion.circle
-                          r={26}
-                          fill="none"
-                          stroke="#10B981"
-                          strokeWidth="0.8"
-                          animate={{ r: [22, 42, 22], opacity: [0.6, 0, 0.6] }}
-                          transition={{ duration: 2.4, repeat: Infinity }}
-                        />
-                        <circle r={18} fill="rgba(16,185,129,0.1)" stroke="#10B981" strokeWidth="1.2" />
-                      </>
-                    )}
-                    {!isPrimary && (
-                      <circle r={5} fill="#0a0a0a" stroke="rgba(255,255,255,0.35)" strokeWidth="1" />
-                    )}
-                    <text
-                      x={0} y={isPrimary ? -30 : -14}
-                      textAnchor="middle"
-                      fontFamily="JetBrains Mono, monospace" fontSize="10"
-                      fill={isPrimary ? "#10B981" : "#E5E5E5"}
-                      style={{ letterSpacing: "0.14em", textTransform: "uppercase" }}
+                  <g key={r.id} transform={`translate(${r.x}, ${r.y})`}>
+                    <motion.g
+                      initial={{ opacity: 0 }}
+                      whileInView={{ opacity: 1 }}
+                      viewport={{ once: true }}
+                      transition={{ delay: i * 0.08, duration: 0.6 }}
                     >
-                      {r.name}
-                    </text>
-                    <text
-                      x={0} y={isPrimary ? 40 : 22}
-                      textAnchor="middle"
-                      fontFamily="JetBrains Mono, monospace" fontSize="9"
-                      fill="#525252"
-                      style={{ letterSpacing: "0.12em" }}
-                    >
-                      {r.grid} gCO₂/kWh
-                    </text>
-                  </motion.g>
+                      {isPrimary && (
+                        <>
+                          <motion.circle
+                            r={26}
+                            fill="none"
+                            stroke="#10B981"
+                            strokeWidth="0.8"
+                            animate={{ r: [22, 42, 22], opacity: [0.6, 0, 0.6] }}
+                            transition={{ duration: 2.4, repeat: Infinity }}
+                          />
+                          <circle r={18} fill="rgba(16,185,129,0.1)" stroke="#10B981" strokeWidth="1.2" />
+                        </>
+                      )}
+                      {!isPrimary && (
+                        <circle r={5} fill="#0a0a0a" stroke="rgba(255,255,255,0.35)" strokeWidth="1" />
+                      )}
+                      <text
+                        x={0} y={isPrimary ? -34 : -16}
+                        textAnchor="middle"
+                        fontFamily="JetBrains Mono, monospace" fontSize="10"
+                        fill={isPrimary ? "#10B981" : "#E5E5E5"}
+                        style={{ letterSpacing: "0.14em", textTransform: "uppercase" }}
+                      >
+                        {r.name}
+                      </text>
+                      <text
+                        x={0} y={isPrimary ? 44 : 24}
+                        textAnchor="middle"
+                        fontFamily="JetBrains Mono, monospace" fontSize="9"
+                        fill="#525252"
+                        style={{ letterSpacing: "0.12em" }}
+                      >
+                        {r.grid} gCO₂/kWh
+                      </text>
+                    </motion.g>
+                  </g>
                 );
               })}
             </svg>

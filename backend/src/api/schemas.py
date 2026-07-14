@@ -298,12 +298,23 @@ class UserLogin(BaseModel):
     email: str
     password: str
 
+class UserResponse(BaseModel):
+    """Schema for user information (without password)"""
+    id: int
+    email: str
+    full_name: str
+    is_active: bool
+    created_at: Optional[str] = None
+
+
 class Token(BaseModel):
     """JWT access token response; refresh_token added in Phase 1 (optional for old clients)."""
     access_token: str
     token_type: str = "bearer"
     refresh_token: Optional[str] = None
     expires_in: Optional[int] = None
+    # Optional so clients can seed /auth/me cache without an extra round-trip.
+    user: Optional[UserResponse] = None
 
 
 class RefreshRequest(BaseModel):
@@ -314,12 +325,3 @@ class RefreshRequest(BaseModel):
 class LogoutRequest(BaseModel):
     refresh_token: Optional[str] = None
     revoke_all: bool = False
-
-
-class UserResponse(BaseModel):
-    """Schema for user information (without password)"""
-    id: int
-    email: str
-    full_name: str
-    is_active: bool
-    created_at: Optional[str] = None

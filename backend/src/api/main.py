@@ -28,7 +28,14 @@ from src.agents import models
 from src.memory import storage
 from src.api import auth
 from src.api.health import router as health_router
-from src.api.deps import get_current_user, get_optional_user, assert_document_owner, assert_conversation_owner
+from src.api.deps import (
+    get_current_user,
+    get_optional_user,
+    assert_document_owner,
+    assert_conversation_owner,
+    enforce_job_owner,
+    seed_user_cache,
+)
 from src.api.request_logging import RequestLoggingMiddleware
 
 # --- Setup ---
@@ -51,18 +58,12 @@ def _safe_filename(name: Optional[str]) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    This function runs on application startup.
-    1. Validates runtime config (env, JWT, CORS).
-    2. Loads the NVIDIA NIM client.
-    3. Initializes relational DB; probes Chroma without long blocking waits.
-    4. Optionally starts an in-process embedded worker thread (free-tier).
+    FastAPI lifespan.
 
-    Critical for Render: uvicorn does not bind PORT until this lifespan
-    completes. Embedded Chroma init is local disk only (no network waits).
-
-    RUN_EMBEDDED_WORKER runs the durable worker in a daemon thread inside
-    this process (shared NIM/Chroma memory) — NOT a second Python process,
-    which OOMs free-tier instances and causes 502s during jobs.
+    Critical for Render free-tier: uvicorn does **not** bind PORT until this
+    generator yields. Keep pre-yield work minimal (config + scratch cleanup).
+    Heavy init (NIM client, DB/Chroma, keepalive, embedded worker) runs in a
+    background thread after the port is open so health checks pass.
     """
     import threading
 
@@ -71,7 +72,6 @@ async def lifespan(app: FastAPI):
     log.info("API Startup: validating configuration...")
     settings.validate_for_runtime()
 
-    # Clear scratch downloads only (object store is durable)
     if os.path.exists(UPLOAD_DIR):
         try:
             shutil.rmtree(UPLOAD_DIR)
@@ -80,35 +80,74 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             log.warning(f"Could not clear temp_uploads: {e}")
 
-    log.info("Startup checks complete.")
+    log.info("Startup checks complete — binding HTTP port (deferred warm-up).")
 
-    # 2. Load NVIDIA NIM client (no local HF model downloads)
-    models.load_all_models()
-
-    # 3. Relational DB + embedded Chroma (local disk — no remote wait)
-    storage.init_database(block_on_chroma=False)
-
+    keepalive_stop = threading.Event()
     worker_thread: Optional[threading.Thread] = None
-    if getattr(settings, "RUN_EMBEDDED_WORKER", False):
-        wid = (settings.WORKER_ID or "").strip() or "embedded-api-1"
-        log.info("Starting in-process embedded worker thread (WORKER_ID=%s)", wid)
-        worker_thread = threading.Thread(
-            target=run_worker_forever,
-            kwargs={"worker_id": wid, "embedded": True},
-            name="embedded-durable-worker",
-            daemon=True,
-        )
-        worker_thread.start()
+    warm_thread: Optional[threading.Thread] = None
+
+    def _warm_runtime() -> None:
+        nonlocal worker_thread
+        try:
+            models.load_all_models()
+            storage.init_database(block_on_chroma=False)
+
+            def _db_keepalive_loop() -> None:
+                from sqlalchemy import text
+
+                from src.db.session import get_session, is_postgres
+
+                if not is_postgres():
+                    return
+                while not keepalive_stop.wait(60.0):
+                    try:
+                        db = get_session()
+                        try:
+                            db.execute(text("SELECT 1"))
+                        finally:
+                            db.close()
+                    except Exception as e:
+                        log.debug("DB keepalive ping failed: %s", e)
+
+            threading.Thread(
+                target=_db_keepalive_loop,
+                name="db-keepalive",
+                daemon=True,
+            ).start()
+
+            if getattr(settings, "RUN_EMBEDDED_WORKER", False):
+                wid = (settings.WORKER_ID or "").strip() or "embedded-api-1"
+                log.info("Starting in-process embedded worker thread (WORKER_ID=%s)", wid)
+                worker_thread = threading.Thread(
+                    target=run_worker_forever,
+                    kwargs={"worker_id": wid, "embedded": True},
+                    name="embedded-durable-worker",
+                    daemon=True,
+                )
+                worker_thread.start()
+            log.info("Deferred runtime warm-up complete.")
+        except Exception as e:
+            log.error("Deferred runtime warm-up failed: %s", e, exc_info=True)
+
+    warm_thread = threading.Thread(
+        target=_warm_runtime,
+        name="runtime-warmup",
+        daemon=True,
+    )
+    warm_thread.start()
 
     yield
 
     log.info("API Shutdown: draining requests (uvicorn graceful timeout)...")
+    keepalive_stop.set()
     if worker_thread is not None:
         request_shutdown("api-lifespan")
         grace = float(getattr(settings, "WORKER_SHUTDOWN_GRACE_SEC", 120) or 120)
         worker_thread.join(timeout=min(grace, 60.0))
         if worker_thread.is_alive():
             log.warning("Embedded worker thread still alive after join timeout")
+    if warm_thread is not None and warm_thread.is_alive():
+        warm_thread.join(timeout=15.0)
 
 
 # --- Create FastAPI App ---
@@ -411,12 +450,14 @@ def get_job_status(
     Endpoint for the frontend to poll for job status.
 
     Loads status columns only (no ``result_json``) so polls stay cheap.
+    Ownership is checked from the same row (no extra document/job round-trips).
     Response schema is unchanged — ``JobStatus`` never included the result blob.
     """
-    assert_document_owner(int(current_user["id"]), job_id)
-    status_dict = job_store.get_job(job_id, include_result=False)
-    if not status_dict:
-        raise HTTPException(status_code=404, detail="Job not found.")
+    status_dict = enforce_job_owner(
+        int(current_user["id"]),
+        job_id,
+        job_store.get_job(job_id, include_result=False),
+    )
 
     # Heal race: result already persisted but a late heartbeat left status=processing.
     # Only hydrate the full row when progress claims completion while status lags.
@@ -516,10 +557,11 @@ def get_job_result(
     Attaches a visualization-only frontier carbon comparison derived from the
     already-computed ``carbon_data`` (does not alter scheduler accounting).
     """
-    assert_document_owner(int(current_user["id"]), job_id)
-    status = job_store.get_job(job_id)
-    if not status:
-        raise HTTPException(status_code=404, detail="Job not found.")
+    status = enforce_job_owner(
+        int(current_user["id"]),
+        job_id,
+        job_store.get_job(job_id),
+    )
     if not job_status_mod.is_job_ready_for_result(status):
         current = job_status_mod.normalize_job_status(status.get("status"))
         raise HTTPException(
@@ -1506,14 +1548,23 @@ def login_user(user_data: UserLogin, request: Request, response: Response):
     
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account is inactive")
-    
+
+    user_payload = {
+        "id": int(user.id),
+        "email": user.email,
+        "full_name": user.full_name,
+        "is_active": bool(user.is_active),
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+    }
+    seed_user_cache(user_payload)
+
     pair = auth.issue_token_pair(
         int(user.id),
         user_agent=request.headers.get("user-agent"),
     )
     _set_refresh_cookie(response, pair["refresh_token"])
     log.info(f"User logged in: {user_data.email}")
-    return Token(**pair)
+    return Token(**pair, user=UserResponse(**user_payload))
 
 
 @app.post("/auth/refresh", response_model=Token)

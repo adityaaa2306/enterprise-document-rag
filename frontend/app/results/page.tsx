@@ -228,6 +228,15 @@ function ResultsContent() {
       })
     }
 
+    const applyResult = (data: JobResult) => {
+      resultCache.set(jobId, data)
+      setResult(data)
+      setIsComplete(true)
+      setLiveProgress(100)
+      setResultLoading(false)
+      stopPolling()
+    }
+
     const pollStatus = async () => {
       if (cancelled || inFlight) return
       inFlight = true
@@ -306,8 +315,68 @@ function ResultsContent() {
       }
     }
 
-    pollInterval = setInterval(pollStatus, POLL_INTERVAL_MS)
-    pollStatus()
+    // Fast path for already-complete jobs: race status + result in parallel so
+    // we don't wait status (3s) then result (4s) serially (~7–12s).
+    ;(async () => {
+      setResultLoading(true)
+      try {
+        const [statusRes, resultRes] = await Promise.all([
+          apiFetch(`/job-status/${jobId}`),
+          apiFetch(`/job-result/${jobId}?_ts=${Date.now()}`, { cache: "no-store" }),
+        ])
+        if (cancelled) return
+
+        if (resultRes.ok) {
+          const data: JobResult = await resultRes.json()
+          applyResult(data)
+          appendLog("Results ready.", "info")
+          return
+        }
+
+        if (statusRes.status === 404) {
+          setJobFailed(true)
+          setFailureMessage("Job not found.")
+          setResultLoading(false)
+          appendLog("Job not found (404).", "error")
+          return
+        }
+        if (statusRes.status === 401 || statusRes.status === 403) {
+          setJobFailed(true)
+          setFailureMessage("Authentication expired. Please sign in again.")
+          setResultLoading(false)
+          return
+        }
+
+        if (statusRes.ok) {
+          const data: JobStatus = await statusRes.json()
+          setLiveProgress(Number(data.progress) || 0)
+          if (data.stage) setLiveStage(data.stage)
+          appendLog(data.message || `Status: ${data.status}`, isErrorStatus(data.status) ? "error" : "info")
+
+          if (isSuccessStatus(data.status)) {
+            setIsComplete(true)
+            void fetchResult(jobId)
+            return
+          }
+          if (isErrorStatus(data.status) || isTerminalStatus(data.status)) {
+            setJobFailed(true)
+            setFailureMessage(data.message || "Job failed.")
+            setResultLoading(false)
+            return
+          }
+        }
+      } catch (error) {
+        console.error("Initial result race error:", error)
+      } finally {
+        if (!cancelled && !resultCache.has(jobId)) {
+          setResultLoading(false)
+        }
+      }
+
+      if (cancelled || resultCache.has(jobId)) return
+      pollInterval = setInterval(pollStatus, POLL_INTERVAL_MS)
+      void pollStatus()
+    })()
 
     return () => {
       cancelled = true
@@ -346,8 +415,8 @@ function ResultsContent() {
   const summaryMarkdown = result?.final_summary
     ? stripSummaryMetrics(unwrapOuterMarkdownFence(result.final_summary))
     : ""
-  /** While Results owns job-status polling, slow the sidebar queue polls. */
-  const deferQueuePolling = Boolean(jobId) && !isComplete && !jobFailed && !pollTimedOut
+  /** Defer sidebar queue polls whenever a job is open so /job-result wins the wire. */
+  const deferQueuePolling = Boolean(jobId) && !jobFailed && !pollTimedOut
 
   return (
     <div className="flex">

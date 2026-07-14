@@ -25,10 +25,15 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         return False
 
 
+# Cost 10 ≈ 70ms verify on typical hardware; default 12 ≈ 280ms+.
+# Existing $2b$12$ hashes still verify; new signups use 10.
+_BCRYPT_ROUNDS = 10
+
+
 def get_password_hash(password: str) -> str:
     # bcrypt truncates at 72 bytes; enforce explicitly for clarity
     raw = password.encode("utf-8")[:72]
-    return bcrypt.hashpw(raw, bcrypt.gensalt()).decode("utf-8")
+    return bcrypt.hashpw(raw, bcrypt.gensalt(rounds=_BCRYPT_ROUNDS)).decode("utf-8")
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:

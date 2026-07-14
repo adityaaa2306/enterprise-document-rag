@@ -44,7 +44,8 @@ def issue_refresh_token(
         )
         db.add(row)
         db.commit()
-        db.refresh(row)
+        # Skip db.refresh — callers only need the raw token string; an extra
+        # Neon round-trip on every login was adding ~0.5–2s.
         return raw, row
     except Exception:
         db.rollback()

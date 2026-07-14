@@ -167,7 +167,12 @@ export function JobQueuePanel({
       }
     }
 
-    tick()
+    // When Results is loading job data, wait before competing for Neon/API.
+    if (deferPolling) {
+      timer = setTimeout(tick, 2500)
+    } else {
+      tick()
+    }
     document.addEventListener("visibilitychange", onVisibility)
     return () => {
       cancelled = true

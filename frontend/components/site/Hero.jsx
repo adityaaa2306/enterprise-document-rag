@@ -6,12 +6,13 @@ import { useRef, useState, useEffect } from "react";
 import { ArrowUpRight, ArrowRight } from "lucide-react";
 
 const HEADLINE_LINES = [
-  "A document processing",
-  "pipeline that decides,",
-  "per chunk, which model",
-  "to use — and measures",
-  "exactly how much",
-  <span key="carbon">carbon that decision <span className="italic font-serif font-light text-emerald-400">saves.</span></span>,
+  "A document processing pipeline",
+  "that decides, per chunk, which model",
+  "to use — and measures exactly how much",
+  <span key="carbon">
+    carbon that decision{" "}
+    <span className="italic font-serif font-light text-emerald-400">saves.</span>
+  </span>,
 ];
 
 const PIPELINE = [
@@ -119,40 +120,32 @@ export default function Hero() {
       id="top"
       ref={ref}
       data-testid="hero-section"
-      className="relative pt-32 pb-16 md:pt-40 md:pb-24 overflow-hidden"
+      className="relative pt-20 pb-14 md:pt-24 md:pb-20 overflow-hidden"
     >
       {/* faint grid */}
       <div className="absolute inset-0 grid-bg opacity-40 pointer-events-none" />
       <div className="absolute top-0 left-0 right-0 h-px bg-white/10" />
 
       <div className="relative max-w-[1400px] mx-auto px-6 md:px-10">
-        {/* meta row */}
-        <motion.div
-          initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2 }}
-          className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-16 font-mono text-[10px] uppercase tracking-[0.18em] text-neutral-500"
-        >
-          <div><span className="text-neutral-600">Doc №</span> 001 / systems</div>
-          <div><span className="text-neutral-600">Build</span> v2.4.1-stable</div>
-          <div><span className="text-neutral-600">Grid</span> 480 gCO₂/kWh</div>
-          <div className="flex items-center gap-2">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-            <span className="text-emerald-400">Systems nominal</span>
-          </div>
-        </motion.div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 items-start">
-          {/* Left */}
-          <motion.div style={{ y, opacity }} className="lg:col-span-7 relative">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 lg:gap-12 items-start">
+          {/* Left — slightly wider for balanced headline measure */}
+          <motion.div style={{ y, opacity }} className="lg:col-span-7 xl:col-span-8 relative min-w-0">
             {/* Chapter marker */}
-            <div className="flex items-baseline gap-4 mb-8">
+            <div className="flex items-baseline gap-4 mb-5">
               <span className="font-serif italic text-5xl md:text-6xl text-neutral-700 leading-none">I.</span>
               <span className="font-mono text-[10px] uppercase tracking-[0.24em] text-neutral-500">
                 Hypothesis
               </span>
             </div>
 
-            {/* Kinetic headline */}
-            <h1 className="font-display text-[42px] leading-[1.02] sm:text-[56px] md:text-[68px] lg:text-[74px] font-medium tracking-[-0.03em] text-white">
+            {/* Kinetic headline — intentional breaks, fluid type, ~4 lines on desktop */}
+            <h1
+              className="font-display font-medium text-white tracking-[-0.028em] text-balance"
+              style={{
+                fontSize: "clamp(2.15rem, 2.1rem + 1.6vw, 3.65rem)",
+                lineHeight: 1.08,
+              }}
+            >
               {HEADLINE_LINES.map((line, i) => (
                 <span key={i} className="block overflow-hidden">
                   <motion.span
@@ -161,7 +154,7 @@ export default function Hero() {
                     animate={{ y: 0 }}
                     transition={{
                       duration: 1.05,
-                      delay: 0.15 + i * 0.09,
+                      delay: 0.15 + i * 0.1,
                       ease: [0.19, 1, 0.22, 1],
                     }}
                   >
@@ -174,8 +167,8 @@ export default function Hero() {
             {/* subhead */}
             <motion.p
               initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 1.1, duration: 0.6 }}
-              className="mt-10 max-w-xl text-neutral-400 text-[15px] md:text-base leading-relaxed"
+              transition={{ delay: 0.85, duration: 0.6 }}
+              className="mt-8 max-w-xl text-neutral-400 text-[15px] md:text-base leading-relaxed"
             >
               Three pillars —
               <span className="text-white"> adaptive routing</span>,
@@ -187,8 +180,8 @@ export default function Hero() {
             {/* CTAs */}
             <motion.div
               initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 1.25, duration: 0.6 }}
-              className="mt-12 flex flex-wrap items-center gap-4"
+              transition={{ delay: 1.0, duration: 0.6 }}
+              className="mt-10 flex flex-wrap items-center gap-4"
             >
               <Link
                 href="/dashboard"
@@ -210,8 +203,8 @@ export default function Hero() {
 
             {/* stats */}
             <motion.div
-              initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 1.4, duration: 0.8 }}
-              className="mt-16 grid grid-cols-3 gap-6 max-w-xl"
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 1.15, duration: 0.8 }}
+              className="mt-14 grid grid-cols-3 gap-6 max-w-xl"
             >
               {[
                 ["52.1%", "carbon reduction / last run"],
@@ -230,9 +223,9 @@ export default function Hero() {
           <motion.div
             initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }}
             transition={{ delay: 0.5, duration: 1.2, ease: [0.22, 1, 0.36, 1] }}
-            className="lg:col-span-5 relative"
+            className="lg:col-span-5 xl:col-span-4 relative min-w-0"
           >
-            <div className="relative aspect-[3/4] lg:aspect-auto lg:h-[560px] border border-white/10 bg-[#080808]">
+            <div className="relative aspect-[3/4] lg:aspect-auto lg:h-[520px] xl:h-[540px] border border-white/10 bg-[#080808]">
               {/* corner marks */}
               {["tl","tr","bl","br"].map((c) => (
                 <div key={c} className={`absolute w-3 h-3 border-emerald-400/60

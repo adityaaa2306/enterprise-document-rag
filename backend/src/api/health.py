@@ -22,10 +22,10 @@ router = APIRouter(tags=["health"])
 @router.get("/api/health")
 def health() -> Dict[str, Any]:
     """
-    Liveness (+ light Chroma check for portfolio deploys).
+    Liveness for Render port / health checks.
 
-    Verifies the process is up and embedded Chroma persist directory is
-    accessible. Does not perform remote HTTP checks.
+    Must stay cheap and always return 200 once the process is up — do not
+    block on Neon/Chroma during cold start (that caused port-scan timeouts).
     """
     body: Dict[str, Any] = {
         "status": "ok",
@@ -34,22 +34,20 @@ def health() -> Dict[str, Any]:
         "env": settings.app_env_normalized,
     }
     try:
-        from src.memory.chroma import chroma_health_check, is_chroma_ready
+        from src.memory.chroma import is_chroma_ready
 
-        chroma = chroma_health_check()
+        ready = bool(is_chroma_ready())
         body["chroma"] = {
-            "ok": bool(chroma.get("ok")),
-            "mode": chroma.get("mode"),
-            "path": chroma.get("path"),
-            "ready": is_chroma_ready() or bool(chroma.get("ok")),
+            "ok": ready,
+            "mode": "persistent",
+            "path": settings.CHROMA_PERSIST_DIRECTORY or settings.VECTOR_DB_PATH,
+            "ready": ready,
         }
-        if not chroma.get("ok"):
-            body["status"] = "degraded"
-            body["chroma"]["error"] = chroma.get("error")
+        if not ready:
+            body["status"] = "starting"
     except Exception as e:
-        body["status"] = "degraded"
+        body["status"] = "starting"
         body["chroma"] = {"ok": False, "error": str(e)}
-        log.warning(f"Health Chroma check failed: {e}")
     return body
 
 

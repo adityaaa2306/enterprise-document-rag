@@ -77,6 +77,8 @@ def init_engine(url: Optional[str] = None, *, echo: bool = False) -> Engine:
     else:
         engine_kwargs["pool_size"] = int(getattr(settings, "DB_POOL_SIZE", 5) or 5)
         engine_kwargs["max_overflow"] = int(getattr(settings, "DB_MAX_OVERFLOW", 10) or 10)
+        # Recycle before typical Neon idle suspend (~5 min) so we reconnect cleanly.
+        engine_kwargs["pool_recycle"] = int(getattr(settings, "DB_POOL_RECYCLE", 280) or 280)
 
     _engine = create_engine(database_url, **engine_kwargs)
 

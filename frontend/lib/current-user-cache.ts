@@ -18,6 +18,11 @@ export function clearCurrentUserCache() {
   inflight = null
 }
 
+export function seedCurrentUserCache(data: CurrentUser) {
+  cache = { data, at: Date.now() }
+  inflight = null
+}
+
 export function peekCurrentUserCache(): CurrentUser | null {
   if (cache && Date.now() - cache.at < TTL_MS) return cache.data
   return null
