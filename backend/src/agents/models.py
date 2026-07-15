@@ -45,17 +45,25 @@ class NimApiError(RuntimeError):
         self.__cause__ = cause
 
 
+try:
+    from openai import RateLimitError as _OpenAIRateLimitError
+except ImportError:  # pragma: no cover
+    _OpenAIRateLimitError = ()  # type: ignore
+
+
 # ---------------------------------------------------------------------------
 # NIM client bootstrap
 # ---------------------------------------------------------------------------
 
 def _nim_timeout(*, read_override: Optional[float] = None) -> httpx.Timeout:
-    read = float(
-        read_override
-        if read_override is not None
-        else (getattr(settings, "NIM_HTTP_TIMEOUT_SEC", 90.0) or 90.0)
-    )
+    """HTTP timeout always capped strictly below MAP_CHUNK_HARD_TIMEOUT_SEC."""
+    map_wall = float(getattr(settings, "MAP_CHUNK_HARD_TIMEOUT_SEC", 90.0) or 90.0)
+    default_read = float(getattr(settings, "NIM_HTTP_TIMEOUT_SEC", 75.0) or 75.0)
+    read = float(read_override if read_override is not None else default_read)
+    # Hung sockets must abort before the node wrapper wall.
+    read = min(read, max(1.0, map_wall - 1.0))
     connect = float(getattr(settings, "NIM_CONNECT_TIMEOUT_SEC", 15.0) or 15.0)
+    connect = min(connect, max(1.0, read))
     return httpx.Timeout(read, connect=connect)
 
 
@@ -152,6 +160,28 @@ def _classify_nim_exception(exc: BaseException, *, model_id: str) -> Exception:
     """Normalize SDK/network errors into NimApiError when transient."""
     if isinstance(exc, NimApiError):
         return exc
+    # 429 must surface as RateLimitBackpressure — not a hung-socket path.
+    from src.core.nim_rate_limit import RateLimitBackpressure, is_rate_limit_error
+
+    if is_rate_limit_error(exc) or (
+        _OpenAIRateLimitError and isinstance(exc, _OpenAIRateLimitError)
+    ):
+        retry_after = None
+        headers = getattr(exc, "headers", None) or getattr(
+            getattr(exc, "response", None), "headers", None
+        )
+        if headers:
+            try:
+                ra = headers.get("retry-after") or headers.get("Retry-After")
+                if ra is not None:
+                    retry_after = float(ra)
+            except Exception:
+                pass
+        return RateLimitBackpressure(
+            f"NIM rate limit calling {model_id}: {exc}",
+            retry_after_sec=retry_after,
+            status_code=429,
+        )
     if isinstance(exc, APITimeoutError) or isinstance(exc, httpx.TimeoutException):
         return NimApiError(
             f"NIM timeout calling {model_id} after {getattr(settings, 'NIM_HTTP_TIMEOUT_SEC', 90)}s",
@@ -161,6 +191,11 @@ def _classify_nim_exception(exc: BaseException, *, model_id: str) -> Exception:
         return NimApiError(f"NIM connection error calling {model_id}: {exc}", cause=exc)
     if isinstance(exc, APIStatusError):
         code = int(getattr(exc, "status_code", 0) or 0)
+        if code == 429:
+            return RateLimitBackpressure(
+                f"NIM HTTP 429 calling {model_id}: {exc}",
+                status_code=429,
+            )
         if code >= 500:
             return NimApiError(
                 f"NIM HTTP {code} calling {model_id}: {exc}",
@@ -191,6 +226,220 @@ def _http_status_from_exc(exc: BaseException) -> Optional[int]:
 
 
 def call_chat_with_fallback(
+    model_ids: List[str],
+    messages: List[Dict[str, str]],
+    *,
+    temperature: float = 0.5,
+    max_tokens: int = 2000,
+    max_retries_per_model: Optional[int] = None,
+    return_timing: bool = False,
+    timeout: Optional[httpx.Timeout] = None,
+    call_meta: Optional[Dict[str, Any]] = None,
+    deadline_mono: Optional[float] = None,
+) -> Union[Tuple[str, Optional[str]], Tuple[str, Optional[str], Dict[str, Any]]]:
+    """
+    Try each model in order under an optional shared ``deadline_mono`` wall.
+
+    When ``CHAIN_SLICE_ENABLED``, each model receives an explicit time slice of
+    the remaining wall so the primary cannot starve fallbacks.
+    """
+    from src.core.chain_time_budget import (
+        get_reliability_tracker,
+        log_slice_report,
+        plan_chain_slices,
+    )
+
+    # De-dupe while preserving order
+    seen: set = set()
+    ordered_ids: List[str] = []
+    for mid in model_ids or []:
+        if mid and mid not in seen:
+            seen.add(mid)
+            ordered_ids.append(mid)
+    if not ordered_ids:
+        raise RuntimeError("No models provided to call_chat_with_fallback")
+
+    role = "compile" if (call_meta or {}).get("phase") == "compile" else "map"
+    if call_meta and call_meta.get("endpoint_role"):
+        role = str(call_meta.get("endpoint_role"))
+
+    slice_enabled = bool(getattr(settings, "CHAIN_SLICE_ENABLED", True))
+    if (not slice_enabled) or len(ordered_ids) == 1:
+        return _call_chat_with_fallback_unsliced(
+            ordered_ids,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            max_retries_per_model=max_retries_per_model,
+            return_timing=return_timing,
+            timeout=timeout,
+            call_meta=call_meta,
+            deadline_mono=deadline_mono,
+        )
+
+    # Remaining wall for the whole chain
+    if deadline_mono is not None:
+        wall_sec = max(0.5, float(deadline_mono) - time.monotonic())
+    else:
+        # No outer deadline — derive a sensible chain wall from role defaults.
+        if role == "compile":
+            wall_sec = float(getattr(settings, "COMPILE_CALL_MAX_SEC", 180.0) or 180.0)
+        else:
+            wall_sec = float(getattr(settings, "MAP_CHUNK_HARD_TIMEOUT_SEC", 90.0) or 90.0)
+        deadline_mono = time.monotonic() + wall_sec
+
+    ordered_ids, slices, report = plan_chain_slices(
+        ordered_ids, role=role, wall_sec=wall_sec
+    )
+    if call_meta is not None:
+        call_meta["chain_slices"] = report.to_dict()
+        call_meta["chain_slice_plan"] = [
+            {"model_id": a.model_id, "allocated_sec": a.allocated_sec}
+            for a in report.attempts
+        ]
+
+    tracker = get_reliability_tracker()
+    last_error: Optional[Exception] = None
+    import concurrent.futures
+
+    for i, model_id in enumerate(ordered_ids):
+        slice_sec = float(slices[i] if i < len(slices) else slices[-1])
+        # Never let a model run past the shared wall.
+        model_deadline = min(float(deadline_mono), time.monotonic() + slice_sec)
+        remaining = model_deadline - time.monotonic()
+        if remaining < 0.35:
+            att = report.attempts[i]
+            att.outcome = "skipped"
+            att.used_sec = 0.0
+            att.error = f"insufficient_slice_remaining={remaining:.2f}s"
+            log.warning(
+                "CHAIN_SLICE skip model=%s remaining=%.2fs (starvation prevented upstream)",
+                model_id,
+                remaining,
+            )
+            continue
+
+        att = report.attempts[i]
+        t0 = time.monotonic()
+        meta_i: Dict[str, Any] = dict(call_meta or {})
+        meta_i["phase"] = (call_meta or {}).get("phase") or role
+        meta_i["endpoint_role"] = role
+        meta_i["task_id"] = (call_meta or {}).get("task_id")
+        meta_i["chain_position"] = i
+        meta_i["slice_allocated_sec"] = slice_sec
+
+        def _invoke() -> Any:
+            return _call_chat_with_fallback_unsliced(
+                [model_id],
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                max_retries_per_model=max_retries_per_model,
+                return_timing=return_timing,
+                timeout=timeout,
+                call_meta=meta_i,
+                deadline_mono=model_deadline,
+            )
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        fut = pool.submit(_invoke)
+        try:
+            # Hard cut at slice boundary — primary cannot burn the whole wall.
+            out = fut.result(timeout=max(0.3, remaining))
+            used = time.monotonic() - t0
+            att.used_sec = used
+            att.outcome = "success"
+            tracker.record(model_id, ok=True, timeout=False)
+            if call_meta is not None:
+                call_meta.update({k: v for k, v in meta_i.items() if k != "attempts"})
+                call_meta["attempts"] = list(call_meta.get("attempts") or []) + list(
+                    meta_i.get("attempts") or []
+                )
+                call_meta["chain_slices"] = report.to_dict()
+                call_meta["model_reliability"] = tracker.stats(model_id)
+            log.info(
+                "CHAIN_SLICE model=%s pos=%s alloc=%.1fs used=%.1fs outcome=success",
+                model_id,
+                i,
+                slice_sec,
+                used,
+            )
+            log_slice_report(report)
+            return out
+        except concurrent.futures.TimeoutError as e:
+            used = time.monotonic() - t0
+            att.used_sec = used
+            att.outcome = "timeout_slice"
+            att.error = f"slice_timeout after {used:.1f}s (alloc={slice_sec:.1f}s)"
+            tracker.record(model_id, ok=False, timeout=True)
+            last_error = NimApiError(
+                f"Model slice timeout after {used:.1f}s "
+                f"(alloc={slice_sec:.1f}s model={model_id})"
+            )
+            log.warning(
+                "CHAIN_SLICE model=%s pos=%s alloc=%.1fs used=%.1fs outcome=timeout_slice "
+                "— falling through to next fallback",
+                model_id,
+                i,
+                slice_sec,
+                used,
+            )
+            if call_meta is not None:
+                call_meta.setdefault("attempts", [])
+                call_meta["attempts"] = list(call_meta.get("attempts") or []) + [
+                    {
+                        "model_id": model_id,
+                        "ok": False,
+                        "duration_ms": round(used * 1000.0, 1),
+                        "error": att.error,
+                        "slice_timeout": True,
+                        "allocated_sec": slice_sec,
+                    }
+                ]
+        except Exception as e:
+            used = time.monotonic() - t0
+            att.used_sec = used
+            err_l = str(e).lower()
+            is_to = "timeout" in err_l or "deadline" in err_l
+            att.outcome = "timeout_slice" if is_to else "error"
+            att.error = f"{type(e).__name__}: {str(e)[:160]}"
+            tracker.record(model_id, ok=False, timeout=is_to, error=not is_to)
+            last_error = e if isinstance(e, Exception) else RuntimeError(str(e))
+            log.warning(
+                "CHAIN_SLICE model=%s pos=%s alloc=%.1fs used=%.1fs outcome=%s err=%s",
+                model_id,
+                i,
+                slice_sec,
+                used,
+                att.outcome,
+                att.error,
+            )
+            if call_meta is not None:
+                call_meta["attempts"] = list(call_meta.get("attempts") or []) + list(
+                    meta_i.get("attempts") or []
+                ) + [
+                    {
+                        "model_id": model_id,
+                        "ok": False,
+                        "duration_ms": round(used * 1000.0, 1),
+                        "error": att.error,
+                        "allocated_sec": slice_sec,
+                    }
+                ]
+        finally:
+            _shutdown_executor_nowait(pool, fut)
+
+    if call_meta is not None:
+        call_meta["chain_slices"] = report.to_dict()
+        call_meta["success"] = False
+        call_meta["error"] = str(last_error)[:300] if last_error else "all_slices_failed"
+    log_slice_report(report)
+    raise RuntimeError(
+        f"All models failed under chain slices ({ordered_ids}). Last error: {last_error}"
+    ) from last_error
+
+
+def _call_chat_with_fallback_unsliced(
     model_ids: List[str],
     messages: List[Dict[str, str]],
     *,
@@ -237,29 +486,61 @@ def call_chat_with_fallback(
     role = "compile" if (call_meta or {}).get("phase") == "compile" else "map"
     if call_meta and call_meta.get("endpoint_role"):
         role = str(call_meta.get("endpoint_role"))
+    task_id = str((call_meta or {}).get("task_id") or "-")
     exclude_endpoints: set = set()
     acquire_timeout = float(
         getattr(settings, "NIM_ENDPOINT_ACQUIRE_TIMEOUT_SEC", 120.0) or 120.0
     )
+    # Never wait for a lease past the scheduler deadline — that was orphaning
+    # capacity while the outer hard-timeout abandoned the worker thread.
+    if deadline_mono is not None:
+        acquire_timeout = min(
+            acquire_timeout, max(0.5, float(deadline_mono) - time.monotonic() - 0.25)
+        )
     soft_ttft = float(getattr(settings, "NIM_SOFT_TTFT_TIMEOUT_SEC", 45.0) or 0.0)
     # Soft TTFT applies to map/embed paths; compile uses its own shorter wall.
     use_soft_ttft = soft_ttft > 0 and role != "compile"
     # Measure TTFT whenever soft timeout is active (stream + cancel).
     measure_ttft = bool(return_timing or use_soft_ttft)
 
+    def _deadline_left() -> float:
+        if deadline_mono is None:
+            return 1e9
+        return float(deadline_mono) - time.monotonic()
+
+    def _raise_if_deadline(where: str) -> None:
+        left = _deadline_left()
+        if left <= 0.25:
+            raise NimApiError(
+                f"Shared call deadline exhausted at {where} (remaining={left:.2f}s)"
+            )
+
     def _acquire_client():
         nonlocal lease
+        _raise_if_deadline("acquire_endpoint")
         if use_pool and pool_mod is not None:
+            acq_to = acquire_timeout
+            if deadline_mono is not None:
+                acq_to = min(acq_to, max(0.5, _deadline_left() - 0.25))
             lease = pool_mod.acquire_endpoint(
                 role=role,
                 exclude_ids=exclude_endpoints or None,
                 block=True,
-                timeout=acquire_timeout,
+                timeout=acq_to,
             )
             if lease is None and exclude_endpoints:
                 # All preferred endpoints busy/cooling — allow any with capacity
                 lease = pool_mod.acquire_endpoint(
-                    role=role, block=True, timeout=min(30.0, acquire_timeout)
+                    role=role,
+                    block=True,
+                    timeout=min(30.0, acq_to, max(0.5, _deadline_left() - 0.25)),
+                )
+            if lease is not None:
+                log.info(
+                    "TASK_LIFECYCLE phase=ENDPOINT_SELECTED task=%s endpoint=%s role=%s",
+                    task_id,
+                    lease.endpoint_id,
+                    role,
                 )
             return lease.client if lease else get_nim_client()
         return get_nim_client()
@@ -279,9 +560,14 @@ def call_chat_with_fallback(
     last_error: Optional[Exception] = None
     hard_read = float(
         getattr(settings, "NIM_HARD_TIMEOUT_SEC", None)
-        or getattr(settings, "NIM_HTTP_TIMEOUT_SEC", 90.0)
-        or 90.0
+        or getattr(settings, "NIM_HTTP_TIMEOUT_SEC", 75.0)
+        or 75.0
     )
+    map_wall = float(getattr(settings, "MAP_CHUNK_HARD_TIMEOUT_SEC", 90.0) or 90.0)
+    hard_read = min(hard_read, max(1.0, map_wall - 1.0))
+    # Cap hard read to remaining deadline so HTTP aborts inside the slice.
+    if deadline_mono is not None:
+        hard_read = min(hard_read, max(1.0, float(deadline_mono) - time.monotonic() - 0.25))
     base_timeout = timeout or _nim_timeout(read_override=hard_read)
     t_call0 = time.perf_counter()
     attempts_log: List[Dict[str, Any]] = []
@@ -298,6 +584,73 @@ def call_chat_with_fallback(
             ordered_ids.append(mid)
 
     for model_id in ordered_ids:
+        # Provider routing: ollama/* always uses Ollama adapter. Global
+        # LLM_PROVIDER=ollama only remaps non-NIM model ids — NIM-looking
+        # ids (meta/, mistralai/, …) still use the NIM HTTP client so
+        # fallback chains can leave Ollama when it is down/slow.
+        mid_s = str(model_id)
+        use_alt_provider = mid_s.startswith("ollama/")
+        if (
+            not use_alt_provider
+            and str(getattr(settings, "LLM_PROVIDER", "") or "").lower() == "ollama"
+        ):
+            nim_like = mid_s.startswith(
+                ("meta/", "mistralai/", "openai/", "nvidia/", "google/", "microsoft/")
+            )
+            use_alt_provider = not nim_like
+        if use_alt_provider:
+            try:
+                from src.core.llm_providers import resolve_provider_for_model
+
+                provider = resolve_provider_for_model(model_id)
+                t_attempt = time.perf_counter()
+                text, meta = provider.chat(
+                    model_id,
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=float(getattr(timeout, "read", None) or hard_read),
+                )
+                if not text:
+                    raise ValueError(f"Empty response from {model_id}")
+                attempt_ms = (time.perf_counter() - t_attempt) * 1000.0
+                attempts_log.append(
+                    {
+                        "model_id": model_id,
+                        "attempt": 1,
+                        "ok": True,
+                        "duration_ms": round(attempt_ms, 1),
+                        "http_status": 200,
+                        "error": None,
+                        "provider": meta.get("provider"),
+                    }
+                )
+                if call_meta is not None:
+                    call_meta.update(
+                        {
+                            "model_id": meta.get("model_id") or model_id,
+                            "provider": meta.get("provider"),
+                            "retry_count": retry_count,
+                            "attempt_count": len(attempts_log),
+                            "http_status": 200,
+                            "call_ms": round((time.perf_counter() - t_call0) * 1000.0, 1),
+                            "attempts": attempts_log,
+                            "success": True,
+                        }
+                    )
+                if return_timing:
+                    return text, meta.get("model_id") or model_id, {
+                        "ttft_ms": attempt_ms,
+                        "ttlt_ms": attempt_ms,
+                        "mode": "provider",
+                        "model_used": meta.get("model_id") or model_id,
+                    }
+                return text, meta.get("model_id") or model_id
+            except Exception as e:
+                last_error = e if isinstance(e, Exception) else RuntimeError(str(e))
+                log.warning("Provider %s failed for %s: %s", "ollama", model_id, e)
+                continue
+
         if deadline_mono is not None:
             remaining = float(deadline_mono) - time.monotonic()
             if remaining <= max(1.0, connect_cap):
@@ -309,12 +662,10 @@ def call_chat_with_fallback(
                 break
         model_attempts = max_retries_per_model * endpoint_retries
         for attempt in range(model_attempts):
-            # Soft TTFT via idle read timeout: httpx resets between streamed
-            # tokens, so a hung socket dies at soft_ttft while active streams
-            # can continue up to the scheduler hard wall.
+            # Soft TTFT is enforced inside the stream helper (idle-to-first-token),
+            # NOT by capping the whole HTTP read timeout — that was killing slow
+            # medium/heavy models at 45s even while tokens were about to arrive.
             read_cap = float(getattr(base_timeout, "read", None) or hard_read)
-            if use_soft_ttft and soft_ttft > 0:
-                read_cap = min(read_cap, soft_ttft)
             if deadline_mono is not None:
                 remaining = float(deadline_mono) - time.monotonic()
                 if remaining <= max(1.0, connect_cap):
@@ -332,6 +683,23 @@ def call_chat_with_fallback(
                 req_timeout = httpx.Timeout(read_cap, connect=connect_cap)
             t_attempt = time.perf_counter()
             try:
+                _raise_if_deadline(f"before_http:{model_id}")
+                # Global throttle — workers queue on the limiter, not each other.
+                from src.core.nim_rate_limit import acquire_nim_request_slot
+
+                acquire_timeout = None
+                if deadline_mono is not None:
+                    acquire_timeout = max(0.5, float(deadline_mono) - time.monotonic() - 0.5)
+                acquire_nim_request_slot(timeout_sec=acquire_timeout)
+                log.info(
+                    "TASK_LIFECYCLE phase=HTTP_REQUEST_STARTED task=%s model=%s "
+                    "endpoint=%s read_timeout=%.1fs deadline_left=%.1fs",
+                    task_id,
+                    model_id,
+                    lease.endpoint_id if lease else "primary",
+                    float(getattr(req_timeout, "read", None) or 0.0),
+                    _deadline_left(),
+                )
                 if measure_ttft:
                     text, timing = _chat_completion_with_ttft(
                         client,
@@ -341,6 +709,8 @@ def call_chat_with_fallback(
                         max_tokens=max_tokens,
                         timeout=req_timeout,
                         soft_ttft_timeout_sec=soft_ttft if use_soft_ttft else None,
+                        deadline_mono=deadline_mono,
+                        task_id=task_id,
                     )
                 else:
                     completion = client.chat.completions.create(
@@ -352,10 +722,27 @@ def call_chat_with_fallback(
                     )
                     text = (completion.choices[0].message.content or "").strip()
                     timing = None
+                log.info(
+                    "TASK_LIFECYCLE phase=RESPONSE_RECEIVED task=%s model=%s "
+                    "chars=%s endpoint=%s",
+                    task_id,
+                    model_id,
+                    len(text or ""),
+                    lease.endpoint_id if lease else "primary",
+                )
                 if not text:
                     raise ValueError(f"Empty response from {model_id}")
                 attempt_ms = (time.perf_counter() - t_attempt) * 1000.0
                 ttft_ms = float((timing or {}).get("ttft_ms") or 0.0)
+                log.info(
+                    "TASK_LIFECYCLE phase=SUMMARY_PARSED task=%s model=%s "
+                    "chars=%s ttft_ms=%.1f call_ms=%.1f",
+                    task_id,
+                    model_id,
+                    len(text),
+                    ttft_ms,
+                    attempt_ms,
+                )
                 attempts_log.append(
                     {
                         "model_id": model_id,
@@ -412,7 +799,29 @@ def call_chat_with_fallback(
                     return text, model_id, timing_out
                 return text, model_id
             except Exception as e:
+                from src.core.nim_rate_limit import RateLimitBackpressure
+
+                # Propagate rate-limit backpressure immediately (no classify delay).
+                if isinstance(e, RateLimitBackpressure):
+                    raise
                 classified = _classify_nim_exception(e, model_id=model_id)
+                if isinstance(classified, RateLimitBackpressure):
+                    from src.core.nim_rate_limit import record_rate_limit_signal
+
+                    record_rate_limit_signal()
+                    if use_pool and pool_mod is not None and lease is not None:
+                        try:
+                            pool_mod.release_endpoint(
+                                lease,
+                                ok=False,
+                                latency_ms=(time.perf_counter() - t_attempt) * 1000.0,
+                                rate_limited=True,
+                                timed_out=False,
+                            )
+                        except Exception:
+                            pass
+                        lease = None
+                    raise classified
                 last_error = classified if isinstance(classified, Exception) else e
                 err_str = str(e)
                 http_status = _http_status_from_exc(classified)
@@ -441,13 +850,37 @@ def call_chat_with_fallback(
                 is_rate_limit = (
                     http_status == 429
                     or "429" in err_str
-                    or "rate" in err_str.lower()
+                    or "rate limit" in err_str.lower()
+                    or (
+                        _OpenAIRateLimitError
+                        and isinstance(e, _OpenAIRateLimitError)
+                    )
                 )
-                # Retry only on timeout / 429 / 5xx / connection (and soft TTFT).
+                # Rate-limit is backpressure for the pool — do not burn the
+                # hard-isolation wall with intra-call sleeps/retries.
+                if is_rate_limit:
+                    from src.core.nim_rate_limit import record_rate_limit_signal
+
+                    record_rate_limit_signal()
+                    if use_pool and pool_mod is not None and lease is not None:
+                        pool_mod.release_endpoint(
+                            lease,
+                            ok=False,
+                            latency_ms=attempt_ms,
+                            rate_limited=True,
+                            timed_out=False,
+                        )
+                        lease = None
+                    raise RateLimitBackpressure(
+                        f"NIM rate limit on {model_id}",
+                        retry_after_sec=getattr(classified, "retry_after_sec", None),
+                        status_code=429,
+                    )
+
+                # Retry only on timeout / 5xx / connection (and soft TTFT).
                 retryable = (
                     is_soft
                     or is_timeout
-                    or is_rate_limit
                     or is_transient_nim_error(classified)
                     or (http_status is not None and http_status >= 500)
                 )
@@ -458,7 +891,7 @@ def call_chat_with_fallback(
                         lease,
                         ok=False,
                         latency_ms=attempt_ms,
-                        rate_limited=is_rate_limit,
+                        rate_limited=False,
                         timed_out=is_timeout,
                     )
                     lease = None
@@ -471,7 +904,7 @@ def call_chat_with_fallback(
                     client = _acquire_client()
                     if client is None:
                         break
-                    wait = 0.5 if is_soft else ((2 * (attempt + 1)) if is_rate_limit else 0.25)
+                    wait = 0.5 if is_soft else 0.25
                     if deadline_mono is not None:
                         wait = min(
                             wait, max(0.0, float(deadline_mono) - time.monotonic() - 1.0)
@@ -537,6 +970,8 @@ def _chat_completion_with_ttft(
     max_tokens: int,
     timeout: httpx.Timeout,
     soft_ttft_timeout_sec: Optional[float] = None,
+    deadline_mono: Optional[float] = None,
+    task_id: str = "-",
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Stream the completion solely to separate TTFT from TTLT.
@@ -561,6 +996,10 @@ def _chat_completion_with_ttft(
             stream=True,
         )
         for chunk in stream:
+            if deadline_mono is not None and time.monotonic() >= float(deadline_mono):
+                raise NimApiError(
+                    f"Shared call deadline exhausted during stream on {model_id}"
+                )
             if first_byte_ms is None:
                 first_byte_ms = (time.perf_counter() - t0) * 1000.0
             if soft > 0 and ttft_ms is None and (time.perf_counter() - t0) >= soft:
@@ -575,6 +1014,18 @@ def _chat_completion_with_ttft(
             if delta:
                 if ttft_ms is None:
                     ttft_ms = (time.perf_counter() - t0) * 1000.0
+                    log.info(
+                        "TASK_LIFECYCLE phase=TTFT_RECEIVED task=%s model=%s "
+                        "ttft_ms=%.1f",
+                        task_id,
+                        model_id,
+                        ttft_ms,
+                    )
+                    log.info(
+                        "TASK_LIFECYCLE phase=TOKEN_STREAM_STARTED task=%s model=%s",
+                        task_id,
+                        model_id,
+                    )
                 parts.append(delta)
         text = "".join(parts).strip()
         ttlt_ms = (time.perf_counter() - t0) * 1000.0
@@ -844,6 +1295,7 @@ def run_tier_summarizer(
     tier: str = "light",
     model_ids: Optional[List[str]] = None,
     call_meta: Optional[Dict[str, Any]] = None,
+    deadline_mono: Optional[float] = None,
 ) -> str:
     """
     Summarize with an explicit tier (and optional model chain from the router).
@@ -883,6 +1335,7 @@ def run_tier_summarizer(
             temperature=0.3,
             max_tokens=max_tokens,
             call_meta=call_meta,
+            deadline_mono=deadline_mono,
         )
         key = _usage_key(tier)
         state.setdefault("model_usage_chars", {"light": 0, "medium": 0, "large": 0})
@@ -1111,6 +1564,19 @@ def _call_compile_llm(
     # Shared budget for the whole fallback chain (not per-model stacking).
     hard_sec = max(0.5, min(wall, float(deadline_mono) - started))
 
+    # Hedged compile: fire fallback concurrently if primary exceeds its slice.
+    # Carbon/cost tradeoff: when hedge fires, up to ~2 concurrent compile NIM
+    # calls may run briefly; gated by COMPILE_HEDGED_FALLBACK_ENABLED.
+    hedged = bool(getattr(settings, "COMPILE_HEDGED_FALLBACK_ENABLED", False))
+    if hedged and len([m for m in (chain or []) if m]) >= 2:
+        return _call_compile_llm_hedged(
+            messages,
+            chain,
+            intermediate=intermediate,
+            deadline_mono=deadline_mono,
+            hard_sec=hard_sec,
+        )
+
     def _invoke() -> Tuple[str, Optional[str]]:
         remaining = float(deadline_mono) - time.monotonic()
         # No per-model retries — long compile prompts must fall through quickly.
@@ -1139,6 +1605,200 @@ def _call_compile_llm(
     finally:
         # Critical: do not join a hung socket thread — let HTTP timeout reclaim it.
         _shutdown_executor_nowait(pool, fut)
+
+
+def _call_compile_llm_hedged(
+    messages: List[Dict[str, str]],
+    chain: List[str],
+    *,
+    intermediate: bool,
+    deadline_mono: float,
+    hard_sec: float,
+) -> Tuple[str, Optional[str]]:
+    """
+    Hedged compile fallback.
+
+    Primary runs alone for its allocated slice. If it has not returned, the next
+    fallback is started concurrently; first successful response wins and the
+    loser is abandoned via non-blocking executor shutdown.
+
+    Carbon/cost: hedge may briefly double compile NIM spend when primary is slow.
+    """
+    from src.core.chain_time_budget import (
+        get_reliability_tracker,
+        log_slice_report,
+        plan_chain_slices,
+    )
+    import concurrent.futures
+
+    seen: set = set()
+    ordered: List[str] = []
+    for mid in chain or []:
+        if mid and mid not in seen:
+            seen.add(mid)
+            ordered.append(mid)
+    if not ordered:
+        raise RuntimeError("Empty compile chain")
+
+    wall_sec = max(0.5, min(hard_sec, float(deadline_mono) - time.monotonic()))
+    ordered, slices, report = plan_chain_slices(
+        ordered, role="compile", wall_sec=wall_sec
+    )
+    tracker = get_reliability_tracker()
+    primary = ordered[0]
+    primary_slice = float(slices[0])
+    max_tokens = 1600 if intermediate else 2000
+
+    def _one(model_id: str, model_deadline: float, call_meta: Dict[str, Any]):
+        remaining = max(0.5, float(model_deadline) - time.monotonic())
+        return call_chat_with_fallback(
+            [model_id],
+            messages,
+            temperature=0.5,
+            max_tokens=max_tokens,
+            max_retries_per_model=1,
+            timeout=_compile_timeout(remaining_sec=remaining),
+            deadline_mono=model_deadline,
+            call_meta=call_meta,
+        )
+
+    primary_meta: Dict[str, Any] = {
+        "phase": "compile",
+        "endpoint_role": "compile",
+        "hedged": True,
+        "chain_position": 0,
+    }
+    primary_deadline = min(float(deadline_mono), time.monotonic() + primary_slice)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    primary_fut = pool.submit(_one, primary, primary_deadline, primary_meta)
+    t0 = time.monotonic()
+    winner: Optional[Tuple[str, Optional[str]]] = None
+    winner_model = None
+    primary_failed_early = False
+
+    try:
+        try:
+            winner = primary_fut.result(timeout=max(0.5, primary_slice))
+            winner_model = primary
+            used = time.monotonic() - t0
+            report.attempts[0].used_sec = used
+            report.attempts[0].outcome = "success"
+            tracker.record(primary, ok=True)
+            log.info(
+                "CHAIN_SLICE hedged_compile primary=%s alloc=%.1fs used=%.1fs "
+                "outcome=success (no hedge needed)",
+                primary,
+                primary_slice,
+                used,
+            )
+        except concurrent.futures.TimeoutError:
+            used = time.monotonic() - t0
+            report.attempts[0].used_sec = used
+            report.attempts[0].outcome = "timeout_slice"
+            report.attempts[0].error = "primary_slice_elapsed_hedging"
+            tracker.record(primary, ok=False, timeout=True)
+            log.warning(
+                "CHAIN_SLICE hedged_compile primary=%s alloc=%.1fs used=%.1fs "
+                "— launching concurrent fallback (extra NIM spend)",
+                primary,
+                primary_slice,
+                used,
+            )
+        except Exception as e:
+            used = time.monotonic() - t0
+            report.attempts[0].used_sec = used
+            report.attempts[0].outcome = "error"
+            report.attempts[0].error = f"{type(e).__name__}: {str(e)[:120]}"
+            tracker.record(primary, ok=False, error=True)
+            primary_failed_early = True
+            log.warning(
+                "CHAIN_SLICE hedged_compile primary=%s failed early: %s — hedging",
+                primary,
+                e,
+            )
+
+        if winner is None:
+            # Fire remaining fallbacks concurrently; take first success.
+            # Include still-running primary on timeout path (it may still win).
+            futs: Dict[concurrent.futures.Future, Tuple[int, str]] = {}
+            if not primary_failed_early and not primary_fut.done():
+                futs[primary_fut] = (0, primary)
+            for i, mid in enumerate(ordered[1:], start=1):
+                slice_i = float(slices[i] if i < len(slices) else slices[-1])
+                md = min(float(deadline_mono), time.monotonic() + slice_i)
+                if md - time.monotonic() < 0.75:
+                    report.attempts[i].outcome = "skipped"
+                    continue
+                meta = {
+                    "phase": "compile",
+                    "endpoint_role": "compile",
+                    "hedged": True,
+                    "chain_position": i,
+                }
+                f = pool.submit(_one, mid, md, meta)
+                futs[f] = (i, mid)
+
+            if not futs:
+                log_slice_report(report)
+                raise NimApiError(
+                    f"Hedged compile: no runnable fallbacks within {hard_sec:.0f}s"
+                )
+
+            remaining_wall = max(0.5, float(deadline_mono) - time.monotonic())
+            done, _pending = concurrent.futures.wait(
+                list(futs.keys()),
+                timeout=remaining_wall,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for fut in done:
+                idx, mid = futs[fut]
+                try:
+                    winner = fut.result(timeout=0)
+                    winner_model = mid
+                    used_i = time.monotonic() - t0
+                    report.attempts[idx].used_sec = used_i
+                    report.attempts[idx].outcome = "success"
+                    tracker.record(mid, ok=True)
+                    for other, (oj, om) in futs.items():
+                        if other is fut:
+                            continue
+                        if report.attempts[oj].outcome in ("pending", "timeout_slice"):
+                            report.attempts[oj].outcome = "cancelled"
+                            report.attempts[oj].used_sec = used_i
+                            report.attempts[oj].error = "cancelled_hedge_loser"
+                    log.info(
+                        "CHAIN_SLICE hedged_compile winner=%s pos=%s wall_used=%.1fs",
+                        mid,
+                        idx,
+                        used_i,
+                    )
+                    break
+                except Exception as e:
+                    report.attempts[idx].outcome = "error"
+                    report.attempts[idx].error = f"{type(e).__name__}: {str(e)[:120]}"
+                    report.attempts[idx].used_sec = time.monotonic() - t0
+                    tracker.record(mid, ok=False, error=True)
+            if winner is None:
+                for fut, (idx, mid) in futs.items():
+                    if fut.done():
+                        try:
+                            winner = fut.result(timeout=0)
+                            winner_model = mid
+                            report.attempts[idx].outcome = "success"
+                            tracker.record(mid, ok=True)
+                            break
+                        except Exception:
+                            continue
+                if winner is None:
+                    log_slice_report(report)
+                    raise NimApiError(
+                        f"Hedged compile failed within {hard_sec:.0f}s "
+                        f"(models={ordered})"
+                    )
+        log_slice_report(report)
+        return winner
+    finally:
+        _shutdown_executor_nowait(pool, primary_fut)
 
 
 def _estimate_compile_tokens(text: str) -> int:
@@ -1297,11 +1957,30 @@ def _hierarchical_compile(
         if job_id and chain:
             try:
                 from src.db import jobs as jobs_db
+                from src.perf.critical_path import dag_audit_record_compile_stamp
 
+                kind = str(state.get("_compile_audit_kind") or "executive")
+                nid = state.get("_compile_audit_nid")
+                # Truthful progress — never say "Executive" while compiling regional/chapter.
+                kind_label = {
+                    "regional": "Regional Summaries",
+                    "chapter": "Chapter Summaries",
+                    "executive": "Executive Summary",
+                    "final": "Executive Summary",
+                    "compile": "Compile",
+                    "chunk": "Chunk Summaries",
+                }.get(kind, "Summary")
+                msg = f"{kind_label}… · {chain[0]}"
+                dag_audit_record_compile_stamp(
+                    str(job_id),
+                    kind=kind,
+                    nid=str(nid) if nid else None,
+                    message=msg,
+                )
                 jobs_db.set_progress(
                     job_id,
                     88.0,
-                    f"Compiling executive summary... · {chain[0]}",
+                    msg,
                 )
             except Exception:
                 pass

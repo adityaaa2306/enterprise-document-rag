@@ -158,3 +158,62 @@ def test_hard_timeout_does_not_wait_390s(monkeypatch):
     assert elapsed < 5.0
     assert progress.failed == 1
     assert mets.timeouts >= 1
+    assert mets.orphan_timeouts >= 1
+
+
+def test_deadline_aware_worker_fails_without_orphan(monkeypatch):
+    """Deadline-aware workers must exit near the hard wall (no lease orphan path)."""
+    from src.core import execution_scheduler as sched
+
+    monkeypatch.setattr(sched, "_endpoint_capacity", lambda role="map": 2)
+    saw_deadline = []
+
+    def work(payload, deadline_mono=None):
+        saw_deadline.append(deadline_mono)
+        # Honor deadline like call_chat_with_fallback
+        while deadline_mono is not None and time.monotonic() < float(deadline_mono):
+            time.sleep(0.05)
+        raise TimeoutError("Shared call deadline exhausted")
+
+    t0 = time.perf_counter()
+    _ordered, progress, mets = sched.run_capacity_pool(
+        [(0, "a"), (1, "b")],
+        work,
+        role="map",
+        max_workers=2,
+        hard_timeout_sec=0.35,
+        max_attempts=1,
+        is_success=lambda r: bool(r and (r[1] or "").strip()),
+    )
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 3.0
+    assert progress.failed == 2
+    assert progress.completed == 0
+    assert all(d is not None for d in saw_deadline)
+    assert mets.orphan_timeouts == 0
+
+
+def test_successful_http_increments_completed(monkeypatch):
+    from src.core import execution_scheduler as sched
+
+    monkeypatch.setattr(sched, "_endpoint_capacity", lambda role="map": 3)
+
+    def work(payload, deadline_mono=None):
+        assert deadline_mono is not None
+        idx, _ = payload
+        return idx, f"summary-{idx}"
+
+    ordered, progress, _mets = sched.run_capacity_pool(
+        [(i, f"c{i}") for i in range(5)],
+        work,
+        role="map",
+        max_workers=3,
+        hard_timeout_sec=5.0,
+        max_attempts=1,
+        is_success=lambda r: bool(r and str(r[1]).startswith("summary")),
+    )
+    assert progress.completed == 5
+    assert progress.failed == 0
+    assert progress.running == 0
+    assert progress.queued == 0
+    assert [r[1] for r in ordered] == [f"summary-{i}" for i in range(5)]

@@ -4,6 +4,7 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
+  Cell,
   Legend,
   Line,
   LineChart,
@@ -31,6 +32,12 @@ type EnergyPoint = {
   energy_consumed_kwh?: number
   estimated_co2e?: number
   docs_processed?: number
+}
+
+type ModelBar = {
+  model: string
+  estimated_gco2e: number
+  is_ours: boolean
 }
 
 function fmt(value: number | undefined | null, digits = 2) {
@@ -65,9 +72,22 @@ function EnergyTooltip({ active, payload, label }: any) {
   )
 }
 
+function ModelTooltip({ active, payload }: any) {
+  if (!active || !payload?.length) return null
+  const row = payload[0]?.payload as ModelBar
+  return (
+    <div className="rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-xl">
+      <p className="font-semibold mb-1">{row.model}</p>
+      <p>Estimated CO₂e: {fmt(row.estimated_gco2e)} g</p>
+      {row.is_ours ? <p className="text-emerald-400">Our system</p> : null}
+    </div>
+  )
+}
+
 type Props = {
   carbonTrend: TrendPoint[]
   energyTrend: EnergyPoint[]
+  modelBars?: ModelBar[]
   sparse: boolean
   emptyMessage: string
 }
@@ -75,9 +95,12 @@ type Props = {
 export default function DashboardCharts({
   carbonTrend,
   energyTrend,
+  modelBars = [],
   sparse,
   emptyMessage,
 }: Props) {
+  const showModels = modelBars.length > 0
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
       <ChartCard title="Daily Carbon Savings vs Baseline" delay={0.2}>
@@ -99,7 +122,7 @@ export default function DashboardCharts({
               </ResponsiveContainer>
             ) : (
               <div className="h-[260px] flex items-center justify-center text-sm text-muted-foreground">
-                No documents in this range yet.
+                No finalized job metrics yet.
               </div>
             )}
           </div>
@@ -140,8 +163,31 @@ export default function DashboardCharts({
         )}
       </ChartCard>
 
-      <ChartCard title="Energy & Processing Trends" delay={0.25}>
-        {sparse ? (
+      <ChartCard
+        title={showModels ? "Model CO₂e (same as Results)" : "Energy & Processing Trends"}
+        delay={0.25}
+      >
+        {showModels ? (
+          <ResponsiveContainer width="100%" height={sparse ? 260 : 300}>
+            <BarChart data={modelBars} layout="vertical" margin={{ left: 8, right: 12 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" />
+              <XAxis type="number" stroke="rgba(255,255,255,0.45)" />
+              <YAxis
+                type="category"
+                dataKey="model"
+                width={110}
+                stroke="rgba(255,255,255,0.45)"
+                tick={{ fontSize: 11 }}
+              />
+              <Tooltip content={<ModelTooltip />} />
+              <Bar dataKey="estimated_gco2e" name="g CO₂e" radius={4}>
+                {modelBars.map((b, i) => (
+                  <Cell key={`${b.model}-${i}`} fill={b.is_ours ? "#22c55e" : "#64748b"} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        ) : sparse ? (
           <div className="space-y-4">
             <p className="text-sm text-muted-foreground">{emptyMessage}</p>
             {energyTrend.length > 0 ? (
@@ -158,7 +204,7 @@ export default function DashboardCharts({
               </ResponsiveContainer>
             ) : (
               <div className="h-[260px] flex items-center justify-center text-sm text-muted-foreground">
-                No documents in this range yet.
+                No finalized job metrics yet.
               </div>
             )}
           </div>

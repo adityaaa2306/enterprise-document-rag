@@ -57,18 +57,27 @@ def test_effective_workers_scale_with_endpoints(monkeypatch):
     monkeypatch.setattr(settings, "NIM_ENDPOINT_2_API_KEY", "k2")
     monkeypatch.setattr(settings, "NIM_ENDPOINT_3_API_KEY", "k3")
     monkeypatch.setattr(settings, "NIM_API_KEYS", "")
+    monkeypatch.setattr(settings, "NIM_ENDPOINT_POOL_ENABLED", True)
     monkeypatch.setattr(settings, "NIM_ENDPOINT_MAX_CONCURRENT", 3)
+    monkeypatch.setattr(settings, "NIM_ENDPOINT_1_MAX_CONCURRENT", 3)
+    monkeypatch.setattr(settings, "NIM_ENDPOINT_2_MAX_CONCURRENT", 3)
+    monkeypatch.setattr(settings, "NIM_ENDPOINT_3_MAX_CONCURRENT", 3)
     monkeypatch.setattr(settings, "MAP_MAX_WORKERS", 24)
     monkeypatch.setattr(settings, "COMPILE_MAX_WORKERS", 20)
+    monkeypatch.setattr(settings, "MAX_PARALLEL_WORKERS", 24)
     monkeypatch.setattr(settings, "RUN_EMBEDDED_WORKER", False)
     assert settings.nim_endpoint_count() == 3
     # Capacity-aware: 3 endpoints × 3 concurrent = 9 (never firehose past NIM)
+    assert settings.effective_nim_capacity() == 9
     assert settings.effective_map_max_workers() == 9
-    assert 1 <= settings.effective_compile_max_workers() <= 9
+    assert settings.effective_compile_max_workers() == 9
+    assert 1 <= settings.effective_parallel_workers() <= 9
 
 
 def test_dag_compile_runs_levels_in_parallel(monkeypatch):
     from src.core import dag_scheduler
+    from src.core.pipeline_dag import DagNode, build_chunk_nodes
+    from src.core.planning import plan_compile_hierarchy
     from src.agents import models, quality_validation
 
     class Chunk:
@@ -105,9 +114,26 @@ def test_dag_compile_runs_levels_in_parallel(monkeypatch):
     )
 
     state: Dict[str, Any] = {
+        "job_id": "test-dag-parallel",
         "models_used": [],
         "model_usage_chars": {"light": 0, "medium": 0, "large": 0},
     }
+    nodes = build_chunk_nodes(chunks, routes={})
+    for i, s in enumerate(summaries):
+        nid = f"chunk-{i}"
+        if nid in nodes:
+            nodes[nid].status = "completed"
+            nodes[nid].output_summary = s
+    nodes, plan = plan_compile_hierarchy(
+        nodes,
+        chunks,
+        summaries,
+        job_id="test-dag-parallel",
+        fan_in=3,
+        max_depth=6,
+        skip_regional_below=0,
+        compile_workers=4,
+    )
     out = dag_scheduler.run_dag_compile(
         chunks,
         summaries,
@@ -119,11 +145,15 @@ def test_dag_compile_runs_levels_in_parallel(monkeypatch):
         heavy_chain=["heavy-model"],
         medium_first=True,
         max_workers=4,
+        existing_nodes=nodes,
+        frozen_plan=plan,
     )
     assert out["final_summary"]
     assert out["compile_calls"] >= 1
     assert out.get("dag_nodes")
+    assert out.get("frozen") is True
     assert calls  # at least some compile nodes executed
+    assert plan.fingerprint == out.get("fingerprint_after") or out.get("fingerprint_after")
 
 
 def test_priority_for_kind_orders_executive_first():

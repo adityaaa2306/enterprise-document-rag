@@ -43,9 +43,13 @@ def run_summarization_agent(
     tier: str,
     model_ids: Optional[List[str]] = None,
     grid_intensity: float = 500.0,
+    deadline_mono: Optional[float] = None,
+    task_id: Optional[str] = None,
 ) -> AgentRunResult:
     """Run the configured tier summarizer and attach telemetry."""
     call_meta: Dict[str, Any] = {}
+    if task_id:
+        call_meta["task_id"] = task_id
     t0 = time.perf_counter()
     summary = models.run_tier_summarizer(
         text,
@@ -53,6 +57,7 @@ def run_summarization_agent(
         tier=tier,
         model_ids=model_ids,
         call_meta=call_meta,
+        deadline_mono=deadline_mono,
     )
     latency_ms = (time.perf_counter() - t0) * 1000.0
     if call_meta.get("call_ms") is not None:

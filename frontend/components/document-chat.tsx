@@ -45,6 +45,11 @@ import {
   fmtPct,
   type CompactJobMetrics,
 } from "@/lib/job-results-metrics"
+import { useFinalizedMetrics } from "@/hooks/use-finalized-metrics"
+import {
+  revisionOf,
+  type FinalizedJobResult,
+} from "@/lib/finalized-metrics-store"
 import {
   Tooltip,
   TooltipContent,
@@ -640,10 +645,19 @@ type Props = {
  * Premium document RAG chat — empty-state showcase + composer + live insights.
  */
 export function DocumentChat({ result }: Props) {
-  const metrics = useMemo(
-    () => extractCompactMetrics(result as Parameters<typeof extractCompactMetrics>[0]),
-    [result],
-  )
+  const jobId = String((result as { job_id?: string }).job_id || "")
+  const shared = useFinalizedMetrics({ refreshOnMount: false })
+  const metrics = useMemo(() => {
+    if (
+      jobId &&
+      shared.jobId === jobId &&
+      shared.metrics &&
+      shared.revision >= revisionOf(result as FinalizedJobResult)
+    ) {
+      return shared.metrics
+    }
+    return extractCompactMetrics(result as Parameters<typeof extractCompactMetrics>[0])
+  }, [result, jobId, shared.jobId, shared.metrics, shared.revision])
   const insights = (result.processing_insights || null) as Record<string, unknown> | null
   const documentId = result.document_id
 

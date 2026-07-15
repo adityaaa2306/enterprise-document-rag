@@ -5,20 +5,22 @@ from typing import List, Optional
 class CarbonData(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    carbon_saved_grams: float
-    message: str
-    total_chunks: int
-    chunks_escalated: int
-    local_grid_gco2_kwh: float
+    # Optional fields: Summary Ready may omit grid/region until background finalize.
+    # Do NOT invent zeros — leave None so UI shows "—" until real values exist.
+    carbon_saved_grams: Optional[float] = None
+    message: Optional[str] = None
+    total_chunks: Optional[int] = None
+    chunks_escalated: Optional[int] = None
+    local_grid_gco2_kwh: Optional[float] = None
     remote_grid_gco2_kwh: Optional[float] = None
-    compute_location: str
+    compute_location: Optional[str] = None
     # Legacy numeric fields (kept for compatibility)
-    baseline_cost_gco2e: float = 0.0
-    actual_cost_gco2e: float = 0.0
-    efficiency_percent: float = 0.0
+    baseline_cost_gco2e: Optional[float] = None
+    actual_cost_gco2e: Optional[float] = None
+    efficiency_percent: Optional[float] = None
     # Workflow energy → Electricity Maps path
-    baseline_energy_kwh: float = 0.0
-    actual_energy_kwh: float = 0.0
+    baseline_energy_kwh: Optional[float] = None
+    actual_energy_kwh: Optional[float] = None
     grid_zone: Optional[str] = None
     grid_datetime: Optional[str] = None
     grid_source: Optional[str] = None
@@ -26,10 +28,10 @@ class CarbonData(BaseModel):
     breakdown: Optional[dict] = None
     methodology: Optional[str] = None
     # Explicit estimated terminology (Boundary A operational)
-    estimated_baseline_pipeline_emissions_g: float = 0.0
-    estimated_optimized_pipeline_emissions_g: float = 0.0
-    estimated_carbon_saved_g: float = 0.0
-    estimated_reduction_percent: float = 0.0
+    estimated_baseline_pipeline_emissions_g: Optional[float] = None
+    estimated_optimized_pipeline_emissions_g: Optional[float] = None
+    estimated_carbon_saved_g: Optional[float] = None
+    estimated_reduction_percent: Optional[float] = None
     reporting_boundary: Optional[str] = None
     reporting_boundary_label: Optional[str] = None
     routing_impact: Optional[dict] = None
@@ -122,6 +124,19 @@ class JobStatus(BaseModel):
     stalled: Optional[bool] = None
     stall_reason: Optional[str] = None
     heartbeat_age_sec: Optional[float] = None
+    # Task 8 — first-class streaming execution fields (additive)
+    workers_busy: Optional[int] = None
+    workers_total: Optional[int] = None
+    avg_latency_ms: Optional[float] = None
+    carbon_g: Optional[float] = None
+    remaining_tasks: Optional[int] = None
+    eta_sec: Optional[float] = None
+    dag: Optional[dict] = None
+    # Post-Summary Ready background lifecycle (additive — polling must continue until metrics_ready)
+    summary_ready: Optional[bool] = None
+    background_phase: Optional[str] = None
+    background_message: Optional[str] = None
+    metrics_ready: Optional[bool] = None
 
 
 class JobListItem(BaseModel):

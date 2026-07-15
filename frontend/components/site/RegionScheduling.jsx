@@ -76,12 +76,14 @@ export default function RegionScheduling() {
                     >
                       {isPrimary && (
                         <>
+                          {/* Animate scale, not SVG `r` — framer can briefly set r=undefined. */}
                           <motion.circle
                             r={26}
                             fill="none"
                             stroke="#10B981"
                             strokeWidth="0.8"
-                            animate={{ r: [22, 42, 22], opacity: [0.6, 0, 0.6] }}
+                            style={{ transformOrigin: "center", transformBox: "fill-box" }}
+                            animate={{ scale: [0.85, 1.6, 0.85], opacity: [0.6, 0, 0.6] }}
                             transition={{ duration: 2.4, repeat: Infinity }}
                           />
                           <circle r={18} fill="rgba(16,185,129,0.1)" stroke="#10B981" strokeWidth="1.2" />

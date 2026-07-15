@@ -1,14 +1,15 @@
 """
 Agentic Orchestrator — Adaptive hierarchical carbon-aware pipeline.
 
-Upload → Triage → Adaptive Chunking → Doc+Chunk Features → CRE →
-Per-chunk Router → Map (Light/Medium/Heavy) → QVA → Escalate ladder →
-Regional Hierarchy → Medium Compile → (Heavy if needed) → Store → Carbon
+Upload → Triage → Adaptive Chunking → Features → CRE → Map → QVA →
+Plan/Freeze compile DAG → Immutable Regional/Chapter/Executive →
+Summary Ready → (Background: embed/Chroma/BM25/carbon/telemetry)
 """
 from __future__ import annotations
 
 import logging
 import concurrent.futures
+import math
 import time
 from typing import TypedDict, List, Dict, Any, Optional
 
@@ -110,12 +111,62 @@ class AgentState(TypedDict, total=False):
     predicted_final_carbon_g: float
     map_checkpoint: Dict[str, Any]
     compile_meta: Dict[str, Any]
+    # Unified pipeline DAG nodes (chunk + hierarchy) — dict id → node dict
+    pipeline_dag_nodes: Dict[str, Any]
     # Pipeline intelligence (capability + strategy + explainability)
     pipeline_intelligence: Dict[str, Any]
     # Diagnostic only — stage + per-chunk timings
     ingestion_latency: Dict[str, Any]
     # Indices re-summarized in the last escalate step (incremental QVA)
     last_escalated_indices: List[int]
+
+
+def _restore_pipeline_nodes(state: AgentState):
+    """Rehydrate DagNode objects from state dicts produced by map_summarize."""
+    raw = state.get("pipeline_dag_nodes") or {}
+    if not raw:
+        return None
+    try:
+        from src.core.pipeline_dag import DagNode
+
+        out = {}
+        for nid, d in raw.items():
+            if isinstance(d, DagNode):
+                out[nid] = d
+                continue
+            if not isinstance(d, dict):
+                continue
+            out[nid] = DagNode(
+                id=str(d.get("id") or nid),
+                kind=str(d.get("kind") or "chunk"),
+                depth=int(d.get("depth") or 0),
+                dep_ids=list(d.get("dep_ids") or []),
+                parent_ids=list(d.get("parent_ids") or []),
+                children_ids=list(d.get("children_ids") or []),
+                status=str(d.get("status") or "pending"),
+                assigned_model=d.get("assigned_model"),
+                endpoint_id=d.get("endpoint_id"),
+                worker_id=d.get("worker_id"),
+                carbon_estimate_g=float(d.get("carbon_estimate_g") or 0.0),
+                energy_kwh=float(d.get("energy_kwh") or 0.0),
+                latency_ms=float(d.get("latency_ms") or 0.0),
+                tokens_in=int(d.get("tokens_in") or 0),
+                tokens_out=int(d.get("tokens_out") or 0),
+                cost_usd=float(d.get("cost_usd") or 0.0),
+                retries=int(d.get("retries") or 0),
+                input_text=str(d.get("input_text") or ""),
+                output_summary=str(d.get("output_summary") or ""),
+                section_path=str(d.get("section_path") or ""),
+                token_estimate=int(d.get("token_estimate") or 0),
+                qva_confidence=float(d.get("qva_confidence") or 0.0),
+                used_heavy=bool(d.get("used_heavy")),
+                tier=d.get("tier"),
+                chunk_index=d.get("chunk_index"),
+            )
+        return out or None
+    except Exception as e:
+        log.debug("restore pipeline nodes failed: %s", e)
+        return None
 
 
 def _set_progress(
@@ -184,6 +235,13 @@ def start_job(state: AgentState) -> AgentState:
         progress=5.0,
         message="Starting job...",
     )
+    # Prefetch Electricity Maps (TTL-cached) so FEA/routing never block on HTTP.
+    try:
+        from src.perf.prefetch import start_grid_intensity_prefetch
+
+        start_grid_intensity_prefetch()
+    except Exception as e:
+        log.debug("grid intensity prefetch skip: %s", e)
     return state
 
 
@@ -285,6 +343,14 @@ def triage_document(state: AgentState) -> Dict[str, Any]:
             raise ValueError("Chunking produced no chunks. Cannot proceed.")
 
     lat.add_meta(total_chunks=len(chunks), raw_triage_chunks=len(raw_chunks))
+    # Start embedding as soon as immutable chunk text exists (overlaps FEA/CRE/map).
+    if bool(getattr(settings, "ENABLE_EMBED_PREFETCH", True)):
+        try:
+            from src.perf.prefetch import start_embed_prefetch
+
+            start_embed_prefetch(job_id, chunks)
+        except Exception as e:
+            log.debug("early embed prefetch skip: %s", e)
     return {
         "chunks": chunks,
         "total_chunks": len(chunks),
@@ -507,11 +573,22 @@ def map_summarize_routed(state: AgentState) -> Dict[str, Any]:
     done_set = set(int(x) for x in (checkpoint.get("completed_indices") or []))
     max_workers = max(1, int(settings.effective_map_max_workers()))
     intensity = float((state.get("features") or {}).get("grid_intensity") or 500.0)
+    # Task 1: real pending chunk nodes in the unified pipeline DAG
+    pipeline_nodes = _restore_pipeline_nodes(state) or {}
+    try:
+        from src.core import pipeline_dag as pdag
+
+        if not pipeline_nodes:
+            pipeline_nodes = pdag.build_chunk_nodes(chunks, routes=routes)
+    except Exception as e:
+        log.debug("pipeline chunk nodes skip: %s", e)
+        pipeline_nodes = {}
     lat.add_meta(
         map_max_workers=max_workers,
         adaptive_chunk_routing=True,
         capacity_scheduler=bool(getattr(settings, "CAPACITY_SCHEDULER_ENABLED", True)),
         embedded_worker=bool(getattr(settings, "RUN_EMBEDDED_WORKER", False)),
+        unified_dag_chunks=len(pipeline_nodes),
     )
     stage_t0 = time.perf_counter()
     carbon_spent = float(state.get("carbon_spent_g") or 0.0)
@@ -524,20 +601,64 @@ def map_summarize_routed(state: AgentState) -> Dict[str, Any]:
         except Exception as e:
             log.debug("embed prefetch skip: %s", e)
 
-    def _run(idx_chunk):
+    def _run(idx_chunk, deadline_mono: Optional[float] = None):
         idx, chunk = idx_chunk
         route = routes.get(idx) or {}
         tier = str(route.get("tier") or default_tier)
         chain = _models_for_tier(tier, decision) or default_chain
         lat.worker_enter()
         try:
-            result = summarization_agents.run_summarization_agent(
-                chunk.content,
-                state,
-                tier=tier,
-                model_ids=chain,
-                grid_intensity=intensity,
+            # Hard isolation: HTTP client timeout is below MAP wall; wrap again
+            # so a stuck socket cannot block the capacity worker forever.
+            from src.core.pipeline_executor import _run_with_hard_isolation
+
+            hard_iso = float(
+                getattr(settings, "MAP_CHUNK_HARD_TIMEOUT_SEC", 90.0) or 90.0
             )
+
+            def _invoke():
+                return summarization_agents.run_summarization_agent(
+                    chunk.content,
+                    state,
+                    tier=tier,
+                    model_ids=chain,
+                    grid_intensity=intensity,
+                    deadline_mono=deadline_mono,
+                    task_id=f"chunk-{idx}",
+                )
+
+            result = _run_with_hard_isolation(
+                _invoke, hard_timeout_sec=hard_iso, label=f"chunk-{idx}"
+            )
+            # Update unified DAG chunk node
+            nid = f"chunk-{idx}"
+            if nid in pipeline_nodes:
+                node = pipeline_nodes[nid]
+                node.status = "completed" if result.success and (result.summary or "").strip() else "failed"
+                node.output_summary = (result.summary or "").strip()
+                node.assigned_model = result.model_id
+                node.tier = tier
+                node.latency_ms = float(result.latency_ms or 0.0)
+                node.carbon_estimate_g = float(result.carbon_estimate_g or 0.0)
+                node.tokens_in = int(result.input_tokens or 0)
+                node.tokens_out = int(result.output_tokens or 0)
+                try:
+                    from src.core.node_accounting import estimate_node_accounting
+
+                    acct = estimate_node_accounting(
+                        tier=tier,
+                        tokens_in=node.tokens_in,
+                        tokens_out=node.tokens_out,
+                        latency_ms=node.latency_ms,
+                        grid_intensity=intensity,
+                        model_id=result.model_id,
+                    )
+                    node.energy_kwh = float(acct["energy_kwh"])
+                    node.cost_usd = float(acct["cost_usd"])
+                    node.carbon_estimate_g = float(acct["carbon_g"])
+                except Exception:
+                    pass
+                node.finished_at = time.monotonic()
             lat.record_chunk_call(
                 {
                     "chunk_index": idx,
@@ -590,11 +711,40 @@ def map_summarize_routed(state: AgentState) -> Dict[str, Any]:
             _set_progress(job_id, pct, prog.message("Summarizing"), force=False)
             try:
                 from src.core.execution_scheduler import map_progress_partial
+                from src.core import pipeline_dag as pdag
 
                 job_store.JOB_STATUSES.setdefault(job_id, {})
                 partial = map_progress_partial(prog, mets)
                 partial["chunks_done"] = prog.completed
                 partial["chunks_total"] = total
+                # Mark running chunk nodes
+                busy = int(prog.running or 0)
+                if pipeline_nodes:
+                    for nid, node in pipeline_nodes.items():
+                        if node.status == "pending" and node.chunk_index is not None:
+                            # leave pending until completed in _run
+                            pass
+                    snap = pdag.dag_progress_snapshot(
+                        pipeline_nodes,
+                        workers_busy=busy,
+                        workers_total=max_workers,
+                    )
+                    elapsed = time.perf_counter() - stage_t0
+                    rate = prog.completed / elapsed if elapsed > 0.5 and prog.completed else 0.0
+                    rem = max(0, total - prog.completed - len(done_set))
+                    eta = (rem / rate) if rate > 0 else None
+                    snap["eta_sec"] = round(eta, 1) if eta is not None else None
+                    snap["carbon_g"] = round(
+                        sum(float(n.carbon_estimate_g or 0) for n in pipeline_nodes.values()),
+                        4,
+                    )
+                    partial["dag"] = snap
+                    partial["workers_busy"] = busy
+                    partial["workers_total"] = max_workers
+                    partial["avg_latency_ms"] = snap.get("avg_latency_ms")
+                    partial["carbon_g"] = snap.get("carbon_g")
+                    partial["remaining_tasks"] = rem
+                    partial["eta_sec"] = snap.get("eta_sec")
                 job_store.JOB_STATUSES[job_id]["partial"] = partial
             except Exception:
                 pass
@@ -637,10 +787,11 @@ def map_summarize_routed(state: AgentState) -> Dict[str, Any]:
             lat.add_meta(scheduler=mets.to_dict(), map_progress=prog.snapshot())
             _on_progress(prog, mets)
         else:
-            # Legacy submit path (feature flag off) — still capacity-capped workers
+            # Legacy submit path (feature flag off) — capacity-capped + non-blocking exit
             submit_times: Dict[int, float] = {}
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_idx = {}
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+            future_to_idx = {}
+            try:
                 for i, c in pending:
                     submit_times[i] = time.perf_counter()
                     future_to_idx[executor.submit(_run, (i, c))] = i
@@ -671,9 +822,25 @@ def map_summarize_routed(state: AgentState) -> Dict[str, Any]:
                         35.0 + (done / max(total, 1)) * 25.0,
                         f"Summarizing... completed {done}/{total}",
                     )
+            finally:
+                # Never join hung NIM threads on map exit
+                try:
+                    models._shutdown_executor_nowait(executor)
+                except Exception:
+                    try:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    except TypeError:
+                        executor.shutdown(wait=False)
 
     budget = float(state.get("carbon_budget_g") or settings.CARBON_BUDGET_G)
     lat.add_meta(map_wall_ms=round((time.perf_counter() - stage_t0) * 1000.0, 1))
+    # Serialize DAG nodes for state (dataclasses → dicts)
+    dag_nodes_ser = {}
+    for nid, n in pipeline_nodes.items():
+        try:
+            dag_nodes_ser[nid] = n.to_dict() if hasattr(n, "to_dict") else n
+        except Exception:
+            pass
     return {
         "summaries": summaries,
         "agent_telemetry": agent_telemetry,
@@ -683,6 +850,7 @@ def map_summarize_routed(state: AgentState) -> Dict[str, Any]:
             "completed_indices": sorted(done_set),
             "summaries": summaries,
         },
+        "pipeline_dag_nodes": dag_nodes_ser,
         "ingestion_latency": _persist_latency(lat),
     }
 
@@ -918,19 +1086,32 @@ def escalate_once(state: AgentState) -> Dict[str, Any]:
         force=True,
     )
 
-    def _run(idx):
+    def _run(idx, deadline_mono: Optional[float] = None):
         route = routes.get(idx) or {}
         cur = str(route.get("tier") or decision.tier)
         nxt = _next_tier(cur) or "heavy"
         chain = _models_for_tier(nxt, decision.to_dict())
         lat.worker_enter()
         try:
-            result = summarization_agents.run_summarization_agent(
-                state["chunks"][idx].content,
-                state,
-                tier=nxt,
-                model_ids=chain,
-                grid_intensity=intensity,
+            from src.core.pipeline_executor import _run_with_hard_isolation
+
+            hard_iso = float(
+                getattr(settings, "MAP_CHUNK_HARD_TIMEOUT_SEC", 90.0) or 90.0
+            )
+
+            def _invoke():
+                return summarization_agents.run_summarization_agent(
+                    state["chunks"][idx].content,
+                    state,
+                    tier=nxt,
+                    model_ids=chain,
+                    grid_intensity=intensity,
+                    deadline_mono=deadline_mono,
+                    task_id=f"chunk-{idx}",
+                )
+
+            result = _run_with_hard_isolation(
+                _invoke, hard_timeout_sec=hard_iso, label=f"esc-chunk-{idx}"
             )
             lat.record_chunk_call(
                 {
@@ -969,8 +1150,8 @@ def escalate_once(state: AgentState) -> Dict[str, Any]:
             # Payloads as (idx,) tuples so ordered results key by index
             payloads = [(i,) for i in failed_idx]
 
-            def _run_wrapped(payload):
-                return _run(payload[0])
+            def _run_wrapped(payload, deadline_mono: Optional[float] = None):
+                return _run(payload[0], deadline_mono=deadline_mono)
 
             ordered, prog, mets = run_capacity_pool(
                 payloads,
@@ -1316,6 +1497,7 @@ def reduce_compile(state: AgentState) -> Dict[str, Any]:
                     max_workers=settings.effective_compile_max_workers(),
                     deadline_mono=dag_deadline,
                     progress_cb=_dag_progress,
+                    existing_nodes=_restore_pipeline_nodes(state),
                 )
                 final_summary = str(dag_out.get("final_summary") or "")
                 compile_meta["medium_compile_ms"] = round(
@@ -1333,7 +1515,18 @@ def reduce_compile(state: AgentState) -> Dict[str, Any]:
                 compile_meta["dag_nodes"] = dag_out.get("dag_nodes") or {}
                 compile_meta["dag_workers"] = dag_out.get("workers")
                 compile_meta["endpoint_pool"] = dag_out.get("endpoint_pool") or []
+                compile_meta["carbon_rollups"] = dag_out.get("carbon_rollups") or {}
+                compile_meta["perf_metrics"] = dag_out.get("perf_metrics") or {}
+                compile_meta["branch_recompiles"] = list(
+                    dag_out.get("branch_recompiles") or []
+                )
                 compile_meta["engine"] = "dag"
+                # Persist full graph back onto state for UI / finalize
+                if dag_out.get("dag_nodes"):
+                    state_nodes = dict(state.get("pipeline_dag_nodes") or {})
+                    state_nodes.update(dag_out.get("dag_nodes") or {})
+                    # returned via compile_meta; finalize merges insights
+                    compile_meta["pipeline_dag_nodes"] = state_nodes
                 qva_t0 = time.perf_counter()
                 final_verdict = quality_validation.validate_final(
                     list(state.get("summaries") or [])[:40], final_summary
@@ -1569,38 +1762,339 @@ def reduce_compile(state: AgentState) -> Dict[str, Any]:
     }
 
 
+def execute_document_dag_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Thin LangGraph entry: one continuous DAG executor owns map → QVA escalate →
+    hierarchy compile. Replaces the split map/validate/escalate/reduce stages.
+    """
+    job_id = state["job_id"]
+    lat = _get_latency(state)
+    reduce_max = float(getattr(settings, "REDUCE_COMPILE_MAX_SEC", 270.0) or 270.0)
+    map_hard = float(getattr(settings, "MAP_CHUNK_HARD_TIMEOUT_SEC", 90.0) or 90.0)
+    compile_hard = float(getattr(settings, "COMPILE_NODE_HARD_TIMEOUT_SEC", 90.0) or 90.0)
+    n_chunks = max(1, int(state.get("total_chunks") or len(state.get("chunks") or []) or 1))
+    workers = max(1, int(settings.effective_parallel_workers()))
+    map_attempts = max(2, int(getattr(settings, "MAP_EMPTY_RETRY_ATTEMPTS", 2) or 2))
+    # Shared wall for the whole document DAG (map + escalate + compile).
+    # Prior default (270s) was too tight: medium-tier NIM hangs + retries burned
+    # the whole budget, then escalate/compile ran with a negative deadline and
+    # wiped summaries → "Unable to generate a final summary…".
+    waves = int(math.ceil(n_chunks / float(workers)))
+    map_budget = map_hard * waves * min(map_attempts, 3)
+    dag_wall = max(
+        reduce_max,
+        map_budget + compile_hard + 60.0,
+        600.0,  # floor for live NIM flakiness on small docs
+    )
+    # Cap absurd walls but allow large docs
+    dag_wall = min(dag_wall, float(getattr(settings, "JOB_MAX_RUNTIME_SEC", 7200.0) or 7200.0))
+    deadline_mono = time.monotonic() + dag_wall
+
+    log.info(
+        "Job %s: [5–7] Unified DAG executor (wall=%.0fs chunks=%s workers=%s)",
+        job_id,
+        dag_wall,
+        n_chunks,
+        workers,
+    )
+    _set_progress(job_id, 35.0, "Running unified pipeline DAG...", force=True)
+
+    from src.core.pipeline_executor import execute_document_dag
+
+    def _progress(pct: float, msg: str, extra: Dict[str, Any]) -> None:
+        # Throttle DB writes; in-memory partial DAG snapshot still updates every tick.
+        _set_progress(job_id, pct, msg, force=False)
+        try:
+            job_store.JOB_STATUSES.setdefault(job_id, {})
+            partial = dict(job_store.JOB_STATUSES[job_id].get("partial") or {})
+            if isinstance(extra.get("dag"), dict):
+                partial["dag"] = extra["dag"]
+                d = extra["dag"]
+                if d.get("workers_busy") is not None:
+                    partial["workers_busy"] = d.get("workers_busy")
+                if d.get("workers_total") is not None:
+                    partial["workers_total"] = d.get("workers_total")
+                if d.get("eta_sec") is not None:
+                    partial["eta_sec"] = d.get("eta_sec")
+                if d.get("carbon_g") is not None:
+                    partial["carbon_g"] = d.get("carbon_g")
+                if d.get("remaining") is not None:
+                    partial["remaining_tasks"] = d.get("remaining")
+                if d.get("avg_latency_ms") is not None:
+                    partial["avg_latency_ms"] = d.get("avg_latency_ms")
+            job_store.JOB_STATUSES[job_id]["partial"] = partial
+        except Exception:
+            pass
+
+    with lat.stage(STAGE_MAP_SUMMARIZE):
+        out = execute_document_dag(
+            dict(state),
+            progress_cb=_progress,
+            deadline_mono=deadline_mono,
+        )
+    _set_progress(job_id, 88.0, "Unified pipeline DAG complete", force=True)
+    for k, v in (out.get("stage_timings_ms") or {}).items():
+        try:
+            lat.add_meta(**{str(k): float(v)})
+        except Exception:
+            pass
+
+    budget = float(state.get("carbon_budget_g") or settings.CARBON_BUDGET_G)
+    carbon_spent = float(out.get("carbon_spent_g") or 0.0)
+    compile_meta = dict(out.get("compile_meta") or {})
+    final_summary = str(out.get("final_summary") or "")
+    verdict = out.get("validation_verdict") or {}
+    accept_warn = bool(
+        not (verdict.get("passed") if isinstance(verdict, dict) else True)
+        or compile_meta.get("used_stitched_fallback")
+        or not (final_summary or "").strip()
+    )
+    if not (final_summary or "").strip():
+        final_summary = models.stitch_compile_fallback(
+            list(out.get("summaries") or [])[:40],
+            reason="unified_dag_empty_final",
+        )
+        compile_meta["used_stitched_fallback"] = True
+        accept_warn = True
+
+    intel = state.get("pipeline_intelligence") or {}
+    if intel:
+        try:
+            from src.core.pipeline_intelligence import enrich_report_after_run
+
+            intel = enrich_report_after_run(
+                intel,
+                routing_distribution=state.get("routing_distribution"),
+                cre_result=state.get("cre_result"),
+                escalations={
+                    "chunks_escalated": compile_meta.get("escalation_count"),
+                    "escalation_count": compile_meta.get("escalation_count"),
+                },
+                compile_meta=compile_meta,
+                validation=verdict if isinstance(verdict, dict) else {},
+                latency_by_stage=(state.get("ingestion_latency") or {}).get("stages_ms"),
+            )
+        except Exception:
+            pass
+
+    lat.add_meta(unified_dag=True, compile_engine=compile_meta.get("engine"))
+    return {
+        "summaries": out.get("summaries") or [],
+        "final_summary": final_summary,
+        "agent_telemetry": out.get("agent_telemetry") or [],
+        "carbon_spent_g": round(carbon_spent, 4),
+        "carbon_remaining_g": round(max(0.0, budget - carbon_spent), 4),
+        "pipeline_dag_nodes": out.get("pipeline_dag_nodes") or {},
+        "compile_meta": compile_meta,
+        "execution_plan": out.get("execution_plan") or {},
+        "validation_verdict": verdict if isinstance(verdict, dict) else {},
+        "accept_with_warning": accept_warn,
+        "hierarchy": compile_meta.get("hierarchy") or {},
+        "map_checkpoint": out.get("map_checkpoint") or {},
+        "pipeline_intelligence": intel or state.get("pipeline_intelligence"),
+        "ingestion_latency": _persist_latency(lat),
+        "escalation_count": int(compile_meta.get("escalation_count") or 0),
+    }
+
+
+def deliver_summary(state: AgentState) -> Dict[str, Any]:
+    """
+    Publish final summary immediately (Summary Ready).
+
+    Embedding / Chroma / BM25 / carbon / telemetry run as background services
+    and must never block this node.
+    """
+    job_id = state["job_id"]
+    final_summary = str(state.get("final_summary") or "")
+    log.info("Job %s: [Summary Ready] delivering summary (%s chars)", job_id, len(final_summary))
+    try:
+        from src.core.sync_lifecycle import log_transition
+
+        log_transition(job_id, "Summary Ready", detail={"chars": len(final_summary)})
+    except Exception:
+        pass
+    _set_progress(job_id, 91.0, "Summary Ready", force=True)
+
+    document_id = state.get("document_id") or job_id
+    display_name = state.get("filename") or state.get("original_filename") or document_id
+    rollups = (state.get("compile_meta") or {}).get("carbon_rollups") or state.get("carbon_rollups") or {}
+    operational = float(
+        rollups.get("total_carbon_g")
+        or state.get("carbon_spent_g")
+        or 0.0
+    )
+    result = {
+        "document_id": document_id,
+        "filename": display_name,
+        "final_summary": final_summary,
+        "job_id": job_id,
+        "summary_ready": True,
+        "background": {
+            "phase": "queued",
+            "message": "Background Indexing",
+        },
+        "carbon_data": {
+            "carbon_saved_grams": 0.0,
+            "efficiency_percent": 0.0,
+            # Primary metric at Summary Ready: Operational CO₂e from DAG nodes
+            "operational_co2e_g": operational,
+            "actual_cost_gco2e": operational,
+            "primary_metric": "operational_co2e",
+            "modeled_co2e_g": None,
+            "modeled_label": "Modeled CO₂e Estimate",
+            "baseline_cost_gco2e": 0.0,
+            "total_chunks": int(state.get("total_chunks") or 0),
+            "processing_time_seconds": 0.0,
+        },
+        "hierarchy": state.get("hierarchy"),
+        "routing_distribution": state.get("routing_distribution"),
+        "chunk_routing": state.get("chunk_routing"),
+        "compile_meta": state.get("compile_meta"),
+        "execution_plan": state.get("execution_plan") or {},
+        "ingestion_latency": state.get("ingestion_latency"),
+        "accept_with_warning": bool(state.get("accept_with_warning")),
+    }
+    try:
+        from src.core.processing_insights import build_processing_insights
+
+        routing_decision = dict(state.get("routing_decision") or {})
+        features = state.get("features") if isinstance(state.get("features"), dict) else {}
+        if not routing_decision.get("document_type") and features.get("document_type"):
+            routing_decision["document_type"] = features.get("document_type")
+        result["processing_insights"] = build_processing_insights(
+            routing_decision=routing_decision,
+            cre_result=state.get("cre_result"),
+            carbon_report={},
+            validation_verdict=state.get("validation_verdict"),
+            job_mode=state.get("job_mode") or "automatic",
+            latency_ms=None,
+            routing_distribution=state.get("routing_distribution"),
+            chunk_routing=state.get("chunk_routing"),
+            hierarchy=state.get("hierarchy"),
+            agent_telemetry=state.get("agent_telemetry"),
+            compile_meta=state.get("compile_meta"),
+            carbon_budget_g=state.get("carbon_budget_g"),
+            carbon_spent_g=state.get("carbon_spent_g"),
+            carbon_remaining_g=state.get("carbon_remaining_g"),
+            predicted_final_carbon_g=state.get("predicted_final_carbon_g"),
+            ingestion_latency=state.get("ingestion_latency"),
+            triage_meta=state.get("triage_meta"),
+            pipeline_intelligence=state.get("pipeline_intelligence"),
+        )
+    except Exception as e:
+        log.warning("Job %s: early processing_insights failed: %s", job_id, e)
+
+    job_store.upsert_job(
+        job_id,
+        status=job_status_mod.STATUS_COMPLETE,
+        progress=91.0,
+        message="Summary Ready",
+        result=result,
+        result_source="orchestrator.deliver_summary",
+        routing_decision=state.get("routing_decision"),
+        selected_model=(state.get("routing_decision") or {}).get("selected_model"),
+        crs=(state.get("cre_result") or {}).get("crs"),
+    )
+    try:
+        from src.core.sync_lifecycle import log_transition
+
+        log_transition(job_id, "Summary persisted", detail={"progress": 91.0})
+    except Exception:
+        pass
+    try:
+        job_store.JOB_STATUSES.setdefault(job_id, {})["background"] = result["background"]
+        partial = dict(job_store.JOB_STATUSES[job_id].get("partial") or {})
+        partial["background"] = result["background"]
+        partial["summary_ready"] = True
+        job_store.JOB_STATUSES[job_id]["partial"] = partial
+    except Exception:
+        pass
+
+    # Off critical path
+    try:
+        from src.core.background_services import enqueue_post_summary_services
+        from src.core.sync_lifecycle import log_transition
+
+        enqueue_post_summary_services(job_id, dict(state))
+        log_transition(job_id, "Background Started")
+    except Exception as e:
+        log.error("Job %s: failed to enqueue background services: %s", job_id, e)
+
+    return {"summary_delivered": True}
+
+
+def route_after_cre(state: AgentState) -> str:
+    if bool(getattr(settings, "UNIFIED_DAG_EXECUTOR_ENABLED", True)):
+        return "execute_document_dag"
+    return "map_summarize"
 def store_for_rag(state: AgentState) -> Dict[str, Any]:
     job_id = state["job_id"]
     log.info(f"Job {job_id}: [8] Storing for RAG...")
     _set_progress(job_id, 90.0, "Indexing for search...", force=True)
     lat = _get_latency(state)
 
-    prefetched = None
-    if bool(getattr(settings, "ENABLE_EMBED_PREFETCH", True)):
-        try:
-            from src.perf.prefetch import get_embed_prefetch
+    from src.perf.critical_path import CriticalPath, dag_audit_get
 
-            prefetched = get_embed_prefetch(job_id, timeout_sec=90.0)
-            if prefetched:
-                lat.add_meta(embed_prefetch_hits=sum(1 for v in prefetched if v))
-        except Exception as e:
-            log.debug("embed prefetch retrieve failed: %s", e)
+    cp = CriticalPath(job_id, label="post_dag")
+    prefetched = None
+    with cp.step("embed_prefetch_wait") as info:
+        if bool(getattr(settings, "ENABLE_EMBED_PREFETCH", True)):
+            try:
+                from src.perf.prefetch import get_embed_prefetch
+
+                prefetched = get_embed_prefetch(job_id, timeout_sec=90.0)
+                info["prefetch_hit"] = bool(prefetched)
+                info["prefetch_vectors"] = (
+                    sum(1 for v in prefetched if v) if prefetched else 0
+                )
+                if prefetched:
+                    lat.add_meta(embed_prefetch_hits=sum(1 for v in prefetched if v))
+            except Exception as e:
+                info["error"] = str(e)
+                log.debug("embed prefetch retrieve failed: %s", e)
+        else:
+            info["skipped"] = True
 
     with lat.stage(STAGE_STORE):
-        try:
-            storage.store_document_data(
-                job_id=job_id,
-                summary=state["final_summary"],
-                chunks=state["chunks"],
-                routing_decision=state.get("routing_decision"),
-                prefetched_embeddings=prefetched,
+        with cp.step("store_document_data") as info:
+            try:
+                t_store = time.perf_counter()
+                storage.store_document_data(
+                    job_id=job_id,
+                    summary=state["final_summary"],
+                    chunks=state["chunks"],
+                    routing_decision=state.get("routing_decision"),
+                    prefetched_embeddings=prefetched,
+                )
+                info["store_wall_ms"] = round((time.perf_counter() - t_store) * 1000.0, 2)
+                info["chunk_count"] = len(state.get("chunks") or [])
+                info["used_prefetch"] = bool(prefetched)
+                log.info("Job %s: stored in Chroma / document store", job_id)
+            except Exception as e:
+                info["error"] = str(e)
+                # Indexing failure should not orphan the job in processing — surface as
+                # a hard failure so the runner marks error/retry.
+                log.error("Job %s: store_for_rag failed: %s", job_id, e)
+                raise
+
+    try:
+        lat.add_meta(**cp.as_meta())
+        audit = dag_audit_get(job_id)
+        if audit:
+            lat.add_meta(
+                dag_audit_submit_counts=dict(audit.get("submit_counts") or {}),
+                dag_audit_overflow_inserts=len(audit.get("overflow_inserts") or []),
+                dag_audit_deferred_overflow=len(audit.get("deferred_overflow") or []),
+                dag_audit_misleading_executive_msgs=int(
+                    audit.get("misleading_executive_msgs") or 0
+                ),
+                dag_audit_node_count_history=(audit.get("node_count_history") or [])[-20:],
             )
-            log.info("Job %s: stored in Chroma / document store", job_id)
-        except Exception as e:
-            # Indexing failure should not orphan the job in processing — surface as
-            # a hard failure so the runner marks error/retry.
-            log.error("Job %s: store_for_rag failed: %s", job_id, e)
-            raise
+        for line in cp.format_table().splitlines():
+            log.info("Job %s: %s", job_id, line)
+    except Exception as e:
+        log.debug("critical path meta skip: %s", e)
+
     return {"ingestion_latency": _persist_latency(lat)}
 
 
@@ -1608,16 +2102,21 @@ def finalize_metrics(state: AgentState) -> Dict[str, Any]:
     job_id = state["job_id"]
     log.info(f"Job {job_id}: [9] Carbon + telemetry...")
     _set_progress(job_id, 98.0, "Recording metrics...", force=True)
-    try:
-        from src.perf.progress import flush_progress
+    from src.perf.critical_path import CriticalPath
 
-        flush_progress(job_id)
-    except Exception:
-        pass
+    cp = CriticalPath(job_id, label="finalize")
+    with cp.step("flush_progress"):
+        try:
+            from src.perf.progress import flush_progress
+
+            flush_progress(job_id)
+        except Exception:
+            pass
     lat = _get_latency(state)
 
     with lat.stage(STAGE_FINALIZE):
-        report = scheduler.calculate_carbon_savings(job_id=job_id, state=state)
+        with cp.step("calculate_carbon_savings"):
+            report = scheduler.calculate_carbon_savings(job_id=job_id, state=state)
 
         # Attach routing explainability into carbon/message side-channel
         decision = state.get("routing_decision") or {}
@@ -1634,36 +2133,89 @@ def finalize_metrics(state: AgentState) -> Dict[str, Any]:
             },
         }
 
-        metrics.log_job_metrics(job_id, report, state)
+        with cp.step("log_job_metrics"):
+            metrics.log_job_metrics(job_id, report, state)
 
         latency = None
         if state.get("job_started_ms"):
             latency = (time.time() * 1000) - float(state["job_started_ms"])
 
-        routing_telemetry.log_job_routing(
-            job_id=job_id,
-            mode=state.get("job_mode") or "automatic",
-            features=state.get("features") or {},
-            cre=cre_result,
-            decision=decision,
-            validation=state.get("validation_verdict"),
-            carbon_report=report,
-            latency_ms=latency,
-        )
+        with cp.step("routing_telemetry"):
+            routing_telemetry.log_job_routing(
+                job_id=job_id,
+                mode=state.get("job_mode") or "automatic",
+                features=state.get("features") or {},
+                cre=cre_result,
+                decision=decision,
+                validation=state.get("validation_verdict"),
+                carbon_report=report,
+                latency_ms=latency,
+            )
 
-        storage.store_document_data(
-            job_id=job_id,
-            summary=state["final_summary"],
-            chunks=[],
-            carbon_meta=report,
-            routing_decision=decision or None,
-        )
+        # Avoid re-embedding / re-storing all chunks; patch carbon + routing only.
+        with cp.step("update_document_carbon_meta"):
+            try:
+                storage.update_document_carbon_meta(
+                    job_id=job_id,
+                    summary=state["final_summary"],
+                    carbon_meta=report,
+                    routing_decision=decision or None,
+                )
+            except Exception as e:
+                log.warning(
+                    "Job %s: carbon meta patch failed (%s); falling back to store_document_data",
+                    job_id,
+                    e,
+                )
+                storage.store_document_data(
+                    job_id=job_id,
+                    summary=state["final_summary"],
+                    chunks=[],
+                    carbon_meta=report,
+                    routing_decision=decision or None,
+                )
+
+    try:
+        lat.add_meta(**cp.as_meta())
+        for line in cp.format_table().splitlines():
+            log.info("Job %s: %s", job_id, line)
+    except Exception:
+        pass
 
     ingestion_latency = lat.finish()
     log_ingestion_latency(job_id, ingestion_latency)
     table = format_latency_table(ingestion_latency)
     for line in table.splitlines():
         log.info("Job %s: %s", job_id, line)
+    try:
+        from src.perf.profiler import format_waterfall, rank_bottlenecks, attach_resource_snapshot
+
+        stages = {
+            k: float(v)
+            for k, v in (ingestion_latency.get("stages") or {}).items()
+            if isinstance(v, (int, float))
+        }
+        if ingestion_latency.get("total_ms") is not None:
+            stages["total_ms"] = float(ingestion_latency["total_ms"])
+        # Include DAG sub-stage timings from meta when present
+        meta = ingestion_latency.get("meta") or {}
+        for k in ("dag_map_ms", "dag_qva_escalate_ms", "dag_compile_ms"):
+            if meta.get(k) is not None:
+                stages[k] = float(meta[k])
+        for line in format_waterfall(stages).splitlines():
+            log.info("Job %s: %s", job_id, line)
+        for row in rank_bottlenecks(stages):
+            log.info(
+                "Job %s: bottleneck #%s %s %.1fs (%.1f%%)",
+                job_id,
+                row["rank"],
+                row["stage"],
+                row["sec"],
+                row["pct_of_stages"],
+            )
+        attach_resource_snapshot(ingestion_latency, label="finalize")
+    except Exception as e:
+        log.debug("waterfall profile skip: %s", e)
 
     # Persist compact latency JSON for offline analysis
     try:
@@ -1679,17 +2231,32 @@ def finalize_metrics(state: AgentState) -> Dict[str, Any]:
     except Exception as e:
         log.warning("Job %s: failed to write ingest latency file: %s", job_id, e)
 
+    # Never downgrade a Summary Ready / complete job back to processing.
+    existing_status = None
+    try:
+        existing_status = (job_store.get_job(job_id) or job_store.JOB_STATUSES.get(job_id) or {}).get(
+            "status"
+        )
+    except Exception:
+        pass
+    terminal = str(existing_status or "") in (
+        job_status_mod.STATUS_COMPLETE,
+        job_status_mod.STATUS_ERROR,
+        job_status_mod.STATUS_CANCELLED,
+    )
     job_store.upsert_job(
         job_id,
         progress=100.0,
         message=(
-            "Job metrics recorded (accepted with warning). Finalizing results..."
-            if state.get("accept_with_warning")
-            else "Job metrics recorded. Finalizing results..."
+            "Summary Ready · Search available"
+            if terminal
+            else (
+                "Job metrics recorded (accepted with warning). Finalizing results..."
+                if state.get("accept_with_warning")
+                else "Job metrics recorded. Finalizing results..."
+            )
         ),
-        # Do not mark terminal "complete" here — the API background runner attaches
-        # the SummaryResponse ``result`` payload and then sets STATUS_COMPLETE.
-        status=job_status_mod.STATUS_PROCESSING,
+        status=job_status_mod.STATUS_COMPLETE if terminal else job_status_mod.STATUS_PROCESSING,
         routing_decision=decision or None,
         crs=cre_result.get("crs"),
         selected_model=decision.get("selected_model"),
@@ -1718,6 +2285,8 @@ workflow.add_node("triage_document", triage_document)
 workflow.add_node("extract_features", extract_features_node)
 workflow.add_node("plan_pipeline", plan_pipeline)
 workflow.add_node("cre_and_route", cre_and_route)
+workflow.add_node("execute_document_dag", execute_document_dag_node)
+workflow.add_node("deliver_summary", deliver_summary)
 workflow.add_node("map_summarize", map_summarize_routed)
 workflow.add_node("validate_map", validate_map)
 workflow.add_node("escalate_once", escalate_once)
@@ -1731,7 +2300,17 @@ workflow.add_edge("start_job", "triage_document")
 workflow.add_edge("triage_document", "extract_features")
 workflow.add_edge("extract_features", "plan_pipeline")
 workflow.add_edge("plan_pipeline", "cre_and_route")
-workflow.add_edge("cre_and_route", "map_summarize")
+workflow.add_conditional_edges(
+    "cre_and_route",
+    route_after_cre,
+    {
+        "execute_document_dag": "execute_document_dag",
+        "map_summarize": "map_summarize",
+    },
+)
+# Critical path ends at Summary Ready; indexing/carbon run in background.
+workflow.add_edge("execute_document_dag", "deliver_summary")
+workflow.add_edge("deliver_summary", END)
 workflow.add_edge("map_summarize", "validate_map")
 
 workflow.add_conditional_edges(
@@ -1746,7 +2325,9 @@ workflow.add_conditional_edges(
 
 workflow.add_edge("escalate_once", "validate_map")
 workflow.add_edge("mark_warning", "reduce_compile")
-workflow.add_edge("reduce_compile", "store_for_rag")
+workflow.add_edge("reduce_compile", "deliver_summary")
+# store_for_rag / finalize_metrics remain callable from background_services
+# (not on the LangGraph critical path for the unified DAG).
 workflow.add_edge("store_for_rag", "finalize_metrics")
 workflow.add_edge("finalize_metrics", END)
 

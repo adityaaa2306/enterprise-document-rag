@@ -1,7 +1,8 @@
 """
-Auth dependencies and ownership enforcement (Phase 1).
+Auth dependencies and ownership enforcement.
 
-Infrastructure only — does not touch AI agents.
+Supports universal Owner: authenticated User (JWT) OR Guest Session (cookie/header).
+JWT always wins when present. Pipeline code does not branch on identity type.
 """
 from __future__ import annotations
 
@@ -10,26 +11,31 @@ import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from src.api import auth
+from src.core.owner import (
+    GUEST_COOKIE_NAME,
+    GUEST_HEADER_NAME,
+    OwnerType,
+    owner_from_guest,
+    owner_from_user,
+    owners_match,
+)
+from src.db import guests as guest_store
 from src.db import jobs as job_store
-from src.memory import storage
 
 log = logging.getLogger("api.deps")
 
 security = HTTPBearer(auto_error=False)
 
-# Short TTL cache: parallel /jobs + /queue + /job-status each called get_user_by_id
-# against remote Neon (~0.5–2s RTT). Cache collapses that to one lookup per window.
 _USER_CACHE_TTL_SEC = 60.0
 _user_cache_lock = threading.Lock()
 _user_cache: Dict[int, Tuple[float, Dict[str, Any]]] = {}
 
 
 def seed_user_cache(user: Dict[str, Any]) -> None:
-    """Populate auth cache after login/register so the next request skips Neon."""
     try:
         uid = int(user["id"])
     except (KeyError, TypeError, ValueError):
@@ -59,8 +65,7 @@ def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> Dict[str, Any]:
     """
-    Require a valid Bearer access token.
-    Verifies: JWT valid, type=access, user exists, user is_active.
+    Require a valid Bearer access token (authenticated users only).
     """
     if credentials is None or not credentials.credentials:
         raise HTTPException(
@@ -84,6 +89,8 @@ def get_current_user(
     except (TypeError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid token subject")
 
+    from src.memory import storage
+
     user = _cached_user(user_id)
     if user is None:
         user = storage.get_user_by_id(user_id)
@@ -98,7 +105,6 @@ def get_current_user(
 def get_optional_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> Optional[Dict[str, Any]]:
-    """Optional auth (unused for business routes; kept for health/compat)."""
     if credentials is None or not credentials.credentials:
         return None
     try:
@@ -107,87 +113,117 @@ def get_optional_user(
         return None
 
 
-def _owner_id_for_document(document_id: str) -> Optional[int]:
-    """Resolve owning user_id from document row or job row."""
-    uid = storage.get_document_user_id(document_id)
-    if uid is not None:
-        return int(uid)
-    job = job_store.get_job(document_id, include_result=False)
-    if job and job.get("user_id") is not None:
-        try:
-            return int(job["user_id"])
-        except (TypeError, ValueError):
-            return None
+def _guest_id_from_request(request: Request) -> Optional[str]:
+    # Prefer explicit header (cross-origin / Vercel→Render) over cookie.
+    header = request.headers.get(GUEST_HEADER_NAME) or request.headers.get(
+        GUEST_HEADER_NAME.lower()
+    )
+    if header and header.strip():
+        return header.strip()
+    cookie = request.cookies.get(GUEST_COOKIE_NAME)
+    if cookie:
+        return cookie.strip()
     return None
 
 
-def require_document_owner(
-    document_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-) -> Dict[str, Any]:
-    """Ensure current user owns the document/job identified by document_id."""
-    owner = _owner_id_for_document(document_id)
-    if owner is None:
-        # Do not leak whether the id exists in other tenants' data
-        raise HTTPException(status_code=404, detail="Document not found")
-    if int(owner) != int(current_user["id"]):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    return current_user
-
-
-def require_job_owner(
-    job_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-) -> Dict[str, Any]:
-    """Jobs use the same UUID as document_id."""
-    return require_document_owner(job_id, current_user)
-
-
-def assert_document_owner(user_id: int, document_id: str) -> None:
-    """Imperative ownership check (for handlers that already have user)."""
-    owner = _owner_id_for_document(document_id)
-    if owner is None:
-        raise HTTPException(status_code=404, detail="Document not found")
-    if int(owner) != int(user_id):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-
-def enforce_job_owner(
-    user_id: int,
-    job_id: str,
-    status: Optional[Dict[str, Any]],
+def get_current_owner(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> Dict[str, Any]:
     """
-    Ownership check using an already-loaded job row when possible.
+    Resolve Owner for business routes.
 
-    Avoids the previous pattern of assert_document_owner (extra Neon round-trips)
-    followed by a second get_job for the same id.
+    Priority: valid JWT user → guest cookie/header → 401.
     """
+    if credentials is not None and credentials.credentials:
+        try:
+            user = get_current_user(credentials)
+            return owner_from_user(user).to_dict()
+        except HTTPException:
+            if credentials.credentials:
+                raise
+
+    sid = _guest_id_from_request(request)
+    if not sid:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated — sign in or start a guest demo session",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    sess = guest_store.touch_guest_session(sid)
+    if sess is None:
+        raise HTTPException(status_code=401, detail="Guest session not found")
+    if str(sess.get("status")) != "active":
+        raise HTTPException(status_code=401, detail="Guest session expired")
+    return owner_from_guest(sess).to_dict()
+
+
+def _resource_owner_fields(document_id: str) -> Dict[str, Any]:
+    """Resolve owner_type/owner_id from document or job (PK lookup)."""
+    fields: Dict[str, Any] = {}
+    try:
+        from src.db.models import DocumentModel
+        from src.db.session import get_session
+
+        db = get_session()
+        try:
+            doc = db.get(DocumentModel, document_id)
+            if doc is not None:
+                fields["owner_type"] = getattr(doc, "owner_type", None)
+                fields["owner_id"] = getattr(doc, "owner_id", None)
+                fields["user_id"] = doc.user_id
+        finally:
+            db.close()
+    except Exception:
+        pass
+    if fields.get("owner_type") and fields.get("owner_id"):
+        return fields
+    job = job_store.get_job(document_id, include_result=False)
+    if job:
+        fields["owner_type"] = job.get("owner_type")
+        fields["owner_id"] = job.get("owner_id")
+        fields["user_id"] = job.get("user_id")
+    return fields
+
+
+def enforce_owner(owner: Dict[str, Any], resource: Dict[str, Any]) -> None:
+    """Raise 403/404 unless resource owner_type+owner_id match the request Owner."""
+    if not resource:
+        raise HTTPException(status_code=404, detail="Not found")
+    ot = resource.get("owner_type")
+    oid = resource.get("owner_id")
+    if not ot or not oid:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not owners_match(owner, owner_type=str(ot), owner_id=str(oid)):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def enforce_job_owner_dict(owner: Dict[str, Any], job_id: str, status: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not status:
         raise HTTPException(status_code=404, detail="Job not found.")
-    owner = status.get("user_id")
-    if owner is not None:
-        try:
-            if int(owner) != int(user_id):
-                raise HTTPException(status_code=403, detail="Forbidden")
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=403, detail="Forbidden")
-        return status
-    # Legacy rows without jobs.user_id — fall back to documents table.
-    assert_document_owner(user_id, job_id)
+    enforce_owner(owner, status)
     return status
 
 
-def assert_conversation_owner(user_id: int, conversation_id: str, document_id: str) -> None:
-    """Conversation must belong to user and document must be owned."""
-    assert_document_owner(user_id, document_id)
+def assert_document_owner_for(owner: Dict[str, Any], document_id: str) -> None:
+    fields = _resource_owner_fields(document_id)
+    if not fields.get("owner_type") or not fields.get("owner_id"):
+        raise HTTPException(status_code=404, detail="Document not found")
+    enforce_owner(owner, fields)
+
+
+def assert_conversation_owner_for(owner: Dict[str, Any], conversation_id: str, document_id: str) -> None:
+    assert_document_owner_for(owner, document_id)
     from src.db import conversations as conv_db
 
     data = conv_db.load_conversation(conversation_id)
     if data is None:
-        return  # new conversation will be created
+        return
     if data.get("document_id") != document_id:
         raise HTTPException(status_code=400, detail="Conversation/document mismatch")
-    conv_uid = data.get("user_id")
-    if conv_uid is not None and int(conv_uid) != int(user_id):
+    ot = data.get("owner_type")
+    oid = data.get("owner_id")
+    if not ot or not oid:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if not owners_match(owner, owner_type=str(ot), owner_id=str(oid)):
         raise HTTPException(status_code=403, detail="Forbidden")

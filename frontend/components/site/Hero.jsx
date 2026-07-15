@@ -183,22 +183,34 @@ export default function Hero() {
               transition={{ delay: 1.0, duration: 0.6 }}
               className="mt-10 flex flex-wrap items-center gap-4"
             >
-              <Link
-                href="/dashboard"
+              <button
+                type="button"
                 data-testid="hero-cta-primary"
                 className="group inline-flex items-center gap-2 bg-emerald-500 text-black px-5 py-3 font-mono text-[11px] uppercase tracking-[0.18em] hover:bg-emerald-400 transition-colors emerald-glow"
+                onClick={async () => {
+                  try {
+                    const { ensureGuestSession } = await import("@/lib/guest-session")
+                    await ensureGuestSession()
+                    window.location.href = "/dashboard"
+                  } catch (e) {
+                    console.error("[Guest] Try Demo failed", e)
+                    window.alert(
+                      "Could not start a guest demo session. Check that the API is running, then retry.",
+                    )
+                  }
+                }}
               >
-                View live dashboard
+                Try Demo
                 <ArrowUpRight className="w-3.5 h-3.5 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" strokeWidth={2} />
-              </Link>
-              <a
-                href="#system"
+              </button>
+              <Link
+                href="/login"
                 data-testid="hero-cta-secondary"
                 className="group inline-flex items-center gap-2 border border-white/20 text-white px-5 py-3 font-mono text-[11px] uppercase tracking-[0.18em] hover:border-white/50 transition-colors"
               >
-                Read the architecture
+                Sign In
                 <ArrowRight className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform" strokeWidth={2} />
-              </a>
+              </Link>
             </motion.div>
 
             {/* stats */}

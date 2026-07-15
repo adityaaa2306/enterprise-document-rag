@@ -62,6 +62,7 @@ def test_nim_client_uses_timeout(monkeypatch):
             captured.update(kwargs)
 
     monkeypatch.setattr(settings, "NVIDIA_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "NIM_ENDPOINT_POOL_ENABLED", False)
     monkeypatch.setattr(models, "OpenAI", FakeOpenAI)
     models.load_nim_client()
     assert captured.get("timeout") is not None
@@ -70,6 +71,7 @@ def test_nim_client_uses_timeout(monkeypatch):
 
 def test_call_chat_retries_transient_connection_errors(monkeypatch):
     from src.agents import models
+    from src.core.config import settings
 
     class FakeCompletions:
         def __init__(self):
@@ -97,6 +99,7 @@ def test_call_chat_retries_transient_connection_errors(monkeypatch):
         def __init__(self):
             self.chat = type("Chat", (), {"completions": FakeCompletions()})()
 
+    monkeypatch.setattr(settings, "NIM_ENDPOINT_POOL_ENABLED", False)
     monkeypatch.setattr(models, "get_nim_client", lambda: FakeClient())
     monkeypatch.setattr(models.time, "sleep", lambda *_a, **_k: None)
 
@@ -124,6 +127,8 @@ def test_compile_falls_back_to_medium_when_heavy_fails(monkeypatch):
     monkeypatch.setattr(models, "call_chat_with_fallback", fake_chat)
     monkeypatch.setattr(models.settings, "COMPILE_MAX_INPUT_TOKENS", 100000)
     monkeypatch.setattr(models.settings, "COMPILE_BATCH_SIZE", 50)
+    # Disable hedged compile so this unit test exercises the sequential ladder.
+    monkeypatch.setattr(models.settings, "COMPILE_HEDGED_FALLBACK_ENABLED", False)
 
     out = models.run_compile_with_models(
         ["Chunk summary A about carbon routing.", "Chunk summary B about RAG."],

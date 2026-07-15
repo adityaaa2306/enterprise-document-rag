@@ -40,6 +40,27 @@ class UserModel(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class GuestSessionModel(Base):
+    """Anonymous try-demo session — no email/password; cookie + optional header."""
+
+    __tablename__ = "guest_sessions"
+    __table_args__ = (
+        Index("ix_guest_sessions_expires", "expires_at"),
+        Index("ix_guest_sessions_status", "status"),
+    )
+
+    session_id = Column(String(64), primary_key=True)
+    anonymous_name = Column(String(64), nullable=False, default="Guest")
+    status = Column(String(32), nullable=False, default="active")  # active|expired|purged|upgraded
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    last_activity = Column(DateTime(timezone=True), nullable=False)
+    ip_hash = Column(String(64), nullable=True)
+    user_agent_hash = Column(String(64), nullable=True)
+    chat_count = Column(Integer, nullable=False, default=0)
+    upgraded_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+
 class RefreshTokenModel(Base):
     """
     Opaque refresh tokens (stored hashed). Supports rotation + revocation.
@@ -77,6 +98,9 @@ class DocumentModel(Base):
 
     # Optional ownership (nullable for backward compatibility with anonymous jobs)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    # Universal owner: user | guest (owner_id = str(user_id) or guest session UUID)
+    owner_type = Column(String(16), nullable=True, index=True)
+    owner_id = Column(String(64), nullable=True, index=True)
 
     # Analytics
     carbon_saved_grams = Column(Float, default=0.0)
@@ -163,10 +187,13 @@ class JobModel(Base):
     __table_args__ = (
         Index("ix_jobs_user_status", "user_id", "status"),
         Index("ix_jobs_queue_claim", "status", "available_at", "created_at"),
+        Index("ix_jobs_owner", "owner_type", "owner_id"),
     )
 
     id = Column(String(64), primary_key=True)  # same UUID as document_id / job_id
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    owner_type = Column(String(16), nullable=True, index=True)
+    owner_id = Column(String(64), nullable=True, index=True)
     status = Column(String(32), nullable=False, default="pending", index=True)
     progress = Column(Float, default=0.0)
     message = Column(Text, nullable=True)
@@ -225,6 +252,8 @@ class ConversationModel(Base):
 
     id = Column(String(64), primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    owner_type = Column(String(16), nullable=True, index=True)
+    owner_id = Column(String(64), nullable=True, index=True)
     document_id = Column(String(64), nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

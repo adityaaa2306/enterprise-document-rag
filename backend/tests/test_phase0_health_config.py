@@ -129,6 +129,13 @@ def test_cors_star_allowed_in_production_without_credentials():
         JWT_SECRET_KEY="prod-secret-key-for-cors-star-test!!",
         CORS_ORIGINS="*",
         CORS_ALLOW_ALL=False,
+        DATABASE_URL="postgresql+psycopg://u:p@localhost/db",
+        NVIDIA_API_KEY="nvapi-test",
+        OBJECT_STORAGE_BACKEND="r2",
+        R2_ACCOUNT_ID="a",
+        R2_ACCESS_KEY_ID="k",
+        R2_SECRET_ACCESS_KEY="s",
+        R2_BUCKET="b",
         _env_file=None,
     )
     assert s.cors_allow_origins() == ["*"]
@@ -140,11 +147,19 @@ def test_worker_validation_skips_cors_but_requires_jwt():
     from src.core.config import Settings
 
     # Production worker without CORS_ORIGINS must still start if require_cors=False
+    # (but still needs Postgres + NIM + JWT).
     s = Settings(
         APP_ENV="production",
         JWT_SECRET_KEY="worker-prod-secret-key-32chars!!",
         CORS_ORIGINS="",
         CORS_ALLOW_ALL=False,
+        DATABASE_URL="postgresql+psycopg://u:p@localhost/db",
+        NVIDIA_API_KEY="nvapi-test-key",
+        OBJECT_STORAGE_BACKEND="r2",
+        R2_ACCOUNT_ID="acct",
+        R2_ACCESS_KEY_ID="key",
+        R2_SECRET_ACCESS_KEY="secret",
+        R2_BUCKET="bucket",
         _env_file=None,
     )
     s.validate_for_runtime(require_cors=False)
@@ -158,7 +173,95 @@ def test_worker_validation_skips_cors_but_requires_jwt():
         APP_ENV="production",
         JWT_SECRET_KEY="",
         CORS_ORIGINS="",
+        DATABASE_URL="postgresql+psycopg://u:p@localhost/db",
+        NVIDIA_API_KEY="nvapi-test-key",
         _env_file=None,
     )
     with pytest.raises(RuntimeError, match="JWT_SECRET_KEY"):
         s2.validate_for_runtime(require_cors=False)
+
+
+def test_production_rejects_sqlite_database():
+    from src.core.config import Settings
+
+    s = Settings(
+        APP_ENV="production",
+        JWT_SECRET_KEY="prod-secret-key-for-sqlite-reject!!",
+        CORS_ORIGINS="https://app.example.com",
+        CORS_ALLOW_ALL=False,
+        DATABASE_URL="sqlite:///./agentic_db.sqlite",
+        NVIDIA_API_KEY="nvapi-test",
+        OBJECT_STORAGE_BACKEND="r2",
+        R2_ACCOUNT_ID="a",
+        R2_ACCESS_KEY_ID="k",
+        R2_SECRET_ACCESS_KEY="s",
+        R2_BUCKET="b",
+        _env_file=None,
+    )
+    with pytest.raises(RuntimeError, match="DATABASE_URL"):
+        s.validate_for_runtime(require_cors=True)
+
+
+def test_production_rejects_localhost_only_cors():
+    from src.core.config import Settings
+
+    s = Settings(
+        APP_ENV="production",
+        JWT_SECRET_KEY="prod-secret-key-for-cors-localhost!!",
+        CORS_ORIGINS="http://localhost:3000,http://127.0.0.1:3000",
+        CORS_ALLOW_ALL=False,
+        DATABASE_URL="postgresql+psycopg://u:p@localhost/db",
+        NVIDIA_API_KEY="nvapi-test",
+        OBJECT_STORAGE_BACKEND="r2",
+        R2_ACCOUNT_ID="a",
+        R2_ACCESS_KEY_ID="k",
+        R2_SECRET_ACCESS_KEY="s",
+        R2_BUCKET="b",
+        _env_file=None,
+    )
+    with pytest.raises(RuntimeError, match="CORS_ORIGINS"):
+        s.validate_for_runtime(require_cors=True)
+
+
+def test_production_requires_r2_credentials():
+    from src.core.config import Settings
+
+    s = Settings(
+        APP_ENV="production",
+        JWT_SECRET_KEY="prod-secret-key-for-r2-missing!!!!",
+        CORS_ORIGINS="https://app.example.com",
+        CORS_ALLOW_ALL=False,
+        DATABASE_URL="postgresql+psycopg://u:p@localhost/db",
+        NVIDIA_API_KEY="nvapi-test",
+        OBJECT_STORAGE_BACKEND="r2",
+        R2_ACCOUNT_ID="",
+        R2_ACCESS_KEY_ID="",
+        R2_SECRET_ACCESS_KEY="",
+        R2_BUCKET="",
+        _env_file=None,
+    )
+    with pytest.raises(RuntimeError, match="R2_"):
+        s.validate_for_runtime(require_cors=True)
+
+
+def test_production_happy_path_validate():
+    from src.core.config import Settings
+
+    s = Settings(
+        APP_ENV="production",
+        JWT_SECRET_KEY="prod-secret-key-for-happy-path!!!!!",
+        CORS_ORIGINS="https://app.example.com",
+        CORS_ALLOW_ALL=False,
+        DATABASE_URL="postgresql+psycopg://u:p@localhost/db",
+        NVIDIA_API_KEY="nvapi-test",
+        OBJECT_STORAGE_BACKEND="r2",
+        R2_ACCOUNT_ID="a",
+        R2_ACCESS_KEY_ID="k",
+        R2_SECRET_ACCESS_KEY="s",
+        R2_BUCKET="b",
+        CHROMA_PERSIST_DIRECTORY="/data/chroma",
+        VECTOR_DB_PATH="/data/aux",
+        _env_file=None,
+    )
+    s.validate_for_runtime(require_cors=True)
+

@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { motion } from "framer-motion";
 import { Leaf } from "lucide-react";
+import { LiveDemoLink } from "@/components/live-demo-link";
 
 export default function Nav() {
   const links = [
@@ -53,19 +54,18 @@ export default function Nav() {
           </Link>
           <Link
             href="/login"
+            prefetch
             data-testid="nav-login"
             className="font-mono text-[11px] tracking-[0.14em] uppercase text-neutral-500 hover:text-white transition-colors"
           >
             Login
           </Link>
-          <Link
-            href="/new-job"
-            prefetch
+          <LiveDemoLink
             data-testid="nav-cta"
             className="font-mono text-[11px] tracking-[0.14em] uppercase px-3 py-1.5 border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500 hover:text-black transition-colors"
           >
             Live demo →
-          </Link>
+          </LiveDemoLink>
         </div>
       </div>
     </motion.header>

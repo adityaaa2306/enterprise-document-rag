@@ -1,4 +1,13 @@
-from fastapi import FastAPI, UploadFile, HTTPException, Request, Depends, Response, Query
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    HTTPException,
+    Request,
+    Depends,
+    Response,
+    Query,
+    BackgroundTasks,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
@@ -30,13 +39,23 @@ from src.api import auth
 from src.api.health import router as health_router
 from src.api.deps import (
     get_current_user,
+    get_current_owner,
     get_optional_user,
-    assert_document_owner,
-    assert_conversation_owner,
-    enforce_job_owner,
+    assert_document_owner_for,
+    assert_conversation_owner_for,
+    enforce_job_owner_dict,
     seed_user_cache,
 )
 from src.api.request_logging import RequestLoggingMiddleware
+from src.core.owner import (
+    GUEST_COOKIE_NAME,
+    GUEST_INACTIVITY_HOURS,
+    GUEST_MAX_CHATS,
+    GUEST_MAX_PDF_BYTES,
+    OwnerType,
+    stamp_owner_fields,
+)
+from src.db import guests as guest_store
 
 # --- Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -71,6 +90,11 @@ async def lifespan(app: FastAPI):
 
     log.info("API Startup: validating configuration...")
     settings.validate_for_runtime()
+
+    try:
+        guest_store.ensure_guest_cleanup_loop()
+    except Exception as e:
+        log.warning("Guest cleanup loop not started: %s", e)
 
     if os.path.exists(UPLOAD_DIR):
         try:
@@ -118,13 +142,45 @@ async def lifespan(app: FastAPI):
             if getattr(settings, "RUN_EMBEDDED_WORKER", False):
                 wid = (settings.WORKER_ID or "").strip() or "embedded-api-1"
                 log.info("Starting in-process embedded worker thread (WORKER_ID=%s)", wid)
-                worker_thread = threading.Thread(
-                    target=run_worker_forever,
-                    kwargs={"worker_id": wid, "embedded": True},
-                    name="embedded-durable-worker",
+
+                def _embedded_worker_supervisor() -> None:
+                    """Keep the claim loop alive across transient DB/network failures."""
+                    restart = 0
+                    while not keepalive_stop.is_set() and not _shutdown_requested():
+                        t = threading.Thread(
+                            target=run_worker_forever,
+                            kwargs={"worker_id": wid, "embedded": True},
+                            name="embedded-durable-worker",
+                            daemon=True,
+                        )
+                        t.start()
+                        while t.is_alive() and not keepalive_stop.is_set():
+                            t.join(timeout=2.0)
+                        if keepalive_stop.is_set() or _shutdown_requested():
+                            break
+                        restart += 1
+                        delay = min(30.0, 2.0 * restart)
+                        log.error(
+                            "Embedded worker exited unexpectedly — restarting in %.1fs (n=%s)",
+                            delay,
+                            restart,
+                        )
+                        if keepalive_stop.wait(delay):
+                            break
+
+                def _shutdown_requested() -> bool:
+                    try:
+                        from src.worker.loop import is_shutdown_requested
+
+                        return is_shutdown_requested()
+                    except Exception:
+                        return False
+
+                threading.Thread(
+                    target=_embedded_worker_supervisor,
+                    name="embedded-worker-supervisor",
                     daemon=True,
-                )
-                worker_thread.start()
+                ).start()
             log.info("Deferred runtime warm-up complete.")
         except Exception as e:
             log.error("Deferred runtime warm-up failed: %s", e, exc_info=True)
@@ -140,8 +196,8 @@ async def lifespan(app: FastAPI):
 
     log.info("API Shutdown: draining requests (uvicorn graceful timeout)...")
     keepalive_stop.set()
+    request_shutdown("api-lifespan")
     if worker_thread is not None:
-        request_shutdown("api-lifespan")
         grace = float(getattr(settings, "WORKER_SHUTDOWN_GRACE_SEC", 120) or 120)
         worker_thread.join(timeout=min(grace, 60.0))
         if worker_thread.is_alive():
@@ -177,7 +233,10 @@ app.include_router(health_router)
 async def ingest_upload_to_object_storage(
     file: UploadFile,
     *,
-    user_id: int,
+    user_id: Optional[int] = None,
+    owner_type: str = "user",
+    owner_id: str,
+    max_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Persist upload bytes in object storage; Postgres gets metadata only.
@@ -189,12 +248,18 @@ async def ingest_upload_to_object_storage(
     document_id = job_id
     original = _safe_filename(file.filename)
     content_type = file.content_type or "application/octet-stream"
-    storage_key = f"documents/{user_id}/{document_id}/{original}"
+    owner_path = owner_id if owner_type == "guest" else str(user_id or owner_id)
+    storage_key = f"documents/{owner_type}/{owner_path}/{document_id}/{original}"
 
     try:
         contents = await file.read()
         if not contents:
             raise HTTPException(status_code=400, detail="Empty upload.")
+        if max_bytes is not None and len(contents) > int(max_bytes):
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Guest limit is {int(max_bytes) // (1024 * 1024)} MB.",
+            )
         store = get_object_storage()
         stored = store.put_bytes(
             storage_key,
@@ -211,6 +276,8 @@ async def ingest_upload_to_object_storage(
     storage.save_document_file_metadata(
         document_id,
         user_id=user_id,
+        owner_type=owner_type,
+        owner_id=owner_id,
         storage_key=stored.storage_key,
         file_url=stored.file_url,
         original_filename=original,
@@ -293,22 +360,17 @@ def _job_list_item(raw: Dict[str, Any]) -> JobListItem:
 def list_my_jobs(
     limit: int = Query(1, ge=1, le=200),
     active_only: bool = Query(False),
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
-    """
-    Job list for the signed-in user.
-
-    Retention (purge older jobs) runs on enqueue only — never on this read path,
-    so the Results sidebar can poll without multi-second latency.
-    """
-    uid = int(current_user["id"])
-
-    rows = job_store.list_jobs_for_user(
-        uid,
+    """Job list for the current Owner (user or guest)."""
+    stamp = stamp_owner_fields(current_owner)
+    rows = job_store.list_jobs_for_owner(
+        owner_type=str(stamp["owner_type"]),
+        owner_id=str(stamp["owner_id"]),
+        user_id=stamp.get("user_id"),
         limit=min(limit, 1) if not active_only else limit,
         include_terminal=not active_only,
     )
-    # Hard cap: never return more than one terminal history slot
     if not active_only and len(rows) > 1:
         rows = rows[:1]
     items = [_job_list_item(r) for r in rows]
@@ -317,10 +379,15 @@ def list_my_jobs(
 
 @app.get("/queue", response_model=QueueSnapshotResponse)
 def get_queue_snapshot(
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
-    """Live worker occupancy + this user's pending/processing jobs."""
-    snap = job_store.queue_snapshot_for_user(int(current_user["id"]))
+    """Live worker occupancy + this owner's pending/processing jobs."""
+    stamp = stamp_owner_fields(current_owner)
+    snap = job_store.queue_snapshot_for_owner(
+        owner_type=str(stamp["owner_type"]),
+        owner_id=str(stamp["owner_id"]),
+        user_id=stamp.get("user_id"),
+    )
     scheduler = None
     try:
         from src.agents import nim_endpoint_pool as pool
@@ -342,12 +409,12 @@ def get_queue_snapshot(
 @app.post("/jobs/{job_id}/cancel", response_model=CancelJobResponse)
 def cancel_my_job(
     job_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """Cancel a pending/processing job and free the worker slot."""
-    assert_document_owner(int(current_user["id"]), job_id)
+    assert_document_owner_for(current_owner, job_id)
     try:
-        updated = job_store.cancel_job(job_id, user_id=int(current_user["id"]))
+        updated = job_store.cancel_job(job_id, user_id=current_owner.get("user_id"))
     except PermissionError:
         raise HTTPException(status_code=403, detail="Not allowed to cancel this job.")
     if not updated:
@@ -361,34 +428,108 @@ def cancel_my_job(
     )
 
 
+@app.post("/jobs/{job_id}/nodes/{node_id}/cancel")
+def cancel_dag_node(
+    job_id: str,
+    node_id: str,
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
+):
+    """
+    Request cancellation of a single DAG node (Task 6).
+    Does not cancel sibling nodes or the whole job — the scheduler will
+    abandon that node attempt and retry/reassign.
+    """
+    assert_document_owner_for(current_owner, job_id)
+    job = job_store.get_job(job_id, include_result=False)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    status = job_store.JOB_STATUSES.setdefault(job_id, dict(job))
+    cancels = set(status.get("node_cancels") or [])
+    cancels.add(str(node_id))
+    status["node_cancels"] = list(cancels)
+    partial = dict(status.get("partial") or {})
+    dag = dict(partial.get("dag") or {})
+    dag_nodes = dict(dag.get("nodes") or {})
+    if node_id in dag_nodes and isinstance(dag_nodes[node_id], dict):
+        dag_nodes[node_id]["cancel_requested"] = True
+        dag_nodes[node_id]["status"] = "retrying"
+    dag["nodes"] = dag_nodes
+    partial["dag"] = dag
+    status["partial"] = partial
+    job_store.JOB_STATUSES[job_id] = status
+    return {
+        "job_id": job_id,
+        "node_id": node_id,
+        "cancel_requested": True,
+        "message": f"Node {node_id} marked for cancel/reassign.",
+    }
+
+
+def _retain_latest_job_bg(
+    keep_job_id: str,
+    *,
+    owner_type: str,
+    owner_id: str,
+    user_id: Optional[int] = None,
+) -> None:
+    """Portfolio retention — never block /summarize on purge I/O."""
+    try:
+        job_store.retain_only_latest_job_for_owner(
+            owner_type=owner_type,
+            owner_id=owner_id,
+            keep_job_id=keep_job_id,
+            user_id=user_id,
+        )
+    except Exception as e:
+        log.warning("retain_only_latest_job (background) failed: %s", e)
+
+
 @app.post("/summarize", response_model=SummarizeJobResponse)
 async def summarize_document(
     file: UploadFile,
+    background_tasks: BackgroundTasks,
     mode: str = "automatic",
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
     Enqueue a summarization job (Phase 3).
 
-    API only: validate → upload to object storage → create pending job → return job_id.
-    Long-running AI work runs in the durable worker process (``python -m src.worker``).
+    Same pipeline for User and Guest — only ownership stamp differs.
     """
     preference = normalize_routing_preference(mode)
-    user_id = int(current_user["id"])
-    log.info(f"Received file: {file.filename} (Type: {file.content_type}) (preference: {preference})")
+    stamp = stamp_owner_fields(current_owner)
+    log.info(
+        "Received file: %s (Type: %s) preference=%s owner=%s:%s",
+        file.filename,
+        file.content_type,
+        preference,
+        stamp.get("owner_type"),
+        stamp.get("owner_id"),
+    )
 
-    meta = await ingest_upload_to_object_storage(file, user_id=user_id)
+    max_bytes = GUEST_MAX_PDF_BYTES if current_owner.get("is_guest") else None
+    meta = await ingest_upload_to_object_storage(
+        file,
+        user_id=stamp.get("user_id"),
+        owner_type=str(stamp["owner_type"]),
+        owner_id=str(stamp["owner_id"]),
+        max_bytes=max_bytes,
+    )
     job_store.enqueue_job(
         meta["job_id"],
-        user_id=user_id,
+        user_id=stamp.get("user_id"),
+        owner_type=str(stamp["owner_type"]),
+        owner_id=str(stamp["owner_id"]),
         filename=meta["original_filename"],
         job_mode=preference,
     )
-    # Single-slot retention: wipe older jobs + their RAG data for this user
-    try:
-        job_store.retain_only_latest_job(user_id, keep_job_id=meta["job_id"])
-    except Exception as e:
-        log.warning("retain_only_latest_job after enqueue failed: %s", e)
+    background_tasks.add_task(
+        _retain_latest_job_bg,
+        meta["job_id"],
+        owner_type=str(stamp["owner_type"]),
+        owner_id=str(stamp["owner_id"]),
+        user_id=stamp.get("user_id"),
+    )
 
     return SummarizeJobResponse(
         job_id=meta["job_id"],
@@ -408,20 +549,40 @@ def _parse_chunk_progress(message: str) -> tuple:
 def _stage_from_progress(progress: float, message: str) -> str:
     p = float(progress or 0)
     msg = (message or "").lower()
+    if "search ready" in msg or "search available" in msg:
+        return "search_ready"
+    if "summary ready" in msg:
+        return "summary_ready"
+    if "background" in msg or "embedding" in msg or "search index" in msg or "indexing" in msg:
+        return "background"
+    if "validation" in msg or "validat" in msg:
+        return "validation"
+    if "regional" in msg:
+        return "regional"
+    if "chapter" in msg:
+        return "chapter"
+    if "executive" in msg:
+        return "executive"
+    if "chunk summar" in msg or "summarizing" in msg:
+        return "chunk_summaries"
+    if "planning" in msg or "freeze" in msg:
+        return "planning"
     if p >= 98:
-        return "finalize"
+        return "search_ready"
+    if p >= 91:
+        return "summary_ready"
     if p >= 90:
-        return "store"
+        return "background"
     if p >= 82:
         return "compile"
     if "escalat" in msg:
         return "escalate"
     if p >= 65:
-        return "validate"
+        return "validation"
     if p >= 35:
-        return "map"
+        return "chunk_summaries"
     if p >= 24:
-        return "plan"
+        return "planning"
     if p >= 20:
         return "features"
     if p >= 12:
@@ -457,6 +618,38 @@ def _job_status_payload(job_id: str, status_dict: Dict[str, Any]) -> JobStatus:
         hb_age = job_store._heartbeat_age_sec(status_dict)
     except Exception:
         hb_age = None
+
+    from src.core.sync_lifecycle import (
+        metrics_ready_from_status,
+        summary_ready_from_status,
+        log_transition,
+    )
+
+    bg = status_dict.get("background") if isinstance(status_dict.get("background"), dict) else {}
+    if not bg and isinstance(partial, dict) and isinstance(partial.get("background"), dict):
+        bg = partial["background"]
+    result = status_dict.get("result") if isinstance(status_dict.get("result"), dict) else {}
+    if not bg and isinstance(result.get("background"), dict):
+        bg = result["background"]
+    summary_ready = summary_ready_from_status(status_dict)
+    metrics_ready = metrics_ready_from_status(status_dict)
+    bg_phase = str(bg.get("phase") or "") or None
+    bg_msg = str(bg.get("message") or "") or None
+    # Log poll-facing snapshot (throttled by caller frequency; cheap)
+    log_transition(
+        job_id,
+        "Frontend Poll Received",
+        detail={
+            "status": status,
+            "progress": progress,
+            "message": message[:120],
+            "summary_ready": summary_ready,
+            "background_phase": bg_phase,
+            "metrics_ready": metrics_ready,
+            "stage": stage,
+        },
+    )
+
     return JobStatus(
         job_id=job_id,
         status=status,
@@ -474,13 +667,48 @@ def _job_status_payload(job_id: str, status_dict: Dict[str, Any]) -> JobStatus:
         stalled=bool(stalled) if stalled is not None else False,
         stall_reason=status_dict.get("stall_reason"),
         heartbeat_age_sec=round(hb_age, 1) if hb_age is not None else None,
+        workers_busy=(
+            int(partial["workers_busy"])
+            if isinstance(partial, dict) and partial.get("workers_busy") is not None
+            else (int((partial.get("dag") or {}).get("workers_busy")) if isinstance(partial, dict) and isinstance(partial.get("dag"), dict) and partial["dag"].get("workers_busy") is not None else None)
+        ),
+        workers_total=(
+            int(partial["workers_total"])
+            if isinstance(partial, dict) and partial.get("workers_total") is not None
+            else (int((partial.get("dag") or {}).get("workers_total")) if isinstance(partial, dict) and isinstance(partial.get("dag"), dict) and partial["dag"].get("workers_total") is not None else None)
+        ),
+        avg_latency_ms=(
+            float(partial["avg_latency_ms"])
+            if isinstance(partial, dict) and partial.get("avg_latency_ms") is not None
+            else None
+        ),
+        carbon_g=(
+            float(partial["carbon_g"])
+            if isinstance(partial, dict) and partial.get("carbon_g") is not None
+            else None
+        ),
+        remaining_tasks=(
+            int(partial["remaining_tasks"])
+            if isinstance(partial, dict) and partial.get("remaining_tasks") is not None
+            else None
+        ),
+        eta_sec=(
+            float(partial["eta_sec"])
+            if isinstance(partial, dict) and partial.get("eta_sec") is not None
+            else None
+        ),
+        dag=(partial.get("dag") if isinstance(partial, dict) else None),
+        summary_ready=summary_ready,
+        background_phase=bg_phase,
+        background_message=bg_msg,
+        metrics_ready=metrics_ready,
     )
 
 
 @app.get("/job-status/{job_id}", response_model=JobStatus)
 def get_job_status(
     job_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
     Endpoint for the frontend to poll for job status.
@@ -489,8 +717,8 @@ def get_job_status(
     Ownership is checked from the same row (no extra document/job round-trips).
     Response schema is unchanged — ``JobStatus`` never included the result blob.
     """
-    status_dict = enforce_job_owner(
-        int(current_user["id"]),
+    status_dict = enforce_job_owner_dict(
+        current_owner,
         job_id,
         job_store.get_job(job_id, include_result=False),
     )
@@ -506,18 +734,35 @@ def get_job_status(
     # Only hydrate the full row when progress claims completion while status lags.
     status = str(status_dict.get("status") or "pending")
     progress = float(status_dict.get("progress") or 0.0)
-    if status == job_status_mod.STATUS_PROCESSING and progress >= 100.0:
+    needs_heal = (
+        status == job_status_mod.STATUS_PROCESSING and progress >= 100.0
+    ) or (
+        # Stale in-memory pending while DB/result already finished (guest + embedded worker).
+        status
+        in (job_status_mod.STATUS_PENDING, job_status_mod.STATUS_PROCESSING)
+        and (
+            status_dict.get("summary_ready") is True
+            or "search ready" in str(status_dict.get("message") or "").lower()
+            or "summary ready" in str(status_dict.get("message") or "").lower()
+            or progress >= 100.0
+        )
+    )
+    if needs_heal:
         full = job_store.get_job(job_id, include_result=True) or status_dict
         if (
             isinstance(full.get("result"), dict)
-            and full["result"].get("final_summary")
+            and (
+                full["result"].get("final_summary")
+                or full["result"].get("summary_ready")
+            )
         ):
             job_store.upsert_job(
                 job_id,
                 status=job_status_mod.STATUS_COMPLETE,
                 progress=100.0,
-                message="Job complete. Results are ready.",
-                result=full.get("result"),
+                message=full.get("message")
+                or status_dict.get("message")
+                or "Job complete. Results are ready.",
                 claimed_by=None,
                 heartbeat_at=None,
             )
@@ -534,7 +779,7 @@ def get_job_status(
 @app.get("/job-events/{job_id}")
 async def job_events_sse(
     job_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
     Server-Sent Events stream of job progress (Phase 13).
@@ -542,7 +787,7 @@ async def job_events_sse(
     Emits ``progress`` events as status changes; closes on terminal status.
     Auth via same Bearer token as polling (EventSource polyfill / fetch stream).
     """
-    assert_document_owner(int(current_user["id"]), job_id)
+    assert_document_owner_for(current_owner, job_id)
 
     async def _gen() -> AsyncIterator[str]:
         last_key = None
@@ -588,7 +833,7 @@ async def job_events_sse(
 @app.get("/job-result/{job_id}", response_model=SummaryResponse)
 def get_job_result(
     job_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
     Endpoint for the frontend to get the *final* result
@@ -600,11 +845,45 @@ def get_job_result(
     Attaches a visualization-only frontier carbon comparison derived from the
     already-computed ``carbon_data`` (does not alter scheduler accounting).
     """
-    status = enforce_job_owner(
-        int(current_user["id"]),
+    status = enforce_job_owner_dict(
+        current_owner,
         job_id,
         job_store.get_job(job_id),
     )
+    try:
+        from src.core.result_revision_log import log_result_read
+
+        log_result_read(
+            job_id,
+            endpoint="GET /job-result",
+            result=status.get("result") if isinstance(status.get("result"), dict) else None,
+            status_fields={
+                "status": status.get("status"),
+                "progress": status.get("progress"),
+                "message": (str(status.get("message") or ""))[:80],
+            },
+        )
+    except Exception:
+        pass
+    if not job_status_mod.is_job_ready_for_result(status):
+        # Heal: durable result exists but status string lagged (pending/processing).
+        result_blob = status.get("result") if isinstance(status.get("result"), dict) else None
+        if result_blob and (
+            result_blob.get("final_summary") or result_blob.get("summary_ready")
+        ):
+            job_store.upsert_job(
+                job_id,
+                status=job_status_mod.STATUS_COMPLETE,
+                progress=100.0,
+                message=status.get("message") or "Job complete. Results are ready.",
+                claimed_by=None,
+                heartbeat_at=None,
+            )
+            status = enforce_job_owner_dict(
+                current_owner,
+                job_id,
+                job_store.get_job(job_id),
+            )
     if not job_status_mod.is_job_ready_for_result(status):
         current = job_status_mod.normalize_job_status(status.get("status"))
         raise HTTPException(
@@ -758,50 +1037,76 @@ def get_job_result(
         # Keep frontier methodology for the comparison panel, but ensure
         # carbon_data.methodology is always Boundary-A operational copy.
         result["methodology"] = comparison["methodology"]
+
+    # Promote real region/grid values onto top-level carbon_data.
+    # Never invent intensity=0 or location="unknown".
+    from src.core.carbon_result_merge import promote_carbon_from_region_decision
+
+    cd_out = result.get("carbon_data")
+    if isinstance(cd_out, dict):
+        cd_out = promote_carbon_from_region_decision(dict(cd_out))
+        # Refresh report_card grid fields from promoted values when present
+        rc = cd_out.get("report_card") if isinstance(cd_out.get("report_card"), dict) else {}
+        rc = dict(rc)
+        if cd_out.get("local_grid_gco2_kwh") is not None:
+            rc["grid_carbon_intensity_gco2_kwh"] = cd_out.get("local_grid_gco2_kwh")
+        if cd_out.get("grid_zone") or cd_out.get("compute_location"):
+            rc["grid_zone"] = cd_out.get("grid_zone") or cd_out.get("compute_location")
+        if cd_out.get("grid_updated_at") or cd_out.get("grid_datetime"):
+            rc["grid_updated_at"] = cd_out.get("grid_updated_at") or cd_out.get("grid_datetime")
+        if rc:
+            cd_out["report_card"] = rc
+        result["carbon_data"] = cd_out
     return SummaryResponse(**result)
 
 
 @app.post("/rag-query", response_model=RagQueryResponse)
 def query_document(
     request: RagQueryRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
     RAG endpoint: retrieve → assemble → Response Agent → optional AnswerEnvelope.
     """
-    assert_document_owner(int(current_user["id"]), request.document_id)
+    assert_document_owner_for(current_owner, request.document_id)
     if request.conversation_id:
-        assert_conversation_owner(
-            int(current_user["id"]), request.conversation_id, request.document_id
+        assert_conversation_owner_for(
+            current_owner, request.conversation_id, request.document_id
         )
+    stamp = stamp_owner_fields(current_owner)
     return _run_rag_query(
         document_id=request.document_id,
         query=request.query,
         conversation_id=request.conversation_id,
-        user_id=int(current_user["id"]),
+        user_id=stamp.get("user_id"),
+        owner_type=str(stamp["owner_type"]),
+        owner_id=str(stamp["owner_id"]),
     )
 
 
 @app.post("/rag-query/stream")
 def query_document_stream(
     request: RagQueryRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
     True SSE streaming: tokens as they arrive from NIM, explainability in final event.
     Events: meta | token | done | error (JSON lines as ``data: {...}\\n\\n``).
     """
-    assert_document_owner(int(current_user["id"]), request.document_id)
+    assert_document_owner_for(current_owner, request.document_id)
     if request.conversation_id:
-        assert_conversation_owner(
-            int(current_user["id"]), request.conversation_id, request.document_id
+        assert_conversation_owner_for(
+            current_owner, request.conversation_id, request.document_id
         )
+    stamp = stamp_owner_fields(current_owner)
     return StreamingResponse(
         _iter_rag_query_sse(
             document_id=request.document_id,
             query=request.query,
             conversation_id=request.conversation_id,
-            user_id=int(current_user["id"]),
+            user_id=stamp.get("user_id"),
+            owner_type=str(stamp["owner_type"]),
+            owner_id=str(stamp["owner_id"]),
         ),
         media_type="text/event-stream",
         headers={
@@ -815,21 +1120,34 @@ def query_document_stream(
 @app.post("/chat", response_model=RagQueryResponse)
 def chat_document(
     request: ChatRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
     Phase 2.H — multi-turn chat; persists entity resolutions in conversation memory (TTL).
     """
     from src.memory.service import MemoryService
 
-    uid = int(current_user["id"])
-    assert_document_owner(uid, request.document_id)
+    stamp = stamp_owner_fields(current_owner)
+    uid = stamp.get("user_id")
+    assert_document_owner_for(current_owner, request.document_id)
+    if current_owner.get("is_guest"):
+        sid = str(current_owner.get("guest_session_id") or current_owner.get("owner_id"))
+        if guest_store.get_guest_chat_count(sid) >= GUEST_MAX_CHATS:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Guest chat limit ({GUEST_MAX_CHATS}) reached for this session.",
+            )
+        guest_store.increment_guest_chat_count(sid)
     if request.conversation_id:
-        assert_conversation_owner(uid, request.conversation_id, request.document_id)
+        assert_conversation_owner_for(current_owner, request.conversation_id, request.document_id)
 
     mem = MemoryService()
     state = mem.start_conversation(
-        request.document_id, request.conversation_id, user_id=uid
+        request.document_id,
+        request.conversation_id,
+        owner_type=str(stamp["owner_type"]),
+        owner_id=str(stamp["owner_id"]),
+        user_id=uid,
     )
     return _run_rag_query(
         document_id=request.document_id,
@@ -837,6 +1155,8 @@ def chat_document(
         conversation_id=state.conversation_id,
         persist_conversation=True,
         user_id=uid,
+        owner_type=str(stamp["owner_type"]),
+        owner_id=str(stamp["owner_id"]),
     )
 
 
@@ -850,6 +1170,8 @@ def _iter_rag_query_sse(
     query: str,
     conversation_id: Optional[str] = None,
     user_id: Optional[int] = None,
+    owner_type: Optional[str] = None,
+    owner_id: Optional[str] = None,
 ):
     """Generator that yields SSE frames for /rag-query/stream."""
     import time
@@ -1072,9 +1394,14 @@ def _iter_rag_query_sse(
         done_payload["latency"] = latency
 
         if conversation_id and mem is not None:
+            if not owner_type or not owner_id:
+                raise HTTPException(status_code=500, detail="Owner required to persist conversation")
             mem.append_turn(
                 conversation_id, "user", query,
-                entities=list(prior_entities), user_id=user_id,
+                entities=list(prior_entities),
+                owner_type=str(owner_type),
+                owner_id=str(owner_id),
+                user_id=user_id,
             )
             mem.append_turn(
                 conversation_id,
@@ -1082,6 +1409,8 @@ def _iter_rag_query_sse(
                 answer,
                 entities=entities_used,
                 meta={"skill": skill, "model_used": model_used},
+                owner_type=str(owner_type),
+                owner_id=str(owner_id),
                 user_id=user_id,
             )
 
@@ -1100,6 +1429,8 @@ def _run_rag_query(
     conversation_id: Optional[str] = None,
     persist_conversation: bool = False,
     user_id: Optional[int] = None,
+    owner_type: Optional[str] = None,
+    owner_id: Optional[str] = None,
 ) -> RagQueryResponse:
     import time
     import threading
@@ -1353,9 +1684,14 @@ def _run_rag_query(
         resp_kwargs["latency"] = latency
 
         if persist_conversation and conversation_id and mem is not None:
+            if not owner_type or not owner_id:
+                raise HTTPException(status_code=500, detail="Owner required to persist conversation")
             mem.append_turn(
                 conversation_id, "user", query,
-                entities=list(prior_entities), user_id=user_id,
+                entities=list(prior_entities),
+                owner_type=str(owner_type),
+                owner_id=str(owner_id),
+                user_id=user_id,
             )
             mem.append_turn(
                 conversation_id,
@@ -1363,6 +1699,8 @@ def _run_rag_query(
                 answer,
                 entities=entities_used,
                 meta={"skill": skill, "model_used": model_used},
+                owner_type=str(owner_type),
+                owner_id=str(owner_id),
                 user_id=user_id,
             )
 
@@ -1379,12 +1717,17 @@ def _run_rag_query(
 from src.api.schemas import DocumentResponse, KnowledgeResponse, GraphResponse
 
 @app.get("/documents", response_model=List[DocumentResponse])
-def get_documents(current_user: Dict[str, Any] = Depends(get_current_user)):
+def get_documents(current_owner: Dict[str, Any] = Depends(get_current_owner)):
     """
-    List processed documents owned by the current user.
+    List processed documents owned by the current Owner.
     """
     try:
-        docs = storage.list_documents(user_id=int(current_user["id"]))
+        stamp = stamp_owner_fields(current_owner)
+        docs = storage.list_documents(
+            user_id=stamp.get("user_id"),
+            owner_type=str(stamp["owner_type"]),
+            owner_id=str(stamp["owner_id"]),
+        )
         return [DocumentResponse(**doc) for doc in docs]
     except Exception as e:
         log.error(f"Error fetching documents: {e}")
@@ -1394,12 +1737,12 @@ def get_documents(current_user: Dict[str, Any] = Depends(get_current_user)):
 @app.get("/documents/{document_id}/routing")
 def get_document_routing(
     document_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
     Return persisted RoutingDecision for a document (Smart Routing explainability).
     """
-    assert_document_owner(int(current_user["id"]), document_id)
+    assert_document_owner_for(current_owner, document_id)
     data = storage.get_routing_decision(document_id)
     if not data:
         raise HTTPException(
@@ -1412,13 +1755,13 @@ def get_document_routing(
 @app.get("/documents/{document_id}/knowledge", response_model=KnowledgeResponse)
 def get_document_knowledge(
     document_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
     Phase 2.F — read structured KnowledgeDocument for a document.
     Returns 404 if understanding has not produced knowledge yet.
     """
-    assert_document_owner(int(current_user["id"]), document_id)
+    assert_document_owner_for(current_owner, document_id)
     data = storage.get_knowledge(document_id)
     if not data:
         # Reflect job status if still pending
@@ -1451,13 +1794,13 @@ def get_document_knowledge(
 @app.get("/documents/{document_id}/graph", response_model=GraphResponse)
 def get_document_graph(
     document_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
     Phase 2.G — export document knowledge graph (nodes + edges).
     Falls back to building from knowledge_json if graph tables are empty.
     """
-    assert_document_owner(int(current_user["id"]), document_id)
+    assert_document_owner_for(current_owner, document_id)
     try:
         from src.knowledge.graph_store import GraphStore, sync_graph_from_knowledge
 
@@ -1486,13 +1829,13 @@ def get_document_graph(
 
 @app.get("/dashboard-stats")
 def get_dashboard_stats(
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
     range: str = Query("30d"),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
 ):
     """
-    Get aggregated statistics for the dashboard (current user only).
+        Get aggregated statistics for the dashboard (current Owner only).
 
     Includes a static ``methodology`` note for the carbon comparison visualization
     layer. Per-document ``comparison_models`` / ``summary_cards`` are attached on
@@ -1504,8 +1847,11 @@ def get_dashboard_stats(
     try:
         from src.core.frontier_carbon_compare import METHODOLOGY_TEXT
 
+        stamp = stamp_owner_fields(current_owner)
         stats = storage.get_dashboard_stats(
-            user_id=int(current_user["id"]),
+            user_id=stamp.get("user_id"),
+            owner_type=str(stamp["owner_type"]),
+            owner_id=str(stamp["owner_id"]),
             range_key=range,
             start_date=start_date,
             end_date=end_date,
@@ -1519,6 +1865,117 @@ def get_dashboard_stats(
     except Exception as e:
         log.error(f"Error fetching dashboard stats: {e}")
         raise HTTPException(status_code=500, detail="Error fetching dashboard stats.")
+
+# -----------------------------------------------------------
+# Guest Mode (Owner abstraction — same pipeline as authenticated users)
+# -----------------------------------------------------------
+
+def _set_guest_cookie(response: Response, session_id: str) -> None:
+    secure = bool(settings.is_production or getattr(settings, "AUTH_COOKIE_SECURE", False))
+    response.set_cookie(
+        key=GUEST_COOKIE_NAME,
+        value=session_id,
+        httponly=True,
+        samesite="lax",
+        secure=secure,
+        max_age=int(GUEST_INACTIVITY_HOURS * 3600),
+        path="/",
+    )
+
+
+def _clear_guest_cookie(response: Response) -> None:
+    secure = bool(settings.is_production or getattr(settings, "AUTH_COOKIE_SECURE", False))
+    response.delete_cookie(
+        key=GUEST_COOKIE_NAME,
+        path="/",
+        secure=secure,
+        httponly=True,
+        samesite="lax",
+    )
+
+
+@app.post("/guest/session")
+def create_or_resume_guest_session(request: Request, response: Response):
+    """
+    Create a guest session (or resume via cookie/header).
+    Returns guest_session_id for clients that cannot use cross-origin cookies.
+    """
+    existing = request.cookies.get(GUEST_COOKIE_NAME) or request.headers.get(
+        "X-Guest-Session-Id"
+    )
+    if existing:
+        sess = guest_store.touch_guest_session(existing.strip())
+        if sess and str(sess.get("status")) == "active":
+            _set_guest_cookie(response, sess["session_id"])
+            return {
+                "guest_session_id": sess["session_id"],
+                "anonymous_name": sess.get("anonymous_name"),
+                "expires_at": sess.get("expires_at"),
+                "status": sess.get("status"),
+                "resumed": True,
+            }
+
+    ip = request.client.host if request.client else None
+    ua = request.headers.get("user-agent")
+    sess = guest_store.create_guest_session(ip=ip, user_agent=ua)
+    _set_guest_cookie(response, sess["session_id"])
+    return {
+        "guest_session_id": sess["session_id"],
+        "anonymous_name": sess.get("anonymous_name"),
+        "expires_at": sess.get("expires_at"),
+        "status": sess.get("status"),
+        "resumed": False,
+    }
+
+
+@app.get("/guest/session")
+def get_guest_session_info(
+    current_owner: Dict[str, Any] = Depends(get_current_owner),
+):
+    """Current owner session info (guest badge / expiry)."""
+    if not current_owner.get("is_guest"):
+        return {
+            "is_guest": False,
+            "owner_type": current_owner.get("owner_type"),
+            "owner_id": current_owner.get("owner_id"),
+        }
+    return {
+        "is_guest": True,
+        "guest_session_id": current_owner.get("guest_session_id"),
+        "anonymous_name": current_owner.get("anonymous_name"),
+        "expires_at": current_owner.get("expires_at"),
+        "owner_type": current_owner.get("owner_type"),
+        "owner_id": current_owner.get("owner_id"),
+        "chat_count": guest_store.get_guest_chat_count(
+            str(current_owner.get("guest_session_id") or "")
+        ),
+        "limits": {
+            "max_documents": 1,
+            "max_pdf_mb": GUEST_MAX_PDF_BYTES // (1024 * 1024),
+            "max_chats": GUEST_MAX_CHATS,
+        },
+    }
+
+
+@app.post("/guest/upgrade")
+def upgrade_guest_to_user(
+    request: Request,
+    response: Response,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Transfer guest-owned resources to the authenticated account.
+    Call after login while the guest cookie/header is still present.
+    """
+    sid = request.cookies.get(GUEST_COOKIE_NAME) or request.headers.get("X-Guest-Session-Id")
+    if not sid:
+        raise HTTPException(status_code=400, detail="No guest session to upgrade")
+    result = guest_store.transfer_guest_to_user(sid.strip(), int(current_user["id"]))
+    if not result.get("ok"):
+        raise HTTPException(status_code=500, detail=result.get("error") or "Upgrade failed")
+    _clear_guest_cookie(response)
+    return result
+
 
 # -----------------------------------------------------------
 # Authentication Endpoints

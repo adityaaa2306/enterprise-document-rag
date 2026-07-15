@@ -1,4 +1,8 @@
-"""Conversation persistence (DB-backed when PERSIST_CONVERSATIONS_TO_DB)."""
+"""Conversation persistence (DB-backed when PERSIST_CONVERSATIONS_TO_DB).
+
+Business ownership uses owner_type + owner_id (Owner abstraction).
+user_id remains an optional identity column for authenticated users.
+"""
 from __future__ import annotations
 
 import logging
@@ -59,6 +63,8 @@ def load_conversation(conversation_id: str) -> Optional[Dict[str, Any]]:
             "conversation_id": row.id,
             "document_id": row.document_id,
             "user_id": row.user_id,
+            "owner_type": getattr(row, "owner_type", None),
+            "owner_id": getattr(row, "owner_id", None),
             "turns": turns,
             "created_at": (_to_aware(row.created_at) or now).timestamp(),
             "updated_at": (_to_aware(row.updated_at) or now).timestamp(),
@@ -75,10 +81,15 @@ def save_conversation_state(
     document_id: str,
     turns: List[Dict[str, Any]],
     *,
+    owner_type: str,
+    owner_id: str,
     user_id: Optional[int] = None,
     created_at: Optional[float] = None,
 ) -> bool:
     if not _db_enabled():
+        return False
+    if not owner_type or not owner_id:
+        log.error("save_conversation_state requires owner_type and owner_id")
         return False
     from src.db.models import ConversationModel, ConversationTurnModel
     from src.db.session import get_session
@@ -95,6 +106,8 @@ def save_conversation_state(
                 id=conversation_id,
                 document_id=document_id,
                 user_id=user_id,
+                owner_type=str(owner_type),
+                owner_id=str(owner_id),
                 created_at=datetime.fromtimestamp(created_at, tz=timezone.utc) if created_at else now,
                 updated_at=now,
                 expires_at=now + _ttl(),
@@ -102,6 +115,8 @@ def save_conversation_state(
             db.add(row)
         else:
             row.document_id = document_id
+            row.owner_type = str(owner_type)
+            row.owner_id = str(owner_id)
             if user_id is not None:
                 row.user_id = user_id
             row.updated_at = now
@@ -156,6 +171,7 @@ def delete_conversation(conversation_id: str) -> None:
 
 
 def clear_for_document(document_id: str) -> int:
+    """Delete conversations for a document (PK-scoped cleanup after Owner-checked purge)."""
     if not _db_enabled():
         return 0
     from src.db.models import ConversationModel
@@ -172,6 +188,36 @@ def clear_for_document(document_id: str) -> int:
     except Exception as e:
         db.rollback()
         log.warning(f"clear_for_document failed: {e}")
+        return 0
+    finally:
+        db.close()
+
+
+def clear_for_owner(*, owner_type: str, owner_id: str) -> int:
+    """Delete-many conversations for an Owner (guest cleanup / wipe)."""
+    if not _db_enabled():
+        return 0
+    from src.db.models import ConversationModel
+    from src.db.session import get_session
+
+    db = get_session()
+    try:
+        rows = (
+            db.query(ConversationModel)
+            .filter(
+                ConversationModel.owner_type == str(owner_type),
+                ConversationModel.owner_id == str(owner_id),
+            )
+            .all()
+        )
+        n = len(rows)
+        for r in rows:
+            db.delete(r)
+        db.commit()
+        return n
+    except Exception as e:
+        db.rollback()
+        log.warning(f"clear_for_owner failed: {e}")
         return 0
     finally:
         db.close()

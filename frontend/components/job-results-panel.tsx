@@ -33,6 +33,15 @@ import {
   fmtPct,
   type CompactJobMetrics,
 } from "@/lib/job-results-metrics"
+import { useFinalizedMetrics } from "@/hooks/use-finalized-metrics"
+import {
+  finalizedSyncKey,
+  revisionOf,
+  updatedAtOf,
+  type FinalizedJobResult,
+} from "@/lib/finalized-metrics-store"
+import { hasDashboardMetrics } from "@/lib/job-result-sync"
+import { FRONTIER_MODEL_J_PER_TOKEN } from "@/lib/frontier-carbon-compare"
 import { cn } from "@/lib/utils"
 
 type Props = {
@@ -45,7 +54,12 @@ type Props = {
     summary_cards?: unknown
     chart_bars?: unknown
     methodology?: string | null
+    background?: { phase?: string; message?: string } | null
   }
+  /** True while Summary Ready but background carbon/region/chunks not yet final. */
+  metricsPending?: boolean
+  /** When set, prefers shared finalized metrics for Dashboard parity. */
+  jobId?: string | null
 }
 
 function HeroTile({
@@ -54,12 +68,14 @@ function HeroTile({
   subtext,
   icon: Icon,
   valueClassName,
+  loading,
 }: {
   label: string
   value: string
   subtext?: string
   icon: ComponentType<{ className?: string }>
   valueClassName?: string
+  loading?: boolean
 }) {
   return (
     <div className="rounded-lg bg-muted/30 border border-border/40 px-3 py-3 min-w-0">
@@ -67,8 +83,12 @@ function HeroTile({
         <Icon className="w-3.5 h-3.5 shrink-0" />
         <span className="text-[11px] uppercase tracking-wide truncate">{label}</span>
       </div>
-      <p className={cn("text-lg font-bold tabular-nums truncate", valueClassName)}>{value}</p>
-      {subtext ? (
+      {loading ? (
+        <p className="text-sm font-medium text-muted-foreground animate-pulse">Loading…</p>
+      ) : (
+        <p className={cn("text-lg font-bold tabular-nums truncate", valueClassName)}>{value}</p>
+      )}
+      {subtext && !loading ? (
         <p className="text-[11px] text-muted-foreground mt-0.5 truncate">{subtext}</p>
       ) : null}
     </div>
@@ -105,8 +125,8 @@ function StackedBar({
 
 const COLOR_BASELINE = "#F4F4F5"
 const COLOR_OURS = "#34D399"
-/** Peer model bars — dark gray for contrast on black chart bg */
-const COLOR_PEER_BAR = "#52525B"
+/** Peer model bars — slate, readable on black chart backgrounds */
+const COLOR_PEER_BAR = "#94A3B8"
 const COLOR_MUTED_TICK = "#A1A1AA"
 const COLOR_CHART_AXIS = "#71717A"
 
@@ -329,8 +349,7 @@ function shortModelLabel(name: string, isOurs?: boolean) {
 }
 
 function ModelComparisonTab({ m }: { m: CompactJobMetrics }) {
-  const data = [...m.modelBars]
-    .sort((a, b) => Number(b.estimated_gco2e) - Number(a.estimated_gco2e))
+  let data = [...m.modelBars]
     .map((row) => ({
       ...row,
       label: shortModelLabel(
@@ -339,6 +358,34 @@ function ModelComparisonTab({ m }: { m: CompactJobMetrics }) {
           /green\s*agentic/i.test(String(row.model || "")),
       ),
     }))
+
+  // If peer estimates collapsed to 0 (incomplete carbon payload), scale from Ours
+  // using published frontier J/token ratios so bars stay visible and ordered.
+  const oursRow = data.find(
+    (d) =>
+      Boolean(d.is_ours) || /green\s*agentic|ours \(green/i.test(String(d.model || "")),
+  )
+  const oursVal = Number(oursRow?.estimated_gco2e) || 0
+  const peersDead = data
+    .filter((d) => d !== oursRow)
+    .every((d) => !(Number(d.estimated_gco2e) > 0.05))
+  if (oursVal > 0 && peersDead) {
+    const MEDIUM_J = 2.5
+    data = data.map((d) => {
+      if (d === oursRow) return d
+      const hit = FRONTIER_MODEL_J_PER_TOKEN.find(([name]) => name === d.model)
+      const j = hit ? hit[1] : 6.5
+      return {
+        ...d,
+        estimated_gco2e: Math.round(oursVal * (j / MEDIUM_J) * 10) / 10,
+      }
+    })
+  }
+
+  data = [...data].sort(
+    (a, b) => Number(b.estimated_gco2e) - Number(a.estimated_gco2e),
+  )
+
   if (!data.length) {
     return (
       <p className="text-sm text-muted-foreground">No frontier comparison data for this job.</p>
@@ -374,7 +421,7 @@ function ModelComparisonTab({ m }: { m: CompactJobMetrics }) {
               return row?.model || ""
             }}
           />
-          <Bar dataKey="estimated_gco2e" radius={[0, 4, 4, 0]}>
+          <Bar dataKey="estimated_gco2e" radius={[0, 4, 4, 0]} barSize={16}>
             {data.map((entry) => {
               const isOurs =
                 Boolean(entry.is_ours) ||
@@ -383,6 +430,7 @@ function ModelComparisonTab({ m }: { m: CompactJobMetrics }) {
                 <Cell
                   key={entry.model}
                   fill={isOurs ? COLOR_OURS : COLOR_PEER_BAR}
+                  fillOpacity={isOurs ? 0.95 : 0.85}
                 />
               )
             })}
@@ -516,13 +564,65 @@ function DeveloperTrace({ m }: { m: CompactJobMetrics }) {
   )
 }
 
-export function JobResultsPanel({ result }: Props) {
-  const metrics = useMemo(
-    () => extractCompactMetrics(result as Parameters<typeof extractCompactMetrics>[0]),
-    [result],
-  )
+export function JobResultsPanel({ result, metricsPending = false, jobId }: Props) {
+  const shared = useFinalizedMetrics({ refreshOnMount: false })
+  const metrics = useMemo(() => {
+    // Prefer shared store when sync identity matches (job_id + revision + updated_at).
+    // Never rely on JS object reference equality.
+    if (jobId && shared.metrics && shared.jobId === jobId && shared.result) {
+      const localRev = revisionOf(result as FinalizedJobResult)
+      const localAt = updatedAtOf(result as FinalizedJobResult)
+      const localKey = finalizedSyncKey(jobId, localRev, localAt, shared.snapshot?.ownerKey)
+      const sharedKey = finalizedSyncKey(
+        shared.jobId,
+        shared.revision,
+        shared.updatedAt,
+        shared.snapshot?.ownerKey,
+      )
+      if (
+        localKey === sharedKey &&
+        hasDashboardMetrics(shared.result) &&
+        (localRev > 0 || hasDashboardMetrics(result as FinalizedJobResult))
+      ) {
+        return shared.metrics
+      }
+      // Same job, store is same or newer revision — use store metrics when richer
+      if (
+        shared.revision >= localRev &&
+        hasDashboardMetrics(shared.result)
+      ) {
+        return shared.metrics
+      }
+    }
+    return extractCompactMetrics(result as Parameters<typeof extractCompactMetrics>[0])
+  }, [
+    result,
+    jobId,
+    shared.jobId,
+    shared.revision,
+    shared.updatedAt,
+    shared.metrics,
+    shared.result,
+    shared.snapshot?.ownerKey,
+  ])
 
-  const tierSub = `L ${metrics.tierMix.light} · M ${metrics.tierMix.medium} · H ${metrics.tierMix.heavy}`
+  const pending =
+    metricsPending ||
+    (metrics.totalChunks <= 0 &&
+      metrics.baselineG <= 0 &&
+      (metrics.region === "—" ||
+        metrics.region.toLowerCase() === "unknown" ||
+        !metrics.region))
+
+  const tierSub = pending
+    ? "Awaiting background…"
+    : `L ${metrics.tierMix.light} · M ${metrics.tierMix.medium} · H ${metrics.tierMix.heavy}`
+
+  const regionPending =
+    pending ||
+    !metrics.region ||
+    metrics.region === "—" ||
+    metrics.region.toLowerCase() === "unknown"
 
   return (
     <div className="space-y-5">
@@ -531,57 +631,97 @@ export function JobResultsPanel({ result }: Props) {
           label="Optimized CO₂e"
           value={fmtG(metrics.optimizedG)}
           icon={Leaf}
+          loading={pending && metrics.optimizedG <= 0}
         />
         <HeroTile
           label="Baseline CO₂e"
           value={fmtG(metrics.baselineG)}
           icon={Scale}
+          loading={pending && metrics.baselineG <= 0}
         />
         <HeroTile
           label={metrics.emissionsIncreased ? "Emissions Δ" : "Carbon saved"}
           value={fmtG(Math.abs(metrics.savedG))}
           icon={TrendingDown}
           valueClassName={metrics.emissionsIncreased ? "text-rose-400" : undefined}
+          loading={pending && metrics.savedG === 0 && metrics.baselineG <= 0}
         />
         <HeroTile
           label="Reduction"
           value={fmtPct(metrics.reductionPct)}
           icon={Gauge}
           valueClassName={metrics.emissionsIncreased ? "text-rose-400" : undefined}
+          loading={pending && metrics.baselineG <= 0}
         />
         <HeroTile
           label="Region"
           value={metrics.region}
           subtext={fmtIntensity(metrics.intensityGco2Kwh)}
           icon={Globe2}
+          loading={regionPending}
         />
         <HeroTile
           label="Chunks"
           value={String(metrics.totalChunks)}
           subtext={tierSub}
           icon={Layers}
+          loading={pending && metrics.totalChunks <= 0}
         />
       </div>
+
+      {pending ? (
+        <p className="text-xs text-muted-foreground animate-pulse">
+          Stage breakdowns and token metrics will appear when background carbon finishes…
+        </p>
+      ) : null}
 
       <div className="rounded-lg border border-border/40 bg-card/40 p-4">
         <Tabs defaultValue="emissions" className="w-full">
           <TabsList className="grid w-full grid-cols-2 sm:grid-cols-4 h-auto gap-1">
-            <TabsTrigger value="emissions">Emissions</TabsTrigger>
-            <TabsTrigger value="routing">Routing</TabsTrigger>
-            <TabsTrigger value="models">Model comparison</TabsTrigger>
-            <TabsTrigger value="region">Region & strategy</TabsTrigger>
+            <TabsTrigger value="emissions" className="text-xs sm:text-sm">
+              Emissions
+            </TabsTrigger>
+            <TabsTrigger value="routing" className="text-xs sm:text-sm">
+              Routing
+            </TabsTrigger>
+            <TabsTrigger value="models" className="text-xs sm:text-sm">
+              Models
+            </TabsTrigger>
+            <TabsTrigger value="region" className="text-xs sm:text-sm">
+              Region
+            </TabsTrigger>
           </TabsList>
-          <TabsContent value="emissions" className="pt-4">
-            <EmissionsTab m={metrics} />
+          <TabsContent value="emissions" className="mt-4">
+            {pending ? (
+              <p className="text-sm text-muted-foreground animate-pulse">
+                Loading inference / infrastructure stage breakdown…
+              </p>
+            ) : (
+              <EmissionsTab m={metrics} />
+            )}
           </TabsContent>
-          <TabsContent value="routing" className="pt-4">
-            <RoutingTab m={metrics} />
+          <TabsContent value="routing" className="mt-4">
+            {pending ? (
+              <p className="text-sm text-muted-foreground animate-pulse">Loading routing…</p>
+            ) : (
+              <RoutingTab m={metrics} />
+            )}
           </TabsContent>
-          <TabsContent value="models" className="pt-4">
-            <ModelComparisonTab m={metrics} />
+          <TabsContent value="models" className="mt-4">
+            {pending ? (
+              <p className="text-sm text-muted-foreground animate-pulse">
+                Loading frontier comparison…
+              </p>
+            ) : (
+              <ModelComparisonTab m={metrics} />
+            )}
           </TabsContent>
-          <TabsContent value="region" className="pt-4">
-            <RegionStrategyTab m={metrics} />
+          <TabsContent value="region" className="mt-4">
+            {pending ? (
+              <p className="text-sm text-muted-foreground animate-pulse">Loading region…</p>
+            ) : (
+              <RegionStrategyTab m={metrics} />
+            )}
           </TabsContent>
         </Tabs>
       </div>

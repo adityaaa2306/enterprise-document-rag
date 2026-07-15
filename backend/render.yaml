@@ -33,6 +33,8 @@ services:
         value: documents_nemotron_v2
       - key: VECTOR_DB_PATH
         value: /data/aux
+      - key: ROUTING_TELEMETRY_PATH
+        value: /data/aux/routing_telemetry.jsonl
       - key: RUN_MIGRATIONS_ON_STARTUP
         value: "true"
       - key: AUTO_CREATE_SCHEMA

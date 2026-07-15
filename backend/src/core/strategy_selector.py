@@ -223,4 +223,22 @@ def select_processing_strategy(
         strategy.hierarchy_fan_in = max(4, strategy.hierarchy_fan_in - 2)
         strategy.reasons.append("dense tables/equations → finer hierarchy fan-in")
 
+    # --- Dynamic fan-in / depth (Task 3) — continuous from tokens × chunks × context ---
+    # Replaces the static table fan_in/max_depth outputs only; classification unchanged.
+    try:
+        from src.core.pipeline_dag import compute_dynamic_fan_in
+
+        dyn_fan, dyn_depth = compute_dynamic_fan_in(
+            doc_tokens=int(profile.estimated_tokens or 0),
+            chunk_count=int(profile.chunk_count or 0),
+        )
+        strategy.hierarchy_fan_in = int(dyn_fan)
+        strategy.hierarchy_max_depth = int(dyn_depth)
+        strategy.reasons.append(
+            f"dynamic fan_in={dyn_fan} max_depth={dyn_depth} "
+            f"(tokens={profile.estimated_tokens}, chunks={profile.chunk_count})"
+        )
+    except Exception as e:
+        strategy.reasons.append(f"dynamic fan_in fallback (table values kept): {e}")
+
     return strategy

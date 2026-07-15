@@ -255,7 +255,12 @@ def classify_document_llm(sample: str) -> Optional[Dict[str, Any]]:
     if models.get_nim_client() is None:
         return None
 
-    prompt = f"""Classify this document. Reply with ONLY valid JSON, no markdown:
+    timeout_sec = float(
+        getattr(settings, "FEATURE_EXTRACTION_LLM_TIMEOUT_SEC", 12.0) or 12.0
+    )
+
+    def _invoke() -> Optional[Dict[str, Any]]:
+        prompt = f"""Classify this document. Reply with ONLY valid JSON, no markdown:
 {{
   "document_type": one of {DOCUMENT_TYPES},
   "domain_label": one of {DOMAIN_LABELS},
@@ -266,7 +271,6 @@ def classify_document_llm(sample: str) -> Optional[Dict[str, Any]]:
 Document excerpt:
 {sample[:3000]}
 """
-    try:
         text, _ = models.call_chat_with_fallback(
             settings.light_models(),
             [
@@ -302,6 +306,20 @@ Document excerpt:
             "classifier_confidence": float(data.get("confidence", 0.7)),
             "classifier_method": "nim_light_llm",
         }
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_invoke)
+            try:
+                return fut.result(timeout=timeout_sec)
+            except FuturesTimeout:
+                log.warning(
+                    "LLM document classifier soft-timeout after %.1fs → heuristic fallback",
+                    timeout_sec,
+                )
+                return None
     except Exception as e:
         # Timeouts / 5xx / connection errors are expected under NIM load —
         # never abort the pipeline for optional classification metadata.
@@ -310,6 +328,7 @@ Document excerpt:
         else:
             log.warning(f"LLM document classifier failed: {e}")
         return None
+
 
 
 def classify_document_heuristic(sample: str, structural: Dict, reasoning: Dict) -> Dict[str, Any]:

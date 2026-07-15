@@ -167,8 +167,17 @@ function estimateFrontierG(
   const bd = carbon.breakdown || {}
   const intensity =
     num(carbon.local_grid_gco2_kwh) ||
-    num(bd.grid_carbon_intensity_gco2_kwh)
-  if (intensity <= 0 || baseline <= 0) return 0
+    num(bd.grid_carbon_intensity_gco2_kwh) ||
+    700.0
+  const tokens = workflowInferenceTokens(carbon)
+
+  // Absolute estimate when baseline is missing (Summary Ready before full carbon).
+  if (baseline <= 0) {
+    if (tokens > 0 && intensity > 0) {
+      return Math.max(0, ((tokens * modelJ) / JOULES_PER_KWH) * intensity)
+    }
+    return 0
+  }
 
   const stages = (bd.baseline_stages_gco2e || {}) as Record<string, number>
   let inferenceG = num(stages.inference_gco2e)
@@ -184,7 +193,6 @@ function estimateFrontierG(
     infraG = Math.max(0, baseline - inferenceG - otherG)
   }
 
-  const tokens = workflowInferenceTokens(carbon)
   let newInferenceG: number
   if (tokens > 0) {
     // IT-only (no PUE) — infrastructure share is rescaled below (matches backend).

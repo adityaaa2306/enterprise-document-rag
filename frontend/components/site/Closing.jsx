@@ -1,8 +1,8 @@
 "use client"
 
-import Link from "next/link";
 import { motion } from "framer-motion";
 import { ArrowUpRight, ArrowRight } from "lucide-react";
+import { LiveDemoLink } from "@/components/live-demo-link";
 
 export default function Closing() {
   return (
@@ -40,14 +40,13 @@ export default function Closing() {
             transition={{ delay: 0.25, duration: 0.7 }}
             className="mt-12 flex flex-wrap justify-center items-center gap-4"
           >
-            <Link
-              href="/new-job"
+            <LiveDemoLink
               data-testid="closing-cta-primary"
               className="group inline-flex items-center gap-2 bg-emerald-500 text-black px-6 py-4 font-mono text-[11px] uppercase tracking-[0.18em] hover:bg-emerald-400 transition-colors emerald-glow"
             >
               Explore the live demo
               <ArrowUpRight className="w-4 h-4 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" strokeWidth={2} />
-            </Link>
+            </LiveDemoLink>
             <a
               href="#system"
               data-testid="closing-cta-secondary"

@@ -1,25 +1,55 @@
 "use client"
 
-import { motion } from "framer-motion";
+import { motion } from "framer-motion"
+import measured from "@/data/sequential_vs_dag.json"
+
+const rows = measured?.rows || []
+const headline = measured || {}
+
+const benchRows = rows.filter((r) => r.sequential_wall_ms != null && r.speedup != null)
+const validationRows = rows.filter((r) => r.label === "FinalReport.pdf live validation")
 
 const METRICS = [
-  { value: "20%", label: "carbon reduction · at scale", note: "52.1% featured run" },
-  { value: "15%", label: "energy reduction" },
-  { value: "25%", label: "faster processing" },
-  { value: "60%", label: "cost reduction" },
-  { value: "60%", label: "less large-model usage" },
-];
+  {
+    value: `${headline.headline?.median_speedup ?? "—"}x`,
+    label: "median DAG speedup",
+    note: headline.headline?.label || "vs sequential reduce",
+  },
+  {
+    value: `${headline.headline?.best_speedup ?? "—"}x`,
+    label: "best measured speedup",
+    note: "same live NIM compile workload",
+  },
+  {
+    value: String(benchRows[benchRows.length - 1]?.chunks ?? "—"),
+    label: "largest bench chunk set",
+    note: "orchestration scale point",
+  },
+  {
+    value: benchRows.length
+      ? `${Math.round(benchRows.reduce((s, r) => s + (r.parallel_wall_ms || 0), 0) / benchRows.length)}ms`
+      : "—",
+    label: "avg parallel wall",
+    note: "DAG capacity pool · live",
+  },
+  {
+    value: headline.finalreport_validation?.wall_clock_sec
+      ? `${headline.finalreport_validation.wall_clock_sec}s`
+      : benchRows.length
+        ? `${Math.round(benchRows.reduce((s, r) => s + (r.sequential_wall_ms || 0), 0) / benchRows.length)}ms`
+        : "—",
+    label: headline.finalreport_validation ? "FinalReport live wall" : "avg sequential wall",
+    note: headline.finalreport_validation
+      ? `QVA ${headline.finalreport_validation.qva_confidence ?? "—"} · RL requeues ${headline.finalreport_validation.rate_limit_requeues ?? 0}`
+      : "single-worker reduce · live",
+  },
+]
 
-// gCO₂ per document
-const COMPARISON = [
-  { name: "GPT-o3",           value: 14.2, ours: false },
-  { name: "GPT-4",            value: 11.6, ours: false },
-  { name: "Claude 4 Opus",    value: 10.4, ours: false },
-  { name: "Gemini 2.5 Pro",   value: 8.9,  ours: false },
-  { name: "Green / Agentic",  value: 3.97, ours: true },
-];
-
-const max = Math.max(...COMPARISON.map((c) => c.value));
+const maxWall = Math.max(
+  1,
+  ...benchRows.flatMap((r) => [r.sequential_wall_ms || 0, r.parallel_wall_ms || 0]),
+  ...validationRows.map((r) => r.parallel_wall_ms || 0),
+)
 
 export default function Benchmarks() {
   return (
@@ -30,11 +60,15 @@ export default function Benchmarks() {
             10 · Benchmarks
           </div>
           <h2 className="font-display text-3xl md:text-5xl tracking-tight text-white leading-[1.05] max-w-3xl">
-            The numbers, <span className="italic font-serif font-light text-emerald-400">unrounded.</span>
+            Measured Sequential vs{" "}
+            <span className="italic font-serif font-light text-emerald-400">Parallel DAG.</span>
           </h2>
+          <p className="mt-4 max-w-2xl text-sm text-neutral-400 font-mono leading-relaxed">
+            {headline.note || "Real harness output from backend/scripts/bench_sequential_vs_dag.py"}
+            {headline.generated_at ? ` · ${headline.generated_at}` : ""}
+          </p>
         </div>
 
-        {/* metric grid */}
         <div className="grid grid-cols-2 md:grid-cols-5 divide-x divide-y md:divide-y-0 divide-white/10 border border-white/10">
           {METRICS.map((m, i) => (
             <motion.div
@@ -58,48 +92,89 @@ export default function Benchmarks() {
           ))}
         </div>
 
-        {/* bar chart */}
         <div className="mt-4 border border-white/10 bg-[#080808]">
           <div className="hairline-b px-6 py-4 flex items-center justify-between font-mono text-[10px] uppercase tracking-[0.2em]">
-            <span className="text-neutral-400">Chart 01 · CO₂ per document (g)</span>
+            <span className="text-neutral-400">Chart 01 · Wall time by chunk count (ms)</span>
             <span className="text-neutral-600">lower is better</span>
           </div>
-          <div className="p-6 md:p-8">
-            {COMPARISON.map((c, i) => (
+          <div className="p-6 md:p-8 space-y-6">
+            {benchRows.map((r, i) => (
               <motion.div
-                key={c.name}
+                key={`bench-${r.chunks}`}
                 initial={{ opacity: 0, x: -20 }}
                 whileInView={{ opacity: 1, x: 0 }}
                 viewport={{ once: true }}
                 transition={{ delay: i * 0.09, duration: 0.6 }}
-                className={`grid grid-cols-12 items-center py-5 ${i < COMPARISON.length - 1 ? "hairline-b" : ""}`}
+                className="space-y-2"
               >
-                <div className="col-span-4 md:col-span-3 flex items-center gap-3">
-                  {c.ours && <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full" />}
-                  <span className={`font-mono text-[12px] uppercase tracking-[0.14em] ${c.ours ? "text-emerald-400" : "text-neutral-300"}`}>
-                    {c.name}
-                  </span>
+                <div className="font-mono text-[12px] uppercase tracking-[0.14em] text-neutral-300">
+                  {r.chunks} chunks · {r.speedup}x speedup
                 </div>
-                <div className="col-span-6 md:col-span-7">
-                  <div className="h-2 bg-white/5 relative">
-                    <motion.div
-                      initial={{ width: 0 }}
-                      whileInView={{ width: `${(c.value / max) * 100}%` }}
-                      viewport={{ once: true }}
-                      transition={{ delay: 0.2 + i * 0.1, duration: 1, ease: [0.22, 1, 0.36, 1] }}
-                      className="h-full"
-                      style={{ background: c.ours ? "#10B981" : "#3F3F46" }}
+                <div className="grid grid-cols-12 items-center gap-2">
+                  <div className="col-span-2 font-mono text-[10px] text-neutral-500">seq</div>
+                  <div className="col-span-8 h-2 bg-white/5 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-neutral-500"
+                      style={{ width: `${((r.sequential_wall_ms || 0) / maxWall) * 100}%` }}
                     />
                   </div>
+                  <div className="col-span-2 font-mono text-[11px] text-neutral-400 tabular-nums text-right">
+                    {Math.round(r.sequential_wall_ms || 0)}
+                  </div>
                 </div>
-                <div className="col-span-2 text-right font-mono text-[13px] text-white">
-                  {c.value.toFixed(2)} g
+                <div className="grid grid-cols-12 items-center gap-2">
+                  <div className="col-span-2 font-mono text-[10px] text-emerald-400">dag</div>
+                  <div className="col-span-8 h-2 bg-white/5 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-emerald-400"
+                      style={{ width: `${((r.parallel_wall_ms || 0) / maxWall) * 100}%` }}
+                    />
+                  </div>
+                  <div className="col-span-2 font-mono text-[11px] text-emerald-400 tabular-nums text-right">
+                    {Math.round(r.parallel_wall_ms || 0)}
+                  </div>
                 </div>
               </motion.div>
             ))}
+            {validationRows.map((r, i) => (
+              <motion.div
+                key={`val-${r.label}-${r.chunks}`}
+                initial={{ opacity: 0, x: -20 }}
+                whileInView={{ opacity: 1, x: 0 }}
+                viewport={{ once: true }}
+                transition={{ delay: 0.2 + i * 0.09, duration: 0.6 }}
+                className="space-y-2 hairline-t pt-6"
+              >
+                <div className="font-mono text-[12px] uppercase tracking-[0.14em] text-neutral-300">
+                  {r.label || "FinalReport.pdf"} · {r.chunks} chunks · live validation
+                </div>
+                <div className="grid grid-cols-12 items-center gap-2">
+                  <div className="col-span-2 font-mono text-[10px] text-emerald-400">dag</div>
+                  <div className="col-span-8 h-2 bg-white/5 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-emerald-400"
+                      style={{ width: `${((r.parallel_wall_ms || 0) / maxWall) * 100}%` }}
+                    />
+                  </div>
+                  <div className="col-span-2 font-mono text-[11px] text-emerald-400 tabular-nums text-right">
+                    {Math.round(r.parallel_wall_ms || 0)}
+                  </div>
+                </div>
+                <div className="font-mono text-[10px] text-neutral-500 tracking-tight">
+                  QVA {r.qva_confidence ?? "—"} · rate-limit requeues {r.rate_limit_requeues ?? 0} ·
+                  hard-isolation {r.hard_isolation_timeouts ?? 0}
+                </div>
+              </motion.div>
+            ))}
+            {!benchRows.length && !validationRows.length && (
+              <div className="font-mono text-sm text-neutral-500">
+                No measured rows yet — run{" "}
+                <code className="text-emerald-400">python scripts/bench_sequential_vs_dag.py</code>
+              </div>
+            )}
           </div>
         </div>
       </div>
     </section>
-  );
+  )
 }

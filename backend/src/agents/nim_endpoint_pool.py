@@ -115,11 +115,31 @@ def _parse_roles(raw: str) -> Set[str]:
 
 
 def _default_max_concurrent() -> int:
-    return max(1, int(getattr(settings, "NIM_ENDPOINT_MAX_CONCURRENT", 3) or 3))
+    return max(1, int(getattr(settings, "NIM_ENDPOINT_MAX_CONCURRENT", 6) or 6))
 
 
-def _collect_endpoint_specs() -> List[Dict[str, str]]:
-    specs: List[Dict[str, str]] = []
+def _endpoint_max_concurrent(endpoint_id: str, index: Optional[int] = None) -> int:
+    """Prefer per-endpoint NIM_ENDPOINT_{i}_MAX_CONCURRENT when set."""
+    if index is not None:
+        raw = getattr(settings, f"NIM_ENDPOINT_{index}_MAX_CONCURRENT", None)
+        if raw is not None:
+            try:
+                return max(1, int(raw))
+            except (TypeError, ValueError):
+                pass
+    try:
+        if endpoint_id.startswith("endpoint-"):
+            n = int(endpoint_id.split("-", 1)[1])
+            raw = getattr(settings, f"NIM_ENDPOINT_{n}_MAX_CONCURRENT", None)
+            if raw is not None:
+                return max(1, int(raw))
+    except (TypeError, ValueError):
+        pass
+    return _default_max_concurrent()
+
+
+def _collect_endpoint_specs() -> List[Dict[str, Any]]:
+    specs: List[Dict[str, Any]] = []
     primary_key = (getattr(settings, "NVIDIA_API_KEY", None) or "").strip()
     primary_url = (
         getattr(settings, "NVIDIA_BASE_URL", None) or "https://integrate.api.nvidia.com/v1"
@@ -132,6 +152,7 @@ def _collect_endpoint_specs() -> List[Dict[str, str]]:
                 "base_url": primary_url,
                 "roles": getattr(settings, "NIM_ENDPOINT_1_ROLES", "map,compile,embed,any")
                 or "map,compile,embed,any",
+                "max_concurrent": _endpoint_max_concurrent("endpoint-1", 1),
             }
         )
 
@@ -155,6 +176,7 @@ def _collect_endpoint_specs() -> List[Dict[str, str]]:
                 "api_key": key,
                 "base_url": url,
                 "roles": str(roles),
+                "max_concurrent": _endpoint_max_concurrent(f"endpoint-{i}", i),
             }
         )
 
@@ -172,6 +194,7 @@ def _collect_endpoint_specs() -> List[Dict[str, str]]:
                     "api_key": key,
                     "base_url": primary_url,
                     "roles": "map,compile,embed,any",
+                    "max_concurrent": _default_max_concurrent(),
                 }
             )
     return specs
@@ -188,7 +211,6 @@ def load_endpoint_pool() -> List[NimEndpoint]:
     timeout_connect = float(getattr(settings, "NIM_CONNECT_TIMEOUT_SEC", 15.0) or 15.0)
     timeout = httpx.Timeout(timeout_read, connect=timeout_connect)
     max_retries = int(getattr(settings, "NIM_SDK_MAX_RETRIES", 0) or 0)
-    max_conc = _default_max_concurrent()
 
     endpoints: List[NimEndpoint] = []
     for spec in _collect_endpoint_specs():
@@ -199,6 +221,7 @@ def load_endpoint_pool() -> List[NimEndpoint]:
                 timeout=timeout,
                 max_retries=max_retries,
             )
+            max_conc = int(spec.get("max_concurrent") or _default_max_concurrent())
             ep = NimEndpoint(
                 id=spec["id"],
                 api_key=spec["api_key"],
@@ -228,7 +251,7 @@ def load_endpoint_pool() -> List[NimEndpoint]:
         log.info(
             "NIM endpoint pool size=%s total_capacity=%s",
             len(endpoints),
-            len(endpoints) * max_conc,
+            sum(e.max_concurrent for e in endpoints),
         )
     return list(endpoints)
 
@@ -391,6 +414,15 @@ def acquire_endpoint(
                         and e.available_slots > 0
                     ):
                         e.active += 1
+                        log.info(
+                            "TASK_LIFECYCLE phase=ENDPOINT_ACTIVE_INC endpoint=%s "
+                            "active=%s/%s role=%s total_active=%s",
+                            e.id,
+                            e.active,
+                            e.max_concurrent,
+                            role,
+                            sum(x.active for x in _ENDPOINTS),
+                        )
                         return EndpointLease(endpoint_id=e.id, client=e.client, role=role)
 
             chosen = _pick(_candidates(role, exclude_ids=exclude_ids, require_capacity=True))
@@ -400,6 +432,15 @@ def acquire_endpoint(
 
             if chosen is not None:
                 chosen.active += 1
+                log.info(
+                    "TASK_LIFECYCLE phase=ENDPOINT_ACTIVE_INC endpoint=%s "
+                    "active=%s/%s role=%s total_active=%s",
+                    chosen.id,
+                    chosen.active,
+                    chosen.max_concurrent,
+                    role,
+                    sum(x.active for x in _ENDPOINTS),
+                )
                 return EndpointLease(
                     endpoint_id=chosen.id, client=chosen.client, role=role
                 )
@@ -428,6 +469,7 @@ def release_endpoint(
         for e in _ENDPOINTS:
             if e.id != lease.endpoint_id:
                 continue
+            prev = e.active
             e.active = max(0, e.active - 1)
             e.total_calls += 1
             if latency_ms > 0:
@@ -452,6 +494,25 @@ def release_endpoint(
                 )
                 e.rate_limited_until = max(e.rate_limited_until, time.monotonic() + cool)
                 e.cool_until = max(e.cool_until, e.rate_limited_until)
+            log.info(
+                "TASK_LIFECYCLE phase=ENDPOINT_ACTIVE_DEC endpoint=%s "
+                "active=%s/%s (was %s) ok=%s timed_out=%s rate_limited=%s "
+                "total_active=%s",
+                e.id,
+                e.active,
+                e.max_concurrent,
+                prev,
+                ok,
+                timed_out,
+                rate_limited,
+                sum(x.active for x in _ENDPOINTS),
+            )
+            log.info(
+                "TASK_LIFECYCLE phase=ENDPOINT_RELEASED endpoint=%s role=%s ok=%s",
+                e.id,
+                lease.role,
+                ok,
+            )
             _CV.notify_all()
             return
 

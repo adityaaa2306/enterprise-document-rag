@@ -85,6 +85,13 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
         )
         if user_id is not None:
             storage.ensure_document_owner(document_id, int(user_id))
+        else:
+            ot = job.get("owner_type")
+            oid = job.get("owner_id")
+            if ot and oid:
+                storage.ensure_document_owner_stamp(
+                    document_id, owner_type=str(ot), owner_id=str(oid)
+                )
 
         job_store.touch_job_heartbeat(job_id, worker_id)
 
@@ -283,6 +290,43 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
             "grid_updated_at": raw_carbon.get("grid_updated_at"),
         }
 
+        understanding_status = "pending" if settings.ENABLE_UNDERSTANDING else "skipped"
+
+        # If deliver_summary already published Summary Ready, never overwrite it.
+        # Background services patch carbon/search independently.
+        existing = job_store.get_job(job_id) or job_store.JOB_STATUSES.get(job_id) or {}
+        existing_result = dict(existing.get("result") or {})
+        already_delivered = bool(
+            existing_result.get("summary_ready")
+            and (existing_result.get("final_summary") or "").strip()
+        )
+        # Also treat sticky partial flag as delivered (race with DB refresh).
+        if not already_delivered:
+            partial = dict(existing.get("partial") or {})
+            already_delivered = bool(
+                partial.get("summary_ready")
+                and (existing_result.get("final_summary") or final_state.get("final_summary") or "").strip()
+            )
+
+        carbon_fields_merged = dict(carbon_fields)
+        # Prefer Operational CO₂e from DAG rollups when present
+        try:
+            rollups = (final_state.get("compile_meta") or {}).get("carbon_rollups") or {}
+            op = float(
+                rollups.get("total_carbon_g")
+                or rollups.get("total_g")
+                or final_state.get("carbon_spent_g")
+                or 0
+            )
+            if op > 0:
+                carbon_fields_merged["operational_co2e_g"] = op
+                carbon_fields_merged["actual_cost_gco2e"] = op
+                carbon_fields_merged["primary_metric"] = "operational_co2e"
+                carbon_fields_merged["modeled_co2e_g"] = carbon_fields.get("actual_cost_gco2e")
+                carbon_fields_merged["modeled_label"] = "Modeled CO₂e Estimate"
+        except Exception:
+            pass
+
         insights = build_processing_insights(
             routing_decision=final_state.get("routing_decision"),
             cre_result=final_state.get("cre_result"),
@@ -297,6 +341,7 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
             compile_meta=final_state.get("compile_meta"),
             carbon_budget_g=final_state.get("carbon_budget_g"),
             carbon_spent_g=final_state.get("carbon_spent_g")
+            or carbon_fields_merged.get("operational_co2e_g")
             or raw_carbon.get("actual_cost_gco2e"),
             carbon_remaining_g=final_state.get("carbon_remaining_g"),
             predicted_final_carbon_g=final_state.get("predicted_final_carbon_g"),
@@ -305,37 +350,85 @@ def process_claimed_job(job: Dict[str, Any], *, worker_id: str) -> None:
             pipeline_intelligence=final_state.get("pipeline_intelligence"),
         )
 
-        understanding_status = "pending" if settings.ENABLE_UNDERSTANDING else "skipped"
-        job_store.upsert_job(
-            job_id,
-            status=job_status_mod.STATUS_COMPLETE,
-            progress=100.0,
-            message="Job complete. Results are ready.",
-            understanding=understanding_status,
-            result={
-                "document_id": document_id,
-                "filename": display_name,
-                "final_summary": final_state["final_summary"],
-                "carbon_data": carbon_fields,
-                "job_id": job_id,
-                "processing_insights": insights,
-                "ingestion_latency": final_state.get("ingestion_latency"),
-                "hierarchy": final_state.get("hierarchy"),
-                "routing_distribution": final_state.get("routing_distribution"),
-                "chunk_routing": final_state.get("chunk_routing"),
-                "compile_meta": final_state.get("compile_meta"),
-                "carbon_budget": insights.get("carbon_budget"),
-            },
-            routing_decision=final_state.get("routing_decision"),
-            latency_ms=final_state.get("job_latency_ms"),
-            carbon_saved_grams=carbon_fields.get("carbon_saved_grams"),
-            user_id=user_id,
-            claimed_by=None,
-            heartbeat_at=None,
-            error_detail=None,
-        )
-        reached_terminal = True
-        log.info("Job %s: processing → complete", job_id)
+        if already_delivered:
+            # Preserve early result; refresh summary / insights without clearing summary_ready
+            if (final_state.get("final_summary") or "").strip():
+                existing_result["final_summary"] = final_state["final_summary"]
+            existing_result["summary_ready"] = True
+            existing_result.setdefault(
+                "background",
+                {"phase": "indexing", "message": "Preparing search index…"},
+            )
+            # Merge carbon without wiping operational primary
+            prev_cd = dict(existing_result.get("carbon_data") or {})
+            for k, v in carbon_fields_merged.items():
+                if k == "actual_cost_gco2e" and prev_cd.get("operational_co2e_g"):
+                    # Keep operational as primary; stash modeled separately
+                    prev_cd.setdefault("modeled_co2e_g", v)
+                    prev_cd.setdefault("modeled_label", "Modeled CO₂e Estimate")
+                    continue
+                if v is not None:
+                    prev_cd[k] = v
+            existing_result["carbon_data"] = prev_cd
+            existing_result["processing_insights"] = insights
+            if final_state.get("hierarchy"):
+                existing_result["hierarchy"] = final_state.get("hierarchy")
+            if final_state.get("compile_meta"):
+                existing_result["compile_meta"] = final_state.get("compile_meta")
+            if final_state.get("execution_plan"):
+                existing_result["execution_plan"] = final_state.get("execution_plan")
+            job_store.upsert_job(
+                job_id,
+                status=job_status_mod.STATUS_COMPLETE,
+                progress=max(91.0, float(existing.get("progress") or 91.0)),
+                message=existing.get("message") or "Summary Ready · background indexing…",
+                understanding=understanding_status,
+                result=existing_result,
+                result_source="runner.process_claimed_job.already_delivered",
+                routing_decision=final_state.get("routing_decision"),
+                latency_ms=final_state.get("job_latency_ms"),
+                user_id=user_id,
+                claimed_by=None,
+                heartbeat_at=None,
+                error_detail=None,
+            )
+            reached_terminal = True
+            log.info("Job %s: Summary Ready already delivered — skipping blocking finalize upsert", job_id)
+        else:
+            job_store.upsert_job(
+                job_id,
+                status=job_status_mod.STATUS_COMPLETE,
+                progress=100.0,
+                message="Summary Ready",
+                understanding=understanding_status,
+                result={
+                    "document_id": document_id,
+                    "filename": display_name,
+                    "final_summary": final_state["final_summary"],
+                    "summary_ready": True,
+                    "carbon_data": carbon_fields_merged,
+                    "job_id": job_id,
+                    "processing_insights": insights,
+                    "ingestion_latency": final_state.get("ingestion_latency"),
+                    "hierarchy": final_state.get("hierarchy"),
+                    "routing_distribution": final_state.get("routing_distribution"),
+                    "chunk_routing": final_state.get("chunk_routing"),
+                    "compile_meta": final_state.get("compile_meta"),
+                    "execution_plan": final_state.get("execution_plan"),
+                    "carbon_budget": insights.get("carbon_budget"),
+                    "background": {"phase": "complete", "message": "Search Ready"},
+                },
+                result_source="runner.process_claimed_job.legacy_full",
+                routing_decision=final_state.get("routing_decision"),
+                latency_ms=final_state.get("job_latency_ms"),
+                carbon_saved_grams=carbon_fields_merged.get("carbon_saved_grams"),
+                user_id=user_id,
+                claimed_by=None,
+                heartbeat_at=None,
+                error_detail=None,
+            )
+            reached_terminal = True
+            log.info("Job %s: processing → complete (Summary Ready sticky)", job_id)
 
         if settings.ENABLE_UNDERSTANDING:
             def _bg():

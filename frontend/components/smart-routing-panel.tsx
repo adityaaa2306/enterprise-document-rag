@@ -14,6 +14,8 @@ interface SmartRoutingPanelProps {
   onSubmit: () => void
   onBack: () => void
   isSubmitting?: boolean
+  /** 0–100 while uploading; null when idle */
+  uploadPct?: number | null
 }
 
 export function SmartRoutingPanel({
@@ -23,6 +25,7 @@ export function SmartRoutingPanel({
   onSubmit,
   onBack,
   isSubmitting = false,
+  uploadPct = null,
 }: SmartRoutingPanelProps) {
   return (
     <motion.div
@@ -78,13 +81,34 @@ export function SmartRoutingPanel({
 
       <AdvancedRoutingSettings value={preference} onChange={onPreferenceChange} />
 
+      {isSubmitting && uploadPct != null ? (
+        <div className="space-y-1.5">
+          <div className="flex justify-between text-xs text-muted-foreground tabular-nums">
+            <span>
+              {uploadPct < 100 ? "Uploading…" : "Starting job…"}
+            </span>
+            <span>{uploadPct}%</span>
+          </div>
+          <div className="h-1.5 w-full rounded-full bg-muted overflow-hidden">
+            <div
+              className="h-full bg-primary transition-all duration-200 ease-out"
+              style={{ width: `${Math.min(100, Math.max(0, uploadPct))}%` }}
+            />
+          </div>
+        </div>
+      ) : null}
+
       <Button
         size="lg"
         className="w-full"
         onClick={onSubmit}
         disabled={isSubmitting}
       >
-        {isSubmitting ? "Starting…" : "Process document"}
+        {isSubmitting
+          ? uploadPct != null && uploadPct < 100
+            ? `Uploading ${uploadPct}%…`
+            : "Starting job…"
+          : "Process document"}
       </Button>
     </motion.div>
   )

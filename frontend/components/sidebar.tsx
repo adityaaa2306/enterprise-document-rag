@@ -19,8 +19,9 @@ import {
   Zap,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { apiLogout } from "@/lib/api"
+import { apiLogout, getAccessToken } from "@/lib/api"
 import { getLastJobId } from "@/lib/job-session"
+import { clearGuestSessionLocal, isGuestMode } from "@/lib/guest-session"
 import {
   Tooltip,
   TooltipContent,
@@ -106,6 +107,7 @@ export function Sidebar() {
   const [collapsed, setCollapsed] = useState(false)
   const [ready, setReady] = useState(false)
   const [mobileOpen, setMobileOpen] = useState(false)
+  const [guestDemo, setGuestDemo] = useState(false)
 
   useEffect(() => {
     try {
@@ -113,6 +115,7 @@ export function Sidebar() {
     } catch {
       /* ignore */
     }
+    setGuestDemo(isGuestMode())
     setReady(true)
   }, [])
 
@@ -124,6 +127,30 @@ export function Sidebar() {
   useEffect(() => {
     setMobileOpen(false)
   }, [pathname])
+
+  // Prefetch app shell routes so sidebar navigation feels native.
+  useEffect(() => {
+    const routes = ["/dashboard", "/new-job", "/results", "/settings", "/login"]
+    for (const r of routes) {
+      try {
+        router.prefetch(r)
+      } catch {
+        /* ignore */
+      }
+    }
+    const last = getLastJobId()
+    if (last) {
+      try {
+        router.prefetch(`/results?job_id=${last}`)
+      } catch {
+        /* ignore */
+      }
+    }
+    // Warm shared metrics cache in background (Dashboard/Results parity).
+    void import("@/lib/finalized-metrics-store").then((m) =>
+      m.ensureFinalizedMetrics().catch(() => undefined),
+    )
+  }, [router])
 
   const toggleCollapsed = () => {
     setCollapsed((prev) => {
@@ -145,6 +172,11 @@ export function Sidebar() {
   ]
 
   const handleLogout = async () => {
+    if (guestDemo || isGuestMode() || !getAccessToken()) {
+      clearGuestSessionLocal()
+      router.push("/")
+      return
+    }
     await apiLogout(true)
     router.push("/login")
   }
@@ -288,7 +320,11 @@ export function Sidebar() {
               )}
             >
               <LogOut className="w-[18px] h-[18px] shrink-0" />
-              {!collapsed && <span className="text-sm">Log out</span>}
+              {!collapsed && (
+                <span className="text-sm">
+                  {guestDemo ? "End demo" : "Log out"}
+                </span>
+              )}
             </button>
           </TooltipTrigger>
           {collapsed ? (

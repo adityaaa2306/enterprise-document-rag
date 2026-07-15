@@ -68,7 +68,7 @@ def test_is_job_complete():
 def test_is_job_ready_for_result_requires_payload():
     assert is_job_ready_for_result(None) is False
     assert is_job_ready_for_result({"status": "complete"}) is False
-    assert is_job_ready_for_result({"status": "completed", "result": {}}) is True
+    assert is_job_ready_for_result({"status": "completed", "result": {}}) is False
     assert is_job_ready_for_result({
         "status": "complete",
         "result": {"document_id": "abc", "final_summary": "x"},
@@ -77,6 +77,15 @@ def test_is_job_ready_for_result_requires_payload():
         "status": "processing",
         "result": {"document_id": "abc"},
     }) is False
+    # Stale in-memory pending must not block a durable summary payload
+    assert is_job_ready_for_result({
+        "status": "pending",
+        "result": {"final_summary": "Ready now", "summary_ready": True},
+    }) is True
+    assert is_job_ready_for_result({
+        "status": "processing",
+        "result": {"summary_ready": True},
+    }) is True
 
 
 def test_align_chunks_to_document_id_pydantic_and_dict():

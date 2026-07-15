@@ -149,13 +149,15 @@ export function extractCompactMetrics(result: {
     ) ?? 0
   const optimizedG =
     numOr(
+      cd.operational_co2e_g,
       rc.estimated_optimized_pipeline_emissions_g,
       cd.estimated_optimized_pipeline_emissions_g,
       bd.estimated_optimized_pipeline_emissions_g,
       bd.actual_co2e_g,
       cd.actual_cost_gco2e,
     ) ?? 0
-  const savedG = numOr(bd.carbon_saved_g, cd.carbon_saved_grams, baselineG - optimizedG) ?? 0
+  const modeledG = numOr(cd.modeled_co2e_g) ?? null
+  const savedG = numOr(bd.carbon_saved_g, cd.carbon_saved_grams, baselineG - (modeledG ?? optimizedG)) ?? 0
   const reductionPct = numOr(bd.reduction_percent, cd.efficiency_percent, 0) ?? 0
   const emissionsIncreased =
     bd.emissions_direction === "increased" ||

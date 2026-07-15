@@ -418,6 +418,56 @@ def _uncertainty_band(
     }
 
 
+def _dag_measured_compile_tokens(
+    state: Mapping[str, Any],
+    compile_meta: Mapping[str, Any],
+) -> Optional[int]:
+    """
+    Sum tokens_in (+ tokens_out) from frozen DAG compile nodes when present.
+    Returns None if no usable DAG telemetry — caller falls back to heuristic.
+    """
+    total = 0
+    found = 0
+    sources = []
+    dag_nodes = compile_meta.get("dag_nodes") or state.get("pipeline_dag_nodes") or {}
+    if isinstance(dag_nodes, dict):
+        sources.append(dag_nodes.values())
+    for n in sources[0] if sources else []:
+        if isinstance(n, dict):
+            kind = str(n.get("kind") or "")
+            tin = int(n.get("tokens_in") or 0)
+            tout = int(n.get("tokens_out") or 0)
+        else:
+            kind = str(getattr(n, "kind", "") or "")
+            tin = int(getattr(n, "tokens_in", 0) or 0)
+            tout = int(getattr(n, "tokens_out", 0) or 0)
+        if kind in ("chunk", "meta", ""):
+            continue
+        if tin or tout:
+            found += 1
+            total += tin + tout
+    # Also accept explicit compile_meta aggregate
+    explicit = compile_meta.get("compile_tokens_measured") or compile_meta.get(
+        "total_compile_tokens"
+    )
+    if explicit is not None:
+        try:
+            return max(0, int(explicit))
+        except (TypeError, ValueError):
+            pass
+    if found > 0 and total > 0:
+        return int(total)
+    # Fall back to carbon_rollups total_tokens if only compile nodes contributed
+    rollups = compile_meta.get("carbon_rollups") or {}
+    try:
+        rt = int(rollups.get("total_tokens") or 0)
+        if rt > 0 and int(compile_meta.get("compile_calls") or 0) > 0:
+            return rt
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 def estimate_workflow_carbon(
     job_id: str,
     state: Mapping[str, Any],
@@ -481,8 +531,14 @@ def estimate_workflow_carbon(
         compile_calls = max(
             1, int(math.ceil(total_chunks / float(batch_size))) + (n_rounds - 1)
         )
-    # Scale compile token estimate by measured call count when available.
-    compile_tokens = int(summary_tokens * max(n_rounds, compile_calls))
+    # Prefer actual DAG node token accounting when available (Operational accuracy).
+    # Methodology unchanged — only the input token estimate for compile stage.
+    dag_compile_tokens = _dag_measured_compile_tokens(state, compile_meta)
+    if dag_compile_tokens is not None and dag_compile_tokens > 0:
+        compile_tokens = int(dag_compile_tokens)
+    else:
+        # Scale compile token estimate by measured call count when available.
+        compile_tokens = int(summary_tokens * max(n_rounds, compile_calls))
     verification_tokens = total_chunks * 40
     map_tokens_total = (
         max(int(input_tokens * 1.25), input_tokens) if input_tokens > 0 else 0

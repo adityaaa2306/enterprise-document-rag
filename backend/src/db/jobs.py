@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import and_, or_, select, update
@@ -64,17 +65,28 @@ def _extract_metrics(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_RESULT_MISSING = object()
+
+
 def upsert_job(job_id: str, **fields: Any) -> Dict[str, Any]:
     """
-    Merge fields into the in-memory cache and optionally persist to DB.
+    Merge status/progress/metadata fields into the in-memory cache and DB.
 
-    Returns the full status dict (same shape as legacy JOB_STATUSES[job_id]).
+    ``result`` must not be whole-replaced here. If ``result`` is passed (legacy
+    callers), it is routed through ``result_state_store.update_result`` as a
+    monotonic patch. Non-result upserts never rewrite ``result_json``.
     """
+    result_patch = fields.pop("result", _RESULT_MISSING)
+    result_source = fields.pop("result_source", None)
+
     current = dict(JOB_STATUSES.get(job_id) or {})
     prev_status = current.get("status")
+
+    # Apply non-result fields only — preserve existing result reference.
     for k, v in fields.items():
         current[k] = v
     current["job_id"] = job_id
+    # Do not drop result from mem when absent from this upsert.
     JOB_STATUSES[job_id] = current
 
     new_status = current.get("status")
@@ -94,19 +106,110 @@ def upsert_job(job_id: str, **fields: Any) -> Dict[str, Any]:
         except Exception as e:
             log.error(f"Failed to persist job {job_id}: {e}")
 
-    return current
+    if result_patch is not _RESULT_MISSING:
+        try:
+            from src.core.result_state_store import update_result
+
+            source = str(result_source or _infer_result_source())
+            update_result(
+                job_id,
+                result_patch if isinstance(result_patch, dict) else {},
+                source=source,
+            )
+        except Exception as e:
+            log.error("Job %s: monotonic result update failed: %s", job_id, e)
+            raise
+
+    return JOB_STATUSES.get(job_id) or current
+
+
+def _infer_result_source() -> str:
+    try:
+        import inspect
+
+        for fr in inspect.stack()[2:10]:
+            mod = fr.filename.replace("\\", "/")
+            if "result_state_store" in mod or "jobs.py" in mod:
+                continue
+            return f"{Path(fr.filename).name}:{fr.function}"
+    except Exception:
+        pass
+    return "upsert_job.legacy"
+
+
+def cas_persist_result(
+    job_id: str,
+    *,
+    expected_revision: int,
+    new_result: Dict[str, Any],
+) -> bool:
+    """
+    Compare-and-swap persist for result_json only.
+
+    Succeeds only if the current revision still equals ``expected_revision``.
+    Updates in-memory cache on success.
+    """
+    from src.core.result_state_store import get_revision
+
+    # In-memory CAS first (same-process races).
+    mem = JOB_STATUSES.setdefault(job_id, {"job_id": job_id})
+    mem_result = mem.get("result") if isinstance(mem.get("result"), dict) else {}
+    if get_revision(mem_result) != int(expected_revision):
+        return False
+
+    if _db_enabled():
+        from src.db.models import JobModel
+        from src.db.session import get_session
+
+        db = get_session()
+        try:
+            row = db.get(JobModel, job_id)
+            if row is None:
+                row = JobModel(id=job_id, status=job_status_mod.STATUS_PENDING)
+                db.add(row)
+            current_blob = row.result_json if isinstance(row.result_json, dict) else {}
+            if get_revision(current_blob) != int(expected_revision):
+                db.rollback()
+                return False
+            row.result_json = new_result
+            row.updated_at = _now()
+            # Promote indexed carbon metric when present
+            try:
+                cd = new_result.get("carbon_data") if isinstance(new_result.get("carbon_data"), dict) else {}
+                saved = cd.get("carbon_saved_grams")
+                if saved is not None:
+                    row.carbon_saved_grams = float(saved)
+            except (TypeError, ValueError):
+                pass
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            log.error("cas_persist_result failed job=%s: %s", job_id, e)
+            return False
+        finally:
+            db.close()
+
+    mem["result"] = new_result
+    mem["result_revision"] = get_revision(new_result)
+    JOB_STATUSES[job_id] = mem
+    return True
 
 
 def enqueue_job(
     job_id: str,
     *,
     user_id: Optional[int] = None,
+    owner_type: Optional[str] = None,
+    owner_id: Optional[str] = None,
     filename: Optional[str] = None,
     job_mode: Optional[str] = None,
     message: str = "Queued. Waiting for worker...",
 ) -> Dict[str, Any]:
     """Create a durable pending job (API path — no AI work)."""
     now = _now()
+    if not owner_type and user_id is not None:
+        owner_type = "user"
+        owner_id = str(user_id)
     return upsert_job(
         job_id,
         status=job_status_mod.STATUS_PENDING,
@@ -116,6 +219,8 @@ def enqueue_job(
         filename=filename,
         job_mode=job_mode,
         user_id=user_id,
+        owner_type=owner_type,
+        owner_id=owner_id,
         attempt_count=0,
         available_at=now,
         claimed_at=None,
@@ -204,30 +309,116 @@ def get_job(job_id: str, *, include_result: bool = True) -> Optional[Dict[str, A
                         return light
                     return mem
                 status = _row_to_status(row, include_result=include_result)
-                if mem and str(mem.get("status") or "") in (
-                    job_status_mod.STATUS_PROCESSING,
-                    job_status_mod.STATUS_PENDING,
-                ):
+                if mem:
+                    # Always preserve live background / partial (not stored as DB columns).
+                    if mem.get("background") is not None and status.get("background") is None:
+                        status["background"] = mem.get("background")
+                    if mem.get("partial") is not None and status.get("partial") is None:
+                        status["partial"] = mem.get("partial")
                     try:
                         mem_prog = float(mem.get("progress") or 0.0)
                         db_prog = float(status.get("progress") or 0.0)
                     except (TypeError, ValueError):
                         mem_prog, db_prog = 0.0, 0.0
-                    # Prefer live worker cache when it is ahead of durable row
-                    if mem_prog >= db_prog and mem.get("message"):
-                        status["progress"] = mem_prog
-                        status["message"] = mem.get("message") or status.get("message")
+                    mem_status = job_status_mod.normalize_job_status(mem.get("status"))
+                    db_status = job_status_mod.normalize_job_status(status.get("status"))
+                    db_terminal = job_status_mod.is_terminal(db_status)
+
+                    # Prefer live worker cache when it is ahead of durable row —
+                    # but NEVER downgrade a durable terminal status to pending/processing.
+                    # That race left /job-result returning 400 while /jobs showed complete.
+                    if not db_terminal and (
+                        mem_status
+                        in (
+                            job_status_mod.STATUS_PROCESSING,
+                            job_status_mod.STATUS_PENDING,
+                        )
+                        or mem_prog >= db_prog
+                    ):
+                        if mem_prog >= db_prog and mem.get("message"):
+                            status["progress"] = mem_prog
+                            status["message"] = mem.get("message") or status.get("message")
                         if mem.get("partial") is not None:
                             status["partial"] = mem.get("partial")
-                        if mem.get("status"):
-                            status["status"] = mem.get("status")
+                        if mem.get("background") is not None:
+                            status["background"] = mem.get("background")
+                        if mem_status in (
+                            job_status_mod.STATUS_PROCESSING,
+                            job_status_mod.STATUS_PENDING,
+                        ) and mem.get("status"):
+                            status["status"] = mem_status
+                    elif db_terminal:
+                        # Keep DB terminal status; merge live bg/partial only.
+                        if mem.get("partial") is not None:
+                            status["partial"] = mem.get("partial")
+                        if mem.get("background") is not None:
+                            status["background"] = mem.get("background")
+                        if mem_prog > db_prog:
+                            status["progress"] = mem_prog
+                        # Prefer Search Ready messaging from mem once complete.
+                        if mem.get("message") and (
+                            "search ready" in str(mem.get("message") or "").lower()
+                            or "summary ready" in str(mem.get("message") or "").lower()
+                        ):
+                            status["message"] = mem.get("message")
                 # Keep in-memory result when this read intentionally skipped it.
+                # Never clobber a newer result (higher _revision) that landed via CAS
+                # while this status-only read was in flight.
                 if not include_result and mem and mem.get("result") is not None:
-                    cached = dict(mem)
-                    cached.update(status)
-                    cached["result"] = mem["result"]
+                    from src.core.result_state_store import get_revision
+
+                    existing = JOB_STATUSES.get(job_id) or mem
+                    cached = dict(existing)
+                    for k, v in status.items():
+                        if k == "result":
+                            continue
+                        cached[k] = v
+                    # Choose the richer/newer result among mem / existing cache.
+                    candidates = []
+                    for blob in (existing.get("result"), mem.get("result")):
+                        if isinstance(blob, dict):
+                            candidates.append(blob)
+                    if candidates:
+                        cached["result"] = max(candidates, key=get_revision)
+                    cached["status"] = status.get("status") or cached.get("status")
+                    if status.get("progress") is not None:
+                        try:
+                            if float(status.get("progress") or 0) >= float(cached.get("progress") or 0):
+                                cached["progress"] = status.get("progress")
+                        except (TypeError, ValueError):
+                            cached["progress"] = status.get("progress", cached.get("progress"))
+                    if status.get("message"):
+                        cached["message"] = status.get("message")
+                    if mem.get("background") is not None:
+                        cached["background"] = mem.get("background")
+                    elif status.get("background") is not None:
+                        cached["background"] = status.get("background")
                     JOB_STATUSES[job_id] = cached
+                    try:
+                        from src.core.result_revision_log import log_result_read
+
+                        log_result_read(
+                            job_id,
+                            endpoint="get_job(include_result=False).status_merge",
+                            result=cached.get("result")
+                            if isinstance(cached.get("result"), dict)
+                            else None,
+                            status_fields={
+                                "db_status": status.get("status"),
+                                "rev": get_revision(cached.get("result") if isinstance(cached.get("result"), dict) else None),
+                            },
+                        )
+                    except Exception:
+                        pass
                 else:
+                    if mem and mem.get("background") is not None:
+                        status["background"] = mem.get("background")
+                    # When loading full row from DB, prefer higher revision vs mem.
+                    if include_result and mem and isinstance(mem.get("result"), dict) and isinstance(status.get("result"), dict):
+                        from src.core.result_state_store import get_revision
+
+                        if get_revision(mem.get("result")) > get_revision(status.get("result")):
+                            status["result"] = mem.get("result")
                     JOB_STATUSES[job_id] = status
                 return status
             finally:
@@ -790,6 +981,12 @@ def _row_to_status(row, *, include_result: bool = True) -> Dict[str, Any]:
     }
     if row.user_id is not None:
         status["user_id"] = row.user_id
+    ot = getattr(row, "owner_type", None)
+    oid = getattr(row, "owner_id", None)
+    if ot:
+        status["owner_type"] = ot
+    if oid:
+        status["owner_id"] = oid
     if include_result and row.result_json is not None:
         status["result"] = row.result_json
     if include_result and row.error_detail:
@@ -872,13 +1069,12 @@ def cancel_job(job_id: str, *, user_id: Optional[int] = None) -> Optional[Dict[s
     Mark a pending/processing job cancelled so the worker can free the slot.
 
     Already-terminal jobs are returned unchanged (idempotent).
+    Ownership must be enforced by the API (assert_document_owner_for) before call.
     """
+    _ = user_id
     current = get_job(job_id)
     if not current:
         return None
-    if user_id is not None and current.get("user_id") is not None:
-        if int(current["user_id"]) != int(user_id):
-            raise PermissionError("Not the job owner")
 
     status = str(current.get("status") or "")
     if status in (
@@ -902,24 +1098,30 @@ def cancel_job(job_id: str, *, user_id: Optional[int] = None) -> Optional[Dict[s
     )
 
 
-def list_jobs_for_user(
-    user_id: int,
+def list_jobs_for_owner(
     *,
+    owner_type: str,
+    owner_id: str,
+    user_id: Optional[int] = None,
     limit: int = 50,
     include_terminal: bool = True,
     include_result: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Persistent job history for the signed-in user (all sessions).
+    """List jobs for a universal Owner (user or guest).
 
-    By default skips loading ``result_json`` / heavy payload columns so sidebar
-    polls stay cheap. Pass ``include_result=True`` only when the full payload
-    is required.
+    Always filters by owner_type AND owner_id. ``user_id`` is ignored for filtering
+    (kept for call-site compatibility).
     """
+    _ = user_id
+    if not owner_type or not owner_id:
+        return []
+
     if not _db_enabled():
-        # Fallback: in-memory only
         out = []
         for jid, st in JOB_STATUSES.items():
-            if st.get("user_id") is not None and int(st["user_id"]) != int(user_id):
+            if str(st.get("owner_type") or "") != str(owner_type):
+                continue
+            if str(st.get("owner_id") or "") != str(owner_id):
                 continue
             if not include_terminal and str(st.get("status")) in (
                 job_status_mod.STATUS_COMPLETE,
@@ -943,7 +1145,10 @@ def list_jobs_for_user(
 
     db = get_session()
     try:
-        q = select(JobModel).where(JobModel.user_id == int(user_id))
+        q = select(JobModel).where(
+            JobModel.owner_type == str(owner_type),
+            JobModel.owner_id == str(owner_id),
+        )
         if not include_terminal:
             q = q.where(
                 JobModel.status.in_(
@@ -958,6 +1163,8 @@ def list_jobs_for_user(
                 load_only(
                     JobModel.id,
                     JobModel.user_id,
+                    JobModel.owner_type,
+                    JobModel.owner_id,
                     JobModel.status,
                     JobModel.progress,
                     JobModel.message,
@@ -980,17 +1187,25 @@ def list_jobs_for_user(
         db.close()
 
 
-def queue_snapshot_for_user(user_id: int) -> Dict[str, Any]:
-    """Worker occupancy + this user's active/queued jobs (for live UI)."""
+def queue_snapshot_for_owner(
+    *,
+    owner_type: str,
+    owner_id: str,
+    user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Worker occupancy + this Owner's active/queued jobs (for live UI)."""
+    _ = user_id
     workers = list_worker_heartbeats()
     alive = [w for w in workers if w.get("alive")]
-    active = list_jobs_for_user(user_id, limit=30, include_terminal=False)
-    # Also surface any processing job claimed by a live worker (even other users' —
-    # only show filename-safe occupancy flag, not others' content)
+    active = list_jobs_for_owner(
+        owner_type=owner_type,
+        owner_id=owner_id,
+        limit=30,
+        include_terminal=False,
+    )
     busy_workers = []
     for w in alive:
         meta = w.get("meta") if isinstance(w.get("meta"), dict) else {}
-        # meta may use meta_json key depending on serializer
         if not meta:
             meta = w.get("meta_json") if isinstance(w.get("meta_json"), dict) else {}
         cur = meta.get("current_job_id") if isinstance(meta, dict) else None
@@ -999,24 +1214,47 @@ def queue_snapshot_for_user(user_id: int) -> Dict[str, Any]:
                 "worker_id": w.get("worker_id"),
                 "status": w.get("status"),
                 "alive": True,
-                "current_job_id": cur,
                 "busy": bool(cur) or str(w.get("status") or "") == "busy",
             }
         )
     return {
         "alive_workers": len(alive),
         "workers": busy_workers,
-        "worker_busy": any(b.get("busy") for b in busy_workers) or any(
-            str(j.get("status")) == job_status_mod.STATUS_PROCESSING for j in active
+        "worker_busy": any(b.get("busy") for b in busy_workers),
+        "queued_count": sum(1 for j in active if j.get("status") == job_status_mod.STATUS_PENDING),
+        "processing_count": sum(
+            1 for j in active if j.get("status") == job_status_mod.STATUS_PROCESSING
         ),
         "active_jobs": active,
-        "queued_count": sum(
-            1 for j in active if str(j.get("status")) == job_status_mod.STATUS_PENDING
-        ),
-        "processing_count": sum(
-            1 for j in active if str(j.get("status")) == job_status_mod.STATUS_PROCESSING
-        ),
     }
+
+
+def retain_only_latest_job_for_owner(
+    *,
+    owner_type: str,
+    owner_id: str,
+    keep_job_id: str,
+    user_id: Optional[int] = None,
+) -> int:
+    """Portfolio retention for an Owner — purge older jobs by owner_type+owner_id."""
+    _ = user_id
+    jobs = list_jobs_for_owner(
+        owner_type=owner_type,
+        owner_id=owner_id,
+        limit=200,
+        include_terminal=True,
+    )
+    purged = 0
+    for j in jobs:
+        jid = j.get("job_id") or j.get("id")
+        if not jid or str(jid) == str(keep_job_id):
+            continue
+        try:
+            purge_job_completely(str(jid))
+            purged += 1
+        except Exception as e:
+            log.warning("retain owner purge %s: %s", jid, e)
+    return purged
 
 
 def _persist(job_id: str, current: Dict[str, Any], fields: Dict[str, Any]) -> None:
@@ -1067,8 +1305,8 @@ def _persist(job_id: str, current: Dict[str, Any], fields: Dict[str, Any]) -> No
                 row.message = current.get("message")
         if "understanding" in current:
             row.understanding = current.get("understanding")
-        if "result" in current:
-            row.result_json = current.get("result")
+        # result_json is NEVER written here — only via cas_persist_result / update_result.
+        # Silent re-persist of snapshot.result caused rich→stub lost updates.
         if "error_detail" in current:
             row.error_detail = current.get("error_detail")
         if "filename" in current:
@@ -1087,6 +1325,15 @@ def _persist(job_id: str, current: Dict[str, Any], fields: Dict[str, Any]) -> No
             row.user_id = int(current["user_id"])
         elif "user_id" in fields and fields["user_id"] is not None:
             row.user_id = int(fields["user_id"])
+
+        for key in ("owner_type", "owner_id"):
+            if key in current and current[key] is not None:
+                setattr(row, key, current[key])
+            elif key in fields and fields[key] is not None:
+                setattr(row, key, fields[key])
+            elif key == "owner_type" and getattr(row, "owner_type", None) is None and row.user_id is not None:
+                row.owner_type = "user"
+                row.owner_id = str(row.user_id)
 
         for col in ("claimed_at", "claimed_by", "available_at", "heartbeat_at"):
             if col in fields:
@@ -1172,63 +1419,21 @@ def purge_job_completely(job_id: str, *, user_id: Optional[int] = None) -> bool:
     """
     Cancel if active, delete document/RAG artifacts, then remove the job row.
     Job id == document id in this product.
+
+    Ownership must be enforced by the caller (Owner-filtered list or API assert).
     """
+    _ = user_id
     current = get_job(job_id)
     if current is None:
-        # Still try artifact cleanup (orphans)
         _purge_document_artifacts(job_id)
         return delete_job_record(job_id)
-
-    if user_id is not None and current.get("user_id") is not None:
-        if int(current["user_id"]) != int(user_id):
-            raise PermissionError("Not the job owner")
 
     status = str(current.get("status") or "")
     if status in (job_status_mod.STATUS_PENDING, job_status_mod.STATUS_PROCESSING):
         try:
-            cancel_job(job_id, user_id=user_id)
+            cancel_job(job_id)
         except Exception as e:
             log.warning("Cancel before purge failed for %s: %s", job_id, e)
 
     _purge_document_artifacts(job_id)
     return delete_job_record(job_id)
-
-
-def retain_only_latest_job(
-    user_id: int,
-    *,
-    keep_job_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Portfolio / single-slot retention: keep only the newest job for this user.
-    Deletes older jobs and their document/RAG data.
-    """
-    jobs = list_jobs_for_user(user_id, limit=200, include_terminal=True)
-    if not jobs:
-        return {"kept": None, "purged": [], "count_before": 0}
-
-    if keep_job_id:
-        keep = str(keep_job_id)
-    else:
-        keep = str(jobs[0].get("job_id") or "")
-
-    purged: list = []
-    for j in jobs:
-        jid = str(j.get("job_id") or "")
-        if not jid or jid == keep:
-            continue
-        try:
-            purge_job_completely(jid, user_id=user_id)
-            purged.append(jid)
-        except PermissionError:
-            continue
-        except Exception as e:
-            log.warning("Failed to purge older job %s: %s", jid, e)
-
-    log.info(
-        "retain_only_latest_job user=%s keep=%s purged=%s",
-        user_id,
-        keep,
-        len(purged),
-    )
-    return {"kept": keep or None, "purged": purged, "count_before": len(jobs)}

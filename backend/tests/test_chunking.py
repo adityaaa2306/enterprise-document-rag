@@ -134,7 +134,7 @@ def test_flag_defaults():
     assert hasattr(settings, "CHUNK_MAX_TOKENS")
     assert hasattr(settings, "CHUNK_SIM_THRESHOLD")
     assert hasattr(settings, "CHUNK_MAX_COUNT")
-    assert settings.CHUNK_MAX_COUNT <= 128
+    assert settings.CHUNK_MAX_COUNT >= 512
     assert settings.CHUNK_MAX_TOKENS >= 512
 
 

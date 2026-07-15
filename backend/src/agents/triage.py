@@ -154,7 +154,8 @@ def _texts_to_chunks(texts: List[str], document_id: str, *, source: str) -> List
     every Title-Case line was the root cause of 200+ false sections.
     """
     chunks: List[Chunk] = []
-    for part in texts[:200]:
+    # No hardcoded page/block cap here — CHUNK_MAX_COUNT applies at adaptive chunking.
+    for part in texts:
         content = (part or "").strip()
         if not content:
             continue

@@ -9,11 +9,13 @@ import { Button } from "@/components/ui/button"
 import { API_BASE_URL } from "@/config"
 import { apiLogout } from "@/lib/api"
 import { useCurrentUser } from "@/hooks/use-current-user"
+import { clearGuestSessionLocal } from "@/lib/guest-session"
 import { CheckCircle2, XCircle, Server, User, LogOut, Mail } from "lucide-react"
+import Link from "next/link"
 
 export default function SettingsPage() {
   const router = useRouter()
-  const { user, loading: userLoading } = useCurrentUser()
+  const { user, guest, isGuest, loading: userLoading } = useCurrentUser()
   const [apiOk, setApiOk] = useState<boolean | null>(null)
   const [apiDetail, setApiDetail] = useState<string>("")
   const [loggingOut, setLoggingOut] = useState(false)
@@ -45,6 +47,11 @@ export default function SettingsPage() {
   const handleLogout = async () => {
     setLoggingOut(true)
     try {
+      if (isGuest) {
+        clearGuestSessionLocal()
+        router.push("/")
+        return
+      }
       await apiLogout(true)
       router.push("/login")
     } finally {
@@ -70,30 +77,46 @@ export default function SettingsPage() {
                 <div className="min-w-0 flex-1">
                   <h2 className="font-medium mb-1">Account</h2>
                   <p className="text-sm text-muted-foreground">
-                    Your signed-in email for this browser session.
+                    {isGuest
+                      ? "You are in Demo Mode. Sign in to persist history and manage an account."
+                      : "Your signed-in email for this browser session."}
                   </p>
                 </div>
               </div>
 
               <div className="pt-3 border-t border-border space-y-4">
-                <div className="rounded-lg bg-muted/40 border border-border px-4 py-3 space-y-1">
-                  <p className="text-xs text-muted-foreground">Email</p>
-                  {userLoading ? (
-                    <p className="text-sm text-muted-foreground">Loading account…</p>
-                  ) : (
-                    <div className="flex items-center gap-2">
-                      <Mail className="w-4 h-4 text-muted-foreground shrink-0" />
-                      <span className="break-all font-medium text-foreground">
-                        {user?.email || "Not signed in"}
-                      </span>
-                    </div>
-                  )}
-                  {user?.full_name ? (
-                    <p className="text-sm text-muted-foreground pl-6 pt-1">
-                      {user.full_name}
+                {isGuest ? (
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 space-y-2">
+                    <p className="text-sm font-medium text-amber-50">
+                      Guest · {guest?.anonymous_name || "Demo session"}
                     </p>
-                  ) : null}
-                </div>
+                    <p className="text-xs text-amber-100/70">
+                      Account settings require sign-in. Upgrading transfers this session’s work to your account.
+                    </p>
+                    <Button asChild className="mt-1">
+                      <Link href="/login?next=/settings">Sign in to upgrade</Link>
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="rounded-lg bg-muted/40 border border-border px-4 py-3 space-y-1">
+                    <p className="text-xs text-muted-foreground">Email</p>
+                    {userLoading ? (
+                      <p className="text-sm text-muted-foreground">Loading account…</p>
+                    ) : (
+                      <div className="flex items-center gap-2">
+                        <Mail className="w-4 h-4 text-muted-foreground shrink-0" />
+                        <span className="break-all font-medium text-foreground">
+                          {user?.email || "Not signed in"}
+                        </span>
+                      </div>
+                    )}
+                    {user?.full_name ? (
+                      <p className="text-sm text-muted-foreground pl-6 pt-1">
+                        {user.full_name}
+                      </p>
+                    ) : null}
+                  </div>
+                )}
 
                 <Button
                   type="button"
@@ -103,7 +126,13 @@ export default function SettingsPage() {
                   className="w-full sm:w-auto border-border text-destructive hover:text-destructive hover:bg-destructive/10"
                 >
                   <LogOut className="w-4 h-4" />
-                  {loggingOut ? "Signing out…" : "Log out"}
+                  {loggingOut
+                    ? isGuest
+                      ? "Ending…"
+                      : "Signing out…"
+                    : isGuest
+                      ? "End demo"
+                      : "Log out"}
                 </Button>
               </div>
             </section>

@@ -127,13 +127,7 @@ def build_processing_insights(
         "policy_version": decision.get("policy_version"),
         "min_tier": decision.get("min_tier") or cre.get("min_tier"),
         # Adaptive pipeline extras
-        "routing_distribution": dist
-        or {
-            "light_pct": None,
-            "medium_pct": None,
-            "heavy_pct": None,
-            "escalated_pct": None,
-        },
+        "routing_distribution": dist if dist else {},
         "validation_pass_rate": float(pass_rate) if pass_rate is not None else None,
         "average_confidence": float(avg_conf) if avg_conf is not None else None,
         "average_semantic_similarity": float(avg_sem) if avg_sem is not None else None,
@@ -154,7 +148,24 @@ def build_processing_insights(
         "document_structure_tree": tmeta.get("document_structure_tree") or [],
         "structure_diagnostics": tmeta.get("structure_diagnostics") or {},
         "pipeline_intelligence": intel,
-        "document_profile": intel.get("capability_profile") or {},
+        "document_profile": (
+            lambda profile: (
+                profile
+                if not profile
+                else {
+                    **profile,
+                    # Frontend CompactJobMetrics reads profile.complexity
+                    "complexity": profile.get("complexity")
+                    or profile.get("complexity_class"),
+                    "document_type": profile.get("document_type")
+                    or decision.get("document_type"),
+                }
+            )
+        )(dict(intel.get("capability_profile") or {})),
         "processing_strategy": intel.get("strategy") or {},
         "intelligence_report": intel.get("report") or {},
+        # Task 7 / 10 — additive DAG rollups & perf
+        "carbon_rollups": (compile_meta or {}).get("carbon_rollups") or {},
+        "perf_metrics": (compile_meta or {}).get("perf_metrics") or {},
+        "dag_nodes_sample": list(((compile_meta or {}).get("dag_nodes") or {}).keys())[:40],
     }

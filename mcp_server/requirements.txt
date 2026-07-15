@@ -1,0 +1,4 @@
+# Architecture Intelligence MCP (install into backend/.venv or a dedicated venv)
+mcp[cli]>=1.0.0
+networkx>=3.0
+rapidfuzz>=3.0

@@ -6,10 +6,12 @@ frontend/craco.config.js
 frontend/jsconfig.json
 frontend/README.md
 frontend/tailwind.config.js
-oolala
-forensics
+archive
+mcp_server
+scripts
 *.pdf
 *.sqlite
 .vercel
 backend
+graphify-out
 carbon-router

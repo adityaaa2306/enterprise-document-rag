@@ -1,8 +1,8 @@
 "use client"
 
-import Link from "next/link";
 import { motion } from "framer-motion";
 import { ArrowUpRight } from "lucide-react";
+import { LiveDemoLink } from "@/components/live-demo-link";
 
 export default function DashboardPreview() {
   return (
@@ -18,14 +18,13 @@ export default function DashboardPreview() {
             </h2>
           </div>
           <div className="lg:col-span-5 flex items-end justify-start lg:justify-end">
-            <Link
-              href="/new-job"
+            <LiveDemoLink
               data-testid="dashboard-cta"
               className="group inline-flex items-center gap-2 bg-emerald-500 text-black px-5 py-3 font-mono text-[11px] uppercase tracking-[0.18em] hover:bg-emerald-400 transition-colors emerald-glow"
             >
               View live demo
               <ArrowUpRight className="w-3.5 h-3.5 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" strokeWidth={2} />
-            </Link>
+            </LiveDemoLink>
           </div>
         </div>
 

@@ -56,10 +56,22 @@ def is_job_ready_for_result(status_dict: Optional[Dict[str, Any]]) -> bool:
     """
     True when ``/job-result`` may return the SummaryResponse payload.
 
-    Requires canonical complete status AND a ``result`` object.
+    Requires a ``result`` object with summary content. Prefer canonical
+    ``complete`` status, but also accept a durable result when the status
+    string lagged (stale in-memory pending/processing).
     """
     if not status_dict:
         return False
-    if not is_job_complete(status_dict.get("status")):
+    result = status_dict.get("result")
+    if not isinstance(result, dict):
         return False
-    return isinstance(status_dict.get("result"), dict)
+    has_summary = bool(
+        (result.get("final_summary") or "").strip()
+        or result.get("summary_ready")
+    )
+    if not has_summary:
+        return False
+    if is_job_complete(status_dict.get("status")):
+        return True
+    # Lagging status with a real summary payload — still serve the result.
+    return True

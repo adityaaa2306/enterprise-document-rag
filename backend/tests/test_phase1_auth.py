@@ -104,7 +104,13 @@ def test_ownership_isolation(client):
     a_id = client.get("/auth/me", headers={"Authorization": f"Bearer {a['access_token']}"}).json()["id"]
     storage.ensure_document_owner(doc_id, int(a_id))
     job_store.upsert_job(
-        doc_id, status="complete", progress=100, message="done", user_id=int(a_id)
+        doc_id,
+        status="complete",
+        progress=100,
+        message="done",
+        user_id=int(a_id),
+        owner_type="user",
+        owner_id=str(a_id),
     )
 
     ra = client.get("/documents", headers={"Authorization": f"Bearer {a['access_token']}"})

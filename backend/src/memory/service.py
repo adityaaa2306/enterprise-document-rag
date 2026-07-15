@@ -191,7 +191,14 @@ class MemoryService:
             log.warning(f"Load conversation failed: {e}")
             return None
 
-    def save_conversation(self, state: ConversationState, *, user_id: Optional[int] = None) -> None:
+    def save_conversation(
+        self,
+        state: ConversationState,
+        *,
+        owner_type: str,
+        owner_id: str,
+        user_id: Optional[int] = None,
+    ) -> None:
         state.updated_at = time.time()
         if getattr(settings, "PERSIST_CONVERSATIONS_TO_DB", True):
             try:
@@ -201,6 +208,8 @@ class MemoryService:
                     state.conversation_id,
                     state.document_id,
                     [t.to_dict() for t in state.turns],
+                    owner_type=owner_type,
+                    owner_id=owner_id,
                     user_id=user_id,
                     created_at=state.created_at,
                 )
@@ -211,9 +220,12 @@ class MemoryService:
 
         path = _conv_path(state.conversation_id)
         tmp = path + ".tmp"
+        payload = state.to_dict()
+        payload["owner_type"] = owner_type
+        payload["owner_id"] = owner_id
         with _lock:
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(state.to_dict(), f)
+                json.dump(payload, f)
             os.replace(tmp, path)
 
     def delete_conversation(self, conversation_id: str) -> None:
@@ -236,6 +248,8 @@ class MemoryService:
         document_id: str,
         conversation_id: Optional[str] = None,
         *,
+        owner_type: str,
+        owner_id: str,
         user_id: Optional[int] = None,
     ) -> ConversationState:
         cid = conversation_id or str(uuid.uuid4())
@@ -243,7 +257,9 @@ class MemoryService:
         if existing and existing.document_id == document_id:
             return existing
         state = ConversationState(conversation_id=cid, document_id=document_id)
-        self.save_conversation(state, user_id=user_id)
+        self.save_conversation(
+            state, owner_type=owner_type, owner_id=owner_id, user_id=user_id
+        )
         return state
 
     def append_turn(
@@ -254,6 +270,8 @@ class MemoryService:
         *,
         entities: Optional[List[str]] = None,
         meta: Optional[Dict[str, Any]] = None,
+        owner_type: str,
+        owner_id: str,
         user_id: Optional[int] = None,
     ) -> Optional[ConversationState]:
         state = self.get_conversation(conversation_id)
@@ -271,7 +289,9 @@ class MemoryService:
         max_turns = int(getattr(settings, "CONVERSATION_MAX_TURNS", 40) or 40)
         if len(state.turns) > max_turns:
             state.turns = state.turns[-max_turns:]
-        self.save_conversation(state, user_id=user_id)
+        self.save_conversation(
+            state, owner_type=owner_type, owner_id=owner_id, user_id=user_id
+        )
         return state
 
     def prior_entity_resolutions(self, conversation_id: str) -> List[str]:

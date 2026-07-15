@@ -53,6 +53,8 @@ export type QueueSnapshot = {
 type Props = {
   currentJobId?: string | null
   onSelectJob?: (jobId: string) => void
+  /** Also refresh Results panel result store (same source of truth as polling). */
+  onRefreshResults?: () => void | Promise<void>
   /** Poll interval while a job is pending/processing (default 2.5s). */
   pollMs?: number
   /** Poll interval when worker is idle and jobs are terminal (default 30s). */
@@ -86,6 +88,7 @@ function statusTone(status: string) {
 export function JobQueuePanel({
   currentJobId,
   onSelectJob,
+  onRefreshResults,
   pollMs = ACTIVE_POLL_MS,
   idlePollMs = IDLE_POLL_MS,
   autoSelectLatest = false,
@@ -177,15 +180,15 @@ export function JobQueuePanel({
     }
 
     const onVisibility = () => {
-      if (document.visibilityState === "visible" && !cancelled) {
+      if (document.visibilityState === "visible" && !cancelled && !deferPolling) {
         if (timer) clearTimeout(timer)
         tick()
       }
     }
 
-    // When Results is loading job data, wait before competing for Neon/API.
+    // Defer initial poll during upload / Results ownership so Neon isn't contended.
     if (deferPolling) {
-      timer = setTimeout(tick, 2500)
+      timer = setTimeout(tick, Math.max(idlePollMs, 20000))
     } else {
       tick()
     }
@@ -256,7 +259,13 @@ export function JobQueuePanel({
             size="sm"
             variant="outline"
             className="gap-1 bg-transparent"
-            onClick={() => refresh()}
+            onClick={() => {
+              void (async () => {
+                await refresh()
+                // Same fetchResult path as automatic polling — one source of truth.
+                if (onRefreshResults) await onRefreshResults()
+              })()
+            }}
           >
             <RefreshCw className="w-3.5 h-3.5" />
             Refresh

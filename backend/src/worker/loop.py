@@ -124,6 +124,7 @@ def run_worker_forever(
     last_hb = 0.0
     last_reclaim = 0.0
     shutdown_deadline: Optional[float] = None
+    consecutive_errors = 0
 
     try:
         while True:
@@ -150,16 +151,30 @@ def run_worker_forever(
                 time.sleep(min(0.5, poll))
                 continue
 
-            now = time.monotonic()
-            if now - last_hb >= hb_every:
-                job_store.upsert_worker_heartbeat(wid, status="idle")
-                last_hb = now
+            try:
+                now = time.monotonic()
+                if now - last_hb >= hb_every:
+                    job_store.upsert_worker_heartbeat(wid, status="idle")
+                    last_hb = now
 
-            if now - last_reclaim >= reclaim_every:
-                job_store.reclaim_stale_jobs()
-                last_reclaim = now
+                if now - last_reclaim >= reclaim_every:
+                    job_store.reclaim_stale_jobs()
+                    last_reclaim = now
 
-            claimed = job_store.claim_next_job(wid)
+                claimed = job_store.claim_next_job(wid)
+            except Exception as e:
+                consecutive_errors += 1
+                backoff = min(60.0, poll * max(1, consecutive_errors))
+                log.error(
+                    "Worker %s poll/claim failed (will retry in %.1fs): %s",
+                    wid,
+                    backoff,
+                    e,
+                )
+                _shutdown.wait(timeout=backoff)
+                continue
+
+            consecutive_errors = 0
             if claimed:
                 if _shutdown.is_set():
                     # Extremely narrow race: release back to pending
@@ -167,23 +182,29 @@ def run_worker_forever(
 
                     jid = claimed["job_id"]
                     log.info("Shutdown in progress — releasing freshly claimed job %s", jid)
-                    job_store.upsert_job(
-                        jid,
-                        status=job_status_mod.STATUS_PENDING,
-                        claimed_by=None,
-                        claimed_at=None,
-                        heartbeat_at=None,
-                        message="Released on worker shutdown",
-                        available_at=job_store._now(),
-                        progress=0.0,
-                    )
+                    try:
+                        job_store.upsert_job(
+                            jid,
+                            status=job_status_mod.STATUS_PENDING,
+                            claimed_by=None,
+                            claimed_at=None,
+                            heartbeat_at=None,
+                            message="Released on worker shutdown",
+                            available_at=job_store._now(),
+                            progress=0.0,
+                        )
+                    except Exception as e:
+                        log.warning("Failed to release claim on shutdown: %s", e)
                     break
 
                 jid = claimed["job_id"]
                 log.info("Claimed job %s (attempt=%s)", jid, claimed.get("attempt_count"))
-                job_store.upsert_worker_heartbeat(
-                    wid, status="busy", meta={"current_job_id": jid}
-                )
+                try:
+                    job_store.upsert_worker_heartbeat(
+                        wid, status="busy", meta={"current_job_id": jid}
+                    )
+                except Exception as e:
+                    log.warning("Busy heartbeat failed: %s", e)
                 _busy.set()
                 try:
                     process_claimed_job(claimed, worker_id=wid)
@@ -191,7 +212,10 @@ def run_worker_forever(
                     log.exception("Job %s failed in worker: %s", jid, e)
                 finally:
                     _busy.clear()
-                    job_store.upsert_worker_heartbeat(wid, status="idle", meta={})
+                    try:
+                        job_store.upsert_worker_heartbeat(wid, status="idle", meta={})
+                    except Exception as e:
+                        log.warning("Idle heartbeat failed: %s", e)
                     last_hb = time.monotonic()
                 if once or _shutdown.is_set():
                     return

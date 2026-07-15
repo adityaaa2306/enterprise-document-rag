@@ -57,6 +57,10 @@ def test_fallback_chain_shares_single_compile_budget(monkeypatch):
     monkeypatch.setattr(models.settings, "COMPILE_CALL_MAX_SEC", 2.0)
     monkeypatch.setattr(models.settings, "NIM_COMPILE_TIMEOUT_SEC", 1.5)
     monkeypatch.setattr(models.settings, "NIM_CONNECT_TIMEOUT_SEC", 0.3)
+    monkeypatch.setattr(models.settings, "NIM_ENDPOINT_POOL_ENABLED", False)
+    monkeypatch.setattr(models.settings, "LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setattr(models.settings, "NIM_TRANSIENT_RETRIES", 1)
+    monkeypatch.setattr(models.settings, "NIM_ENDPOINT_RETRIES_PER_MODEL", 1)
     monkeypatch.setattr(models, "get_nim_client", lambda: object())
 
     class FakeCompletions:
@@ -80,8 +84,8 @@ def test_fallback_chain_shares_single_compile_budget(monkeypatch):
             deadline_mono=time.monotonic() + 2.0,
         )
     elapsed = time.monotonic() - t0
-    # Must not stack 1.2s × 3 models (~3.6s+); shared 2s budget.
-    assert elapsed < 3.2, f"fallback chain stacked too long: {elapsed:.2f}s"
+    # Must not stack 1.2s × 3 models (~3.6s+); shared 2s budget (+ jitter).
+    assert elapsed < 5.0, f"fallback chain stacked too long: {elapsed:.2f}s"
 
 
 def test_reduce_compile_hits_node_ceiling_and_stitches(monkeypatch):

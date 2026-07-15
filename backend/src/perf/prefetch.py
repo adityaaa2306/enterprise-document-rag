@@ -17,6 +17,34 @@ _lock = threading.Lock()
 # job_id → Future[List[Optional[List[float]]]]
 _PENDING: Dict[str, Future] = {}
 _EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="embed-prefetch")
+_GRID_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grid-prefetch")
+_GRID_FUTURE: Optional[Future] = None
+
+
+def _fetch_grid_intensity() -> Dict[str, Any]:
+    from src.carbon.electricity_maps import fetch_grid_carbon_intensity
+
+    return fetch_grid_carbon_intensity() or {}
+
+
+def start_grid_intensity_prefetch() -> None:
+    """Warm Electricity Maps TTL cache in the background (safe to call often)."""
+    global _GRID_FUTURE
+    with _lock:
+        if _GRID_FUTURE is not None and not _GRID_FUTURE.done():
+            return
+        _GRID_FUTURE = _GRID_EXECUTOR.submit(_fetch_grid_intensity)
+    log.debug("grid intensity prefetch started")
+
+
+def get_grid_intensity_prefetch(timeout_sec: float = 2.0) -> Optional[Dict[str, Any]]:
+    fut = _GRID_FUTURE
+    if fut is None:
+        return None
+    try:
+        return fut.result(timeout=timeout_sec)
+    except Exception:
+        return None
 
 
 def _embed_chunk_texts(texts: List[str]) -> List[Optional[List[float]]]:
@@ -39,6 +67,12 @@ def _embed_chunk_texts(texts: List[str]) -> List[Optional[List[float]]]:
 
 def start_embed_prefetch(job_id: str, chunks: List[Any]) -> None:
     """Kick off non-blocking embed of chunk source texts."""
+    with _lock:
+        existing = _PENDING.get(job_id)
+        if existing is not None and not existing.done():
+            # Already prefetching for this job — do not cancel/restart.
+            return
+
     texts: List[str] = []
     for c in chunks or []:
         if hasattr(c, "content"):
@@ -49,9 +83,9 @@ def start_embed_prefetch(job_id: str, chunks: List[Any]) -> None:
             texts.append(str(c or ""))
 
     with _lock:
-        old = _PENDING.pop(job_id, None)
-        if old is not None and not old.done():
-            old.cancel()
+        existing = _PENDING.get(job_id)
+        if existing is not None and not existing.done():
+            return
         fut = _EXECUTOR.submit(_embed_chunk_texts, texts)
         _PENDING[job_id] = fut
     log.info("embed prefetch started job_id=%s chunks=%s", job_id, len(texts))

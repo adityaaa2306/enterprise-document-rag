@@ -179,11 +179,30 @@ def store_chunks(
         if nim_ready and to_embed_indices:
             texts_to_embed = [normalized[i][2] for i in to_embed_indices]
             try:
+                import time as _time
+
+                _t_emb = _time.perf_counter()
                 vectors = models.embed_texts(texts_to_embed)
+                log.info(
+                    "[critical-path] sync_embed document=%s texts=%s ms=%.1f",
+                    document_id,
+                    len(texts_to_embed),
+                    (_time.perf_counter() - _t_emb) * 1000.0,
+                )
                 for pos, vec in zip(to_embed_indices, vectors):
                     embeddings_by_pos[pos] = vec
             except Exception as e:
                 log.error(f"NIM embedding failed during store: {e}")
+        elif to_embed_indices:
+            log.info(
+                "[critical-path] sync_embed skipped (nim not ready) missing=%s",
+                len(to_embed_indices),
+            )
+        else:
+            log.info(
+                "[critical-path] sync_embed skipped (all prefetched) chunks=%s",
+                len(normalized),
+            )
 
         # Batch SQL merges + single (or few) Chroma upserts
         chroma_ids: List[str] = []
@@ -417,6 +436,8 @@ def store_document_data(
         carbon_meta = {}
 
     # Prefer explicit user_id; else inherit from job row if present
+    owner_type = None
+    owner_id = None
     if user_id is None:
         try:
             from src.db import jobs as job_store
@@ -424,8 +445,13 @@ def store_document_data(
             job = job_store.get_job(document_id) or {}
             if job.get("user_id") is not None:
                 user_id = int(job["user_id"])
+            owner_type = job.get("owner_type")
+            owner_id = job.get("owner_id")
         except Exception:
             pass
+    if not owner_type and user_id is not None:
+        owner_type = "user"
+        owner_id = str(user_id)
 
     routing_payload = routing_decision if isinstance(routing_decision, dict) else None
     selected_model = routing_payload.get("selected_model") if routing_payload else None
@@ -451,6 +477,9 @@ def store_document_data(
                 doc.baseline_cost_gco2e = float(carbon_meta.get("baseline_cost_gco2e") or 0.0)
             if user_id is not None and doc.user_id is None:
                 doc.user_id = int(user_id)
+            if owner_type and owner_id:
+                doc.owner_type = owner_type
+                doc.owner_id = owner_id
             if routing_payload is not None:
                 doc.routing_json = routing_payload
                 if selected_model is not None:
@@ -462,6 +491,8 @@ def store_document_data(
                 id=document_id,
                 summary=summary,
                 user_id=int(user_id) if user_id is not None else None,
+                owner_type=owner_type,
+                owner_id=owner_id,
                 carbon_saved_grams=float(carbon_meta.get("carbon_saved_grams") or 0.0),
                 processing_time_seconds=float(
                     carbon_meta.get("processing_time_seconds") or 0.0
@@ -498,39 +529,141 @@ def store_document_data(
     return {"status": "ok", "document_id": document_id}
 
 
-def get_document_user_id(document_id: str) -> Optional[int]:
-    """Return owning user_id for a document, or None."""
+def update_document_carbon_meta(
+    job_id: str,
+    summary: str,
+    carbon_meta: Optional[Dict[str, Any]] = None,
+    routing_decision: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Patch carbon + routing on an already-stored document without re-indexing chunks.
+    Functional equivalent of store_document_data(..., chunks=[]) for the finalize stage.
+    """
+    document_id = job_id
+    carbon_meta = carbon_meta or {}
+    routing_payload = routing_decision if isinstance(routing_decision, dict) else None
+    selected_model = routing_payload.get("selected_model") if routing_payload else None
+    crs = routing_payload.get("crs") if routing_payload else None
+
+    db = _session()
+    try:
+        doc = db.get(DocumentModel, document_id)
+        if doc is None:
+            # First-time finalize without a prior store — fall through to full path.
+            db.close()
+            return store_document_data(
+                job_id=job_id,
+                summary=summary,
+                chunks=[],
+                carbon_meta=carbon_meta,
+                routing_decision=routing_decision,
+            )
+        if summary is not None:
+            doc.summary = summary
+        if carbon_meta:
+            doc.carbon_saved_grams = float(carbon_meta.get("carbon_saved_grams") or 0.0)
+            doc.processing_time_seconds = float(
+                carbon_meta.get("processing_time_seconds") or 0.0
+            )
+            doc.total_chunks = int(carbon_meta.get("total_chunks") or 0)
+            doc.efficiency_percent = float(carbon_meta.get("efficiency_percent") or 0.0)
+            doc.actual_cost_gco2e = float(carbon_meta.get("actual_cost_gco2e") or 0.0)
+            doc.baseline_cost_gco2e = float(carbon_meta.get("baseline_cost_gco2e") or 0.0)
+        if routing_payload is not None:
+            doc.routing_json = routing_payload
+            if selected_model is not None:
+                doc.selected_model = selected_model
+            if crs is not None:
+                doc.crs = float(crs)
+        db.commit()
+        log.info("Carbon/routing meta patched for document %s", document_id)
+        return {"status": "ok", "document_id": document_id, "patched": True}
+    except Exception as e:
+        log.error("Failed to patch carbon meta for %s: %s", document_id, e)
+        raise
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def get_document_owner_fields(document_id: str) -> Dict[str, Any]:
+    """PK lookup of owner_type/owner_id/user_id for a document row."""
     try:
         db = _session()
         doc = db.get(DocumentModel, document_id)
-        uid = doc.user_id if doc else None
+        if not doc:
+            db.close()
+            return {}
+        out = {
+            "owner_type": getattr(doc, "owner_type", None),
+            "owner_id": getattr(doc, "owner_id", None),
+            "user_id": doc.user_id,
+        }
         db.close()
-        return int(uid) if uid is not None else None
+        return out
     except Exception as e:
-        log.warning(f"get_document_user_id failed: {e}")
-        return None
+        log.warning(f"get_document_owner_fields failed: {e}")
+        return {}
 
 
-def ensure_document_owner(document_id: str, user_id: int) -> None:
-    """Create a stub document row with ownership if missing (pre-job indexing)."""
+def ensure_document_owner_stamp(
+    document_id: str,
+    *,
+    owner_type: str,
+    owner_id: str,
+    user_id: Optional[int] = None,
+) -> None:
+    """Ensure document row exists with Owner stamps (worker / ingest)."""
     try:
         db = _session()
         doc = db.get(DocumentModel, document_id)
         if doc is None:
-            doc = DocumentModel(id=document_id, summary="", user_id=int(user_id))
+            doc = DocumentModel(
+                id=document_id,
+                summary="",
+                user_id=int(user_id) if user_id is not None else None,
+                owner_type=str(owner_type),
+                owner_id=str(owner_id),
+            )
             db.add(doc)
-        elif doc.user_id is None:
-            doc.user_id = int(user_id)
+        else:
+            doc.owner_type = str(owner_type)
+            doc.owner_id = str(owner_id)
+            if user_id is not None and doc.user_id is None:
+                doc.user_id = int(user_id)
         db.commit()
         db.close()
     except Exception as e:
-        log.warning(f"ensure_document_owner failed: {e}")
+        log.warning(f"ensure_document_owner_stamp failed: {e}")
 
+
+def ensure_document_owner(document_id: str, user_id: int) -> None:
+    """Stamp authenticated user as Owner (owner_type=user, owner_id=str(user_id))."""
+    ensure_document_owner_stamp(
+        document_id,
+        owner_type="user",
+        owner_id=str(int(user_id)),
+        user_id=int(user_id),
+    )
+
+
+def get_document_user_id(document_id: str) -> Optional[int]:
+    """Return identity user_id column for a document, or None (not an ownership filter)."""
+    fields = get_document_owner_fields(document_id)
+    uid = fields.get("user_id")
+    try:
+        return int(uid) if uid is not None else None
+    except (TypeError, ValueError):
+        return None
 
 def save_document_file_metadata(
     document_id: str,
     *,
     user_id: Optional[int] = None,
+    owner_type: Optional[str] = None,
+    owner_id: Optional[str] = None,
     storage_key: Optional[str] = None,
     file_url: Optional[str] = None,
     original_filename: Optional[str] = None,
@@ -546,6 +679,13 @@ def save_document_file_metadata(
             db.add(doc)
         if user_id is not None and doc.user_id is None:
             doc.user_id = int(user_id)
+        if owner_type and owner_id:
+            doc.owner_type = str(owner_type)
+            doc.owner_id = str(owner_id)
+        elif not getattr(doc, "owner_id", None) and user_id is not None:
+            # Stamp Owner from authenticated identity when ingest omits explicit pair
+            doc.owner_type = "user"
+            doc.owner_id = str(user_id)
         if storage_key is not None:
             doc.storage_key = storage_key
         if file_url is not None:
@@ -667,15 +807,25 @@ def delete_document_data(document_id: str):
         log.error(f"Failed to delete document summary: {e}")
 
 
-def list_documents(user_id: Optional[int] = None) -> List[Dict[str, Any]]:
+def list_documents(
+    user_id: Optional[int] = None,
+    *,
+    owner_type: Optional[str] = None,
+    owner_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """
-    List stored documents. When user_id is set, only that user's documents.
+    List stored documents for an Owner. Requires owner_type AND owner_id.
     """
+    _ = user_id
+    if not owner_type or not owner_id:
+        log.warning("list_documents called without owner_type/owner_id")
+        return []
     try:
         db = _session()
-        q = db.query(DocumentModel)
-        if user_id is not None:
-            q = q.filter(DocumentModel.user_id == int(user_id))
+        q = db.query(DocumentModel).filter(
+            DocumentModel.owner_type == str(owner_type),
+            DocumentModel.owner_id == str(owner_id),
+        )
         docs = q.order_by(DocumentModel.saved_at.desc()).all()
         result = []
         for doc in docs:
@@ -695,12 +845,14 @@ def list_documents(user_id: Optional[int] = None) -> List[Dict[str, Any]]:
 def get_dashboard_stats(
     user_id: Optional[int] = None,
     *,
+    owner_type: Optional[str] = None,
+    owner_id: Optional[str] = None,
     range_key: str = "30d",
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Aggregates dashboard analytics (scoped to user_id when provided).
+    Aggregates dashboard analytics for an Owner (owner_type + owner_id required).
 
     Date labels are unique calendar days (YYYY-MM-DD → "Jul 13"), not one row
     per document — which previously caused repeated "Jul 13" tick labels.
@@ -790,11 +942,17 @@ def get_dashboard_stats(
             "efficiency": float(eff),
         }
 
+    _ = user_id
+    if not owner_type or not owner_id:
+        log.warning("get_dashboard_stats called without owner_type/owner_id")
+        return empty
+
     try:
         db = _session()
-        q = db.query(DocumentModel)
-        if user_id is not None:
-            q = q.filter(DocumentModel.user_id == int(user_id))
+        q = db.query(DocumentModel).filter(
+            DocumentModel.owner_type == str(owner_type),
+            DocumentModel.owner_id == str(owner_id),
+        )
         docs = q.all()
 
         now = datetime.now(timezone.utc)

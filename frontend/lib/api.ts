@@ -1,11 +1,17 @@
 /**
- * Authenticated API client for the Green Agentic backend.
- * - Attaches Authorization: Bearer <access_token>
- * - On 401, attempts refresh via /auth/refresh then retries once
- * - Redirects to /login when refresh fails
+ * Authenticated + Guest API client for the Green Agentic backend.
+ *
+ * Auth modes:
+ * - JWT: Authorization: Bearer <access_token>  (credentials omit)
+ * - Guest: X-Guest-Session-Id from sessionStorage (credentials omit)
+ *
+ * Never use credentials: "include" for API calls — CORS_ORIGINS=* cannot
+ * pair with Access-Control-Allow-Credentials, and guest identity is header-based.
  */
 import { API_BASE_URL } from "@/config"
 import { clearCurrentUserCache } from "@/lib/current-user-cache"
+import { getGuestSessionId, isGuestMode } from "@/lib/guest-session"
+import { clearOwnerScopedCaches } from "@/lib/historical-analytics-store"
 
 const ACCESS_KEY = "access_token"
 const REFRESH_KEY = "refresh_token"
@@ -31,6 +37,7 @@ export function clearTokens() {
   localStorage.removeItem(ACCESS_KEY)
   localStorage.removeItem(REFRESH_KEY)
   clearCurrentUserCache()
+  clearOwnerScopedCaches()
 }
 
 let refreshPromise: Promise<boolean> | null = null
@@ -42,7 +49,7 @@ async function refreshAccessToken(): Promise<boolean> {
     const res = await fetch(`${API_BASE_URL}/auth/refresh`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      // Bearer/body auth only — omit credentials so CORS_ORIGINS=* works in prod
+      credentials: "omit",
       body: JSON.stringify({ refresh_token: refresh }),
     })
     if (!res.ok) {
@@ -64,10 +71,12 @@ async function refreshAccessToken(): Promise<boolean> {
 
 function redirectToLogin() {
   if (typeof window === "undefined") return
+  // Guests must never bounce to /login for business routes
+  if (isGuestMode()) return
   const path = window.location.pathname
-  if (path !== "/login" && path !== "/signup") {
-    window.location.href = "/login"
-  }
+  if (path === "/login" || path === "/signup" || path === "/") return
+  const next = encodeURIComponent(path + (window.location.search || ""))
+  window.location.replace(`/login?next=${next}`)
 }
 
 export type ApiFetchOptions = RequestInit & {
@@ -76,17 +85,27 @@ export type ApiFetchOptions = RequestInit & {
 }
 
 /**
- * fetch wrapper with Bearer auth + single refresh retry on 401.
+ * fetch wrapper with Bearer auth + guest header + single refresh retry on 401.
  */
 export async function apiFetch(path: string, options: ApiFetchOptions = {}): Promise<Response> {
   const { skipAuth, headers: initHeaders, ...rest } = options
   const headers = new Headers(initHeaders || {})
 
-  if (!skipAuth) {
-    const token = getAccessToken()
-    if (token) {
-      headers.set("Authorization", `Bearer ${token}`)
+  const token = skipAuth ? null : getAccessToken()
+  let authMode: "jwt" | "guest" | "none" = "none"
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`)
+    authMode = "jwt"
+  } else if (!skipAuth) {
+    const guestId = getGuestSessionId()
+    if (guestId) {
+      headers.set("X-Guest-Session-Id", guestId)
+      authMode = "guest"
     }
+  }
+
+  if (typeof console !== "undefined" && process.env.NODE_ENV === "development") {
+    console.debug(`[API] ${rest.method || "GET"} ${path} auth=${authMode}`)
   }
 
   const url = path.startsWith("http") ? path : `${API_BASE_URL}${path.startsWith("/") ? "" : "/"}${path}`
@@ -94,10 +113,11 @@ export async function apiFetch(path: string, options: ApiFetchOptions = {}): Pro
   let res = await fetch(url, {
     ...rest,
     headers,
-    credentials: rest.credentials ?? "omit",
+    // Always omit credentials — identity is Bearer or X-Guest-Session-Id
+    credentials: "omit",
   })
 
-  if (res.status === 401 && !skipAuth) {
+  if (res.status === 401 && !skipAuth && token) {
     if (!refreshPromise) {
       refreshPromise = refreshAccessToken().finally(() => {
         refreshPromise = null
@@ -105,6 +125,15 @@ export async function apiFetch(path: string, options: ApiFetchOptions = {}): Pro
     }
     const ok = await refreshPromise
     if (!ok) {
+      if (getGuestSessionId()) {
+        const guestHeaders = new Headers(initHeaders || {})
+        guestHeaders.set("X-Guest-Session-Id", getGuestSessionId()!)
+        return fetch(url, {
+          ...rest,
+          headers: guestHeaders,
+          credentials: "omit",
+        })
+      }
       redirectToLogin()
       return res
     }
@@ -116,11 +145,11 @@ export async function apiFetch(path: string, options: ApiFetchOptions = {}): Pro
     res = await fetch(url, {
       ...rest,
       headers: retryHeaders,
-      credentials: rest.credentials ?? "omit",
+      credentials: "omit",
     })
     if (res.status === 401) {
       clearTokens()
-      redirectToLogin()
+      if (!getGuestSessionId()) redirectToLogin()
     }
   }
 

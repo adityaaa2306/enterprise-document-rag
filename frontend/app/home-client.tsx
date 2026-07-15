@@ -45,9 +45,12 @@ function PrefetchCriticalRoutes() {
         : (cb: IdleRequestCallback) =>
             window.setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 0 } as IdleDeadline), 200)
     const id = idle(() => {
+      router.prefetch("/dashboard")
       router.prefetch("/new-job")
       router.prefetch("/login")
-      router.prefetch("/dashboard")
+      router.prefetch("/results")
+      router.prefetch("/settings")
+      router.prefetch("/signup")
     })
     return () => {
       if (typeof window !== "undefined" && "cancelIdleCallback" in window) {

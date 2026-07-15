@@ -40,8 +40,31 @@ wheels/
 # Backend specific
 backend/temp_uploads/
 backend/agentic_db.sqlite
+backend/agentic_db_e2e.sqlite
 backend/local_db/
 agentic_db.sqlite
+*.sqlite
+
+# Generated eval / diagnostics / traces (keep only REPO_* cleanup reports)
+backend/eval_out/**
+!backend/eval_out/REPO_INVENTORY.md
+!backend/eval_out/REPO_CLEANUP_REPORT.md
+
+# Coverage / test caches
+.coverage
+*.coverage
+htmlcov/
+.pytest_cache/
+backend/.pytest_cache/
+coverage/
+.mypy_cache/
+.ruff_cache/
+
+# Vector / retrieval local caches (regenerable)
+**/chroma/
+**/.cache/
+backend/**/bm25*.pkl
+backend/**/*.faiss
 
 # Frontend specific
 frontend/node_modules/
@@ -49,13 +72,23 @@ frontend/.next/
 frontend/out/
 frontend/build/
 frontend/.DS_Store
+frontend/*.tsbuildinfo
+frontend/next-env.d.ts
 
 # Local virtualenvs
 .venv/
 .venv-frontend/
 venv/
+backend/.venv/
 
-# IDE
+# Graphify / architecture graph exports (regenerate locally)
+graphify-out/
+graphify-out-docs-smoke/
+
+# Generated / ephemeral evaluation fixtures
+eval_docs/
+
+# IDE / editor
 .vscode/
 .idea/
 *.swp
@@ -66,10 +99,25 @@ venv/
 .DS_Store
 Thumbs.db
 
-# Logs
+# Logs / profiling
 *.log
 logs/
+*.prof
+*.flamegraph
+
+# Local Vercel / deploy link state
+.vercel/
+frontend/.vercel/
 
 # Test files
 *.test.js
-coverage/
+
+# Temporary scratch
+tmp/
+temp/
+scratch/
+debug/
+draft/
+**/tmp/
+**/temp/
+**/scratch/

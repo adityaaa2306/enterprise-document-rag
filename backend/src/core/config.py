@@ -41,7 +41,13 @@ class Settings(BaseSettings):
     NIM_ENDPOINT_COOLDOWN_SEC: float = 8.0
     NIM_ENDPOINT_RATELIMIT_COOLDOWN_SEC: float = 20.0
     # Hard cap of in-flight HTTP calls per endpoint (capacity-aware scheduler).
-    NIM_ENDPOINT_MAX_CONCURRENT: int = 3
+    # Prefer per-endpoint NIM_ENDPOINT_{i}_MAX_CONCURRENT when set.
+    NIM_ENDPOINT_MAX_CONCURRENT: int = 6
+    NIM_ENDPOINT_1_MAX_CONCURRENT: Optional[int] = None
+    NIM_ENDPOINT_2_MAX_CONCURRENT: Optional[int] = None
+    NIM_ENDPOINT_3_MAX_CONCURRENT: Optional[int] = None
+    NIM_ENDPOINT_4_MAX_CONCURRENT: Optional[int] = None
+    NIM_ENDPOINT_5_MAX_CONCURRENT: Optional[int] = None
     # How long a worker waits for an endpoint slot before re-queueing.
     NIM_ENDPOINT_ACQUIRE_TIMEOUT_SEC: float = 120.0
     NIM_ENDPOINT_1_ROLES: str = "map,compile,embed,any"
@@ -67,11 +73,12 @@ class Settings(BaseSettings):
     REGION_SCHEDULER_PROVIDER: str = "electricity_maps"
     # Soft TTFT: if no first token by this deadline, cancel and try another endpoint.
     NIM_SOFT_TTFT_TIMEOUT_SEC: float = 45.0
-    # Hard per-call wall (also used as NIM_HTTP_TIMEOUT_SEC read timeout).
-    NIM_HARD_TIMEOUT_SEC: float = 90.0
-    # Per-request HTTP timeout for chat/embeddings (prevents infinite "processing")
-    NIM_HTTP_TIMEOUT_SEC: float = 90.0
-    # Per-chunk scheduler hard abort — never wait 390s on one chunk.
+    # Hard per-call HTTP read — MUST be strictly below MAP_CHUNK_HARD_TIMEOUT_SEC
+    # so hung NIM sockets abort before the node wrapper wall.
+    NIM_HARD_TIMEOUT_SEC: float = 75.0
+    # Per-request HTTP timeout for chat/embeddings (connect+read on the client).
+    NIM_HTTP_TIMEOUT_SEC: float = 75.0
+    # Per-chunk scheduler hard abort (wrapper wall above HTTP).
     MAP_CHUNK_HARD_TIMEOUT_SEC: float = 90.0
     # Pull-based capacity scheduler for map/escalate (vs submit-all ThreadPool).
     CAPACITY_SCHEDULER_ENABLED: bool = True
@@ -90,6 +97,34 @@ class Settings(BaseSettings):
     NIM_TRANSIENT_RETRIES: int = 1
     # Same-model retries across different endpoints before model fallback.
     NIM_ENDPOINT_RETRIES_PER_MODEL: int = 2
+    # Global NIM request throttle (token bucket shared by all workers/stages).
+    NIM_RATE_LIMITER_ENABLED: bool = True
+    # Token-bucket ceiling across all endpoints. Sized for multi-key pools;
+    # genuine 429s still trigger backoff via RateLimitBackpressure.
+    NIM_MAX_REQUESTS_PER_MINUTE: float = 180.0
+    # Backoff when 429 / RateLimitBackpressure is requeued at the pool.
+    NIM_RATE_LIMIT_BASE_BACKOFF_SEC: float = 1.5
+    NIM_RATE_LIMIT_MAX_BACKOFF_SEC: float = 45.0
+    # Extra requeue budget for rate-limit backpressure (vs empty-summary retries).
+    NIM_RATE_LIMIT_MAX_REQUEUES: int = 8
+
+    # --- Fallback-chain time slices (shared wall → per-model budgets) ---
+    # Prevents the primary from consuming the entire MAP/COMPILE wall and
+    # starving designated fallbacks. Fractions are position weights (renormalized).
+    CHAIN_SLICE_ENABLED: bool = True
+    MAP_CHAIN_SLICE_FRACTIONS: str = "0.45,0.35,0.20"
+    COMPILE_CHAIN_SLICE_FRACTIONS: str = "0.40,0.35,0.25"
+    CHAIN_SLICE_MIN_SEC: float = 8.0
+    # Compile-only: if primary has not returned by its slice, fire the next
+    # fallback concurrently and take the first success. Trades extra API
+    # cost/carbon for better odds of a true executive summary vs stitch.
+    # Carbon/cost tradeoff: up to ~2× compile NIM spend when hedge fires.
+    COMPILE_HEDGED_FALLBACK_ENABLED: bool = True
+    # Rolling reliability window for soft deprioritization (never hard-ban).
+    MODEL_RELIABILITY_WINDOW: int = 50
+    MODEL_RELIABILITY_SOFT_DEPRIORITIZE: bool = False
+    MODEL_RELIABILITY_TIMEOUT_RATE_THRESHOLD: float = 0.55
+    MODEL_RELIABILITY_MIN_SAMPLES: int = 20
 
     # --- Light tier (chunk summarization) ---
     # llama-3.2-3b timed out 0/4 on NIM free tier (2026-07-13 probe).
@@ -171,14 +206,26 @@ class Settings(BaseSettings):
     # Parallel map summarization workers — hard-capped by endpoint capacity
     # (nim_endpoint_count × NIM_ENDPOINT_MAX_CONCURRENT) in effective_map_max_workers().
     MAP_MAX_WORKERS: int = 12
-    # When API+worker share one process, cap map concurrency so /job-status stays responsive
-    EMBEDDED_MAP_MAX_WORKERS: int = 4
+    # Unified pool size for map + compile DAG nodes (Task 2). Map/compile
+    # effective_* helpers prefer this when set.
+    MAX_PARALLEL_WORKERS: int = 12
+    # When API+worker share one process, cap map concurrency so /job-status stays responsive.
+    # Keep high enough to saturate a multi-endpoint NIM pool (was 3–4 → severe queueing).
+    EMBEDDED_MAP_MAX_WORKERS: int = 12
     # Parallel DAG / hierarchical compile node workers (also capacity-capped)
     COMPILE_MAX_WORKERS: int = 6
+    # Per-node hard timeout (cancel/reassign one node without stalling siblings)
+    COMPILE_NODE_HARD_TIMEOUT_SEC: float = 90.0
+    # LLM provider: openai_compatible (NIM) | ollama
+    LLM_PROVIDER: str = "openai_compatible"
+    OLLAMA_BASE_URL: str = "http://127.0.0.1:11434"
+    OLLAMA_TIMEOUT_SEC: float = 120.0
     # Parallel QVA chunk validation workers (CPU-bound lexical checks)
     VALIDATE_MAX_WORKERS: int = 8
     # DAG hierarchical compile (parallel regional/chapter/executive nodes)
     DAG_COMPILE_ENABLED: bool = True
+    # One continuous DAG executor owns map→QVA escalate→compile (LangGraph thin).
+    UNIFIED_DAG_EXECUTOR_ENABLED: bool = True
     # Soft context window used for 80% prompt-size gating in DAG compile
     COMPILE_CONTEXT_WINDOW_TOKENS: int = 12000
     COMPILE_PROMPT_MAX_CONTEXT_FRAC: float = 0.80
@@ -263,6 +310,8 @@ class Settings(BaseSettings):
     BM25_ASYNC_BUILD: bool = True
     # Feature extraction LLM/embed probe is optional metadata — never abort the job
     FEATURE_EXTRACTION_OPTIONAL: bool = True
+    # Soft wall for optional LLM document classifier (heuristic fallback on timeout).
+    FEATURE_EXTRACTION_LLM_TIMEOUT_SEC: float = 12.0
     # When true, API process starts durable worker as an in-process thread
     # (shared NIM/Chroma memory — required for Render free tier).
     RUN_EMBEDDED_WORKER: bool = False
@@ -299,7 +348,8 @@ class Settings(BaseSettings):
     CHUNK_MIN_TOKENS_BEFORE_SIM_SPLIT: int = 500
     # Soft cap for large docs (500–1000+ pages). Hierarchy handles fan-in;
     # force-cap only when CHUNK_FORCE_CAP is true.
-    CHUNK_MAX_COUNT: int = 512
+    # Soft advisory only — do not block 1200+ page docs unless FORCE_CAP.
+    CHUNK_MAX_COUNT: int = 4096
     CHUNK_FORCE_CAP: bool = False
     # Overlap tokens appended from previous chunk when splitting on max size.
     CHUNK_OVERLAP_TOKENS: int = 40
@@ -456,26 +506,57 @@ class Settings(BaseSettings):
                     n += 1
         return n
 
-    def effective_map_max_workers(self) -> int:
-        """Map concurrency ≤ endpoint capacity (never overload NIM)."""
-        base = max(1, int(self.MAP_MAX_WORKERS or 3))
-        eps = max(1, self.nim_endpoint_count())
-        per = max(1, int(self.NIM_ENDPOINT_MAX_CONCURRENT or 3))
-        capacity = eps * per
+    def _per_endpoint_max_concurrent(self, index: int) -> int:
+        raw = getattr(self, f"NIM_ENDPOINT_{index}_MAX_CONCURRENT", None)
+        if raw is not None:
+            try:
+                return max(1, int(raw))
+            except (TypeError, ValueError):
+                pass
+        return max(1, int(self.NIM_ENDPOINT_MAX_CONCURRENT or 6))
+
+    def effective_nim_capacity(self) -> int:
+        """Sum of per-endpoint max_concurrent across configured NIM keys."""
+        if not bool(getattr(self, "NIM_ENDPOINT_POOL_ENABLED", True)):
+            return self._per_endpoint_max_concurrent(1)
+        total = 0
+        default_per = max(1, int(self.NIM_ENDPOINT_MAX_CONCURRENT or 6))
+        if (self.NVIDIA_API_KEY or "").strip():
+            total += self._per_endpoint_max_concurrent(1)
+        for i in (2, 3, 4, 5):
+            if (getattr(self, f"NIM_ENDPOINT_{i}_API_KEY", None) or "").strip():
+                total += self._per_endpoint_max_concurrent(i)
+        csv = (self.NIM_API_KEYS or "").strip()
+        if csv:
+            for key in csv.split(","):
+                k = key.strip()
+                if k and k != (self.NVIDIA_API_KEY or "").strip():
+                    total += default_per
+        return max(1, total or default_per)
+
+    def effective_parallel_workers(self) -> int:
+        """Unified MAX_PARALLEL_WORKERS capped by NIM endpoint capacity."""
+        base = max(1, int(getattr(self, "MAX_PARALLEL_WORKERS", None) or self.MAP_MAX_WORKERS or 8))
+        capacity = self.effective_nim_capacity()
         scaled = min(base, capacity)
         if bool(self.RUN_EMBEDDED_WORKER):
-            cap = max(1, int(getattr(self, "EMBEDDED_MAP_MAX_WORKERS", 3) or 3))
+            cap = max(1, int(getattr(self, "EMBEDDED_MAP_MAX_WORKERS", 12) or 12))
             return min(scaled, cap)
         return scaled
 
+    def effective_map_max_workers(self) -> int:
+        """Map concurrency ≤ endpoint capacity (never overload NIM)."""
+        return self.effective_parallel_workers()
+
     def effective_compile_max_workers(self) -> int:
-        """Compile concurrency ≤ endpoint capacity; separate from map via roles."""
-        base = max(1, int(self.COMPILE_MAX_WORKERS or 4))
-        eps = max(1, self.nim_endpoint_count())
-        per = max(1, int(self.NIM_ENDPOINT_MAX_CONCURRENT or 3))
-        # Reserve ~1/3 of capacity for compile when pool is shared
-        capacity = max(1, (eps * per + 2) // 3)
-        return min(base, capacity, eps * per)
+        """Compile workers: COMPILE_MAX_WORKERS capped by NIM capacity."""
+        base = max(1, int(getattr(self, "COMPILE_MAX_WORKERS", None) or 6))
+        capacity = self.effective_nim_capacity()
+        scaled = min(base, capacity)
+        if bool(self.RUN_EMBEDDED_WORKER):
+            cap = max(1, int(getattr(self, "EMBEDDED_MAP_MAX_WORKERS", 12) or 12))
+            return min(scaled, cap)
+        return scaled
 
     def validate_for_runtime(self, *, require_cors: bool | None = None) -> None:
         """
@@ -506,11 +587,15 @@ class Settings(BaseSettings):
         else:
             log.info("CORS validation skipped (worker process; no HTTP CORS surface)")
 
-        # Compile timeout invariant: HTTP read must be able to abort before the
+        # Timeout invariants: HTTP connect+read must abort before every node
         # wrapper wall, otherwise ThreadPoolExecutor "timeouts" never release.
         compile_read = float(self.NIM_COMPILE_TIMEOUT_SEC or 0.0)
         compile_connect = float(self.NIM_CONNECT_TIMEOUT_SEC or 0.0)
         compile_wall = float(self.COMPILE_CALL_MAX_SEC or 0.0)
+        map_http = float(self.NIM_HTTP_TIMEOUT_SEC or 0.0)
+        map_hard = float(self.NIM_HARD_TIMEOUT_SEC or map_http or 0.0)
+        map_wall = float(self.MAP_CHUNK_HARD_TIMEOUT_SEC or 0.0)
+        node_wall = float(self.COMPILE_NODE_HARD_TIMEOUT_SEC or 0.0)
         if compile_read <= 0 or compile_wall <= 0:
             raise ValueError(
                 "NIM_COMPILE_TIMEOUT_SEC and COMPILE_CALL_MAX_SEC must be positive"
@@ -525,6 +610,25 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"NIM_CONNECT_TIMEOUT_SEC ({compile_connect}) must be strictly less than "
                 f"COMPILE_CALL_MAX_SEC ({compile_wall})"
+            )
+        if map_http <= 0 or map_wall <= 0:
+            raise ValueError(
+                "NIM_HTTP_TIMEOUT_SEC and MAP_CHUNK_HARD_TIMEOUT_SEC must be positive"
+            )
+        if map_http >= map_wall or map_hard >= map_wall:
+            raise ValueError(
+                f"NIM_HTTP_TIMEOUT_SEC/NIM_HARD_TIMEOUT_SEC ({map_http}/{map_hard}) must be "
+                f"strictly less than MAP_CHUNK_HARD_TIMEOUT_SEC ({map_wall})"
+            )
+        if compile_connect >= map_wall:
+            raise ValueError(
+                f"NIM_CONNECT_TIMEOUT_SEC ({compile_connect}) must be strictly less than "
+                f"MAP_CHUNK_HARD_TIMEOUT_SEC ({map_wall})"
+            )
+        if node_wall > 0 and compile_read >= node_wall:
+            raise ValueError(
+                f"NIM_COMPILE_TIMEOUT_SEC ({compile_read}) must be strictly less than "
+                f"COMPILE_NODE_HARD_TIMEOUT_SEC ({node_wall})"
             )
         reduce_wall = float(self.REDUCE_COMPILE_MAX_SEC or 0.0)
         if reduce_wall < compile_wall:
@@ -542,10 +646,83 @@ class Settings(BaseSettings):
                 object.__setattr__(self, "AUTO_CREATE_SCHEMA", False)
             if require_cors and self.CORS_ALLOW_ALL:
                 log.warning("CORS_ALLOW_ALL is ignored when APP_ENV=production")
-            if not (self.NVIDIA_API_KEY or "").strip():
-                log.warning("NVIDIA_API_KEY is empty in production — LLM calls will fail")
+
+            # --- Hard production requirements (fail fast at startup) ---
+            db_url = (self.DATABASE_URL or "").strip().lower()
+            if not db_url or db_url.startswith("sqlite"):
+                raise RuntimeError(
+                    "DATABASE_URL must be a Postgres URL when APP_ENV=production "
+                    "(SQLite is not durable on Render's ephemeral filesystem). "
+                    "Set DATABASE_URL=postgresql+psycopg://… (Neon pooled recommended)."
+                )
+
+            if not (self.NVIDIA_API_KEY or "").strip() and self.nim_endpoint_count() < 1:
+                raise RuntimeError(
+                    "NVIDIA_API_KEY (or NIM_API_KEYS / NIM_ENDPOINT_*_API_KEY) must be set "
+                    "when APP_ENV=production — LLM map/compile will fail without it."
+                )
+
+            backend = (self.OBJECT_STORAGE_BACKEND or "local").strip().lower()
+            if backend == "r2":
+                missing_r2 = [
+                    name
+                    for name, val in (
+                        ("R2_ACCOUNT_ID", self.R2_ACCOUNT_ID),
+                        ("R2_ACCESS_KEY_ID", self.R2_ACCESS_KEY_ID),
+                        ("R2_SECRET_ACCESS_KEY", self.R2_SECRET_ACCESS_KEY),
+                        ("R2_BUCKET", self.R2_BUCKET),
+                    )
+                    if not (val or "").strip()
+                ]
+                if missing_r2:
+                    raise RuntimeError(
+                        "OBJECT_STORAGE_BACKEND=r2 requires "
+                        + ", ".join(missing_r2)
+                        + " when APP_ENV=production"
+                    )
+            elif backend == "local":
+                log.warning(
+                    "OBJECT_STORAGE_BACKEND=local in production — uploads live on the "
+                    "container filesystem and are lost on redeploy. Prefer r2."
+                )
+            elif backend == "s3":
+                if not (self.AWS_ACCESS_KEY_ID and self.AWS_SECRET_ACCESS_KEY and self.AWS_S3_BUCKET):
+                    raise RuntimeError(
+                        "OBJECT_STORAGE_BACKEND=s3 requires AWS_ACCESS_KEY_ID, "
+                        "AWS_SECRET_ACCESS_KEY, and AWS_S3_BUCKET in production"
+                    )
+
+            if require_cors:
+                origins = self.cors_allow_origins()
+                if origins != ["*"]:
+                    only_loopback = all(
+                        ("localhost" in o or "127.0.0.1" in o) for o in origins
+                    )
+                    if only_loopback:
+                        raise RuntimeError(
+                            "CORS_ORIGINS in production must include the public frontend "
+                            "origin (e.g. https://*.vercel.app) or '*'; localhost-only "
+                            "origins will block Vercel browsers."
+                        )
+
+            if bool(getattr(self, "AUTH_COOKIE_ENABLED", False)) and not bool(
+                getattr(self, "AUTH_COOKIE_SECURE", False)
+            ):
+                log.warning(
+                    "AUTH_COOKIE_ENABLED without AUTH_COOKIE_SECURE=true — "
+                    "set AUTH_COOKIE_SECURE=true behind HTTPS"
+                )
+
             persist = (self.CHROMA_PERSIST_DIRECTORY or self.VECTOR_DB_PATH or "").strip()
             log.info("Chroma embedded persist directory=%s", persist or "(default)")
+            if persist and not (
+                persist.startswith("/data") or persist.startswith("/var")
+            ):
+                log.warning(
+                    "Chroma/aux path %s is not under /data — on Render free tier this "
+                    "directory is ephemeral and embeddings are lost on restart",
+                    persist,
+                )
 
 
 settings = Settings()
