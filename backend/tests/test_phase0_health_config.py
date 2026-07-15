@@ -265,3 +265,31 @@ def test_production_happy_path_validate():
     )
     s.validate_for_runtime(require_cors=True)
 
+
+def test_map_timeout_ladder_auto_heals_equal_hard_and_wall():
+    """Render env with NIM_HARD=MAP_WALL must not brick API startup."""
+    from src.core.config import Settings
+
+    s = Settings(
+        APP_ENV="production",
+        JWT_SECRET_KEY="prod-secret-key-for-timeout-heal!!!!",
+        CORS_ORIGINS="https://app.example.com",
+        CORS_ALLOW_ALL=False,
+        DATABASE_URL="postgresql+psycopg://u:p@localhost/db",
+        NVIDIA_API_KEY="nvapi-test",
+        OBJECT_STORAGE_BACKEND="r2",
+        R2_ACCOUNT_ID="a",
+        R2_ACCESS_KEY_ID="k",
+        R2_SECRET_ACCESS_KEY="s",
+        R2_BUCKET="b",
+        CHROMA_PERSIST_DIRECTORY="/data/chroma",
+        VECTOR_DB_PATH="/data/aux",
+        NIM_HTTP_TIMEOUT_SEC=75.0,
+        NIM_HARD_TIMEOUT_SEC=90.0,
+        MAP_CHUNK_HARD_TIMEOUT_SEC=90.0,
+        _env_file=None,
+    )
+    s.validate_for_runtime(require_cors=True)
+    assert float(s.NIM_HARD_TIMEOUT_SEC) < float(s.MAP_CHUNK_HARD_TIMEOUT_SEC)
+    assert float(s.NIM_HTTP_TIMEOUT_SEC) < float(s.MAP_CHUNK_HARD_TIMEOUT_SEC)
+

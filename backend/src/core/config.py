@@ -615,16 +615,36 @@ class Settings(BaseSettings):
             raise ValueError(
                 "NIM_HTTP_TIMEOUT_SEC and MAP_CHUNK_HARD_TIMEOUT_SEC must be positive"
             )
-        if map_http >= map_wall or map_hard >= map_wall:
-            raise ValueError(
-                f"NIM_HTTP_TIMEOUT_SEC/NIM_HARD_TIMEOUT_SEC ({map_http}/{map_hard}) must be "
-                f"strictly less than MAP_CHUNK_HARD_TIMEOUT_SEC ({map_wall})"
+        # Auto-heal timeout ladders so a bad Render/dashboard env cannot brick deploy.
+        # HTTP/hard must abort *before* the map node wall, else ThreadPool "timeouts"
+        # never release hung sockets.
+        desired_http = min(map_http, map_hard) if map_hard > 0 else map_http
+        if desired_http >= map_wall or map_hard >= map_wall:
+            healed_http = max(5.0, map_wall - 15.0)
+            healed_hard = max(5.0, map_wall - 15.0)
+            log.warning(
+                "Timeout ladder invalid "
+                "(NIM_HTTP_TIMEOUT_SEC=%s NIM_HARD_TIMEOUT_SEC=%s "
+                "MAP_CHUNK_HARD_TIMEOUT_SEC=%s); clamping HTTP/HARD to %.0f",
+                map_http,
+                map_hard,
+                map_wall,
+                healed_http,
             )
+            object.__setattr__(self, "NIM_HTTP_TIMEOUT_SEC", healed_http)
+            object.__setattr__(self, "NIM_HARD_TIMEOUT_SEC", healed_hard)
+            map_http = healed_http
+            map_hard = healed_hard
         if compile_connect >= map_wall:
-            raise ValueError(
-                f"NIM_CONNECT_TIMEOUT_SEC ({compile_connect}) must be strictly less than "
-                f"MAP_CHUNK_HARD_TIMEOUT_SEC ({map_wall})"
+            healed_connect = max(1.0, min(float(compile_connect), map_wall - 1.0))
+            log.warning(
+                "NIM_CONNECT_TIMEOUT_SEC (%.0f) >= MAP_CHUNK_HARD_TIMEOUT_SEC (%.0f); "
+                "clamping connect to %.0f",
+                compile_connect,
+                map_wall,
+                healed_connect,
             )
+            object.__setattr__(self, "NIM_CONNECT_TIMEOUT_SEC", healed_connect)
         if node_wall > 0 and compile_read >= node_wall:
             raise ValueError(
                 f"NIM_COMPILE_TIMEOUT_SEC ({compile_read}) must be strictly less than "
