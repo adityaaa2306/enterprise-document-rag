@@ -19,6 +19,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { cn } from "@/lib/utils"
 import { DashboardChartsSkeleton } from "@/components/loading-skeletons"
 import { useFinalizedMetrics } from "@/hooks/use-finalized-metrics"
 import { useHistoricalAnalytics } from "@/hooks/use-historical-analytics"
@@ -32,12 +33,15 @@ const DashboardCharts = dynamic(() => import("@/components/dashboard-charts"), {
   loading: () => <DashboardChartsSkeleton />,
 })
 
+type ViewMode = "latest" | "historical"
+
 function fmt(value: number | undefined | null, digits = 2) {
   if (value == null || Number.isNaN(Number(value))) return "—"
   return Number(value).toFixed(digits)
 }
 
 export default function Dashboard() {
+  const [view, setView] = useState<ViewMode>("latest")
   const [range, setRange] = useState<RangeKey>("30d")
   const [customStart, setCustomStart] = useState("")
   const [customEnd, setCustomEnd] = useState("")
@@ -61,7 +65,7 @@ export default function Dashboard() {
     refresh: refreshLatest,
   } = useFinalizedMetrics({ refreshOnMount: true })
 
-  // Layer 2 — Historical Analytics (signed-in Owners only; never auto-fetch for guests)
+  // Layer 2 — Historical Analytics (signed-in Owners only)
   const {
     stats,
     loading: histLoading,
@@ -75,19 +79,25 @@ export default function Dashboard() {
 
   useEffect(() => {
     if (!personaReady || isGuest) return
+    if (view !== "historical") return
     void refreshHist(true)
-  }, [personaReady, isGuest, range, customStart, customEnd, refreshHist])
+  }, [personaReady, isGuest, view, range, customStart, customEnd, refreshHist])
 
   useEffect(() => {
     const onVis = () => {
       if (document.visibilityState === "visible") {
         void refreshLatest(false)
-        if (!isGuestMode()) void refreshHist(false)
+        if (!isGuestMode() && view === "historical") void refreshHist(false)
       }
     }
     document.addEventListener("visibilitychange", onVis)
     return () => document.removeEventListener("visibilitychange", onVis)
-  }, [refreshLatest, refreshHist])
+  }, [refreshLatest, refreshHist, view])
+
+  // Guests only have latest — keep view locked
+  useEffect(() => {
+    if (personaReady && isGuest && view !== "latest") setView("latest")
+  }, [personaReady, isGuest, view])
 
   const latestCharts = useMemo(() => {
     if (!metrics) {
@@ -104,6 +114,57 @@ export default function Dashboard() {
     stats?.empty_state_message ||
     "More analytics will appear as additional documents are processed."
 
+  const showHistorical = personaReady && !isGuest && view === "historical"
+  const loading = showHistorical ? histLoading && !stats : latestLoading && !metrics
+
+  const kpis = showHistorical
+    ? [
+        {
+          title: "Optimized Emissions",
+          value: stats ? fmt(stats.total_carbon_consumed) : loading ? "…" : "—",
+          unit: "g CO₂e",
+        },
+        {
+          title: "Baseline Pipeline",
+          value: stats ? fmt(stats.total_baseline_carbon) : loading ? "…" : "—",
+          unit: "g CO₂e",
+        },
+        {
+          title: "Carbon Saved",
+          value: stats ? fmt(stats.total_carbon_saved) : loading ? "…" : "—",
+          unit: "g CO₂e",
+        },
+        {
+          title: "Efficiency",
+          value: stats ? fmt(stats.avg_efficiency, 1) : loading ? "…" : "—",
+          unit: "%",
+        },
+      ]
+    : [
+        {
+          title: "Optimized Emissions",
+          value: metrics ? fmt(metrics.optimizedG) : loading ? "…" : "—",
+          unit: "g CO₂e",
+        },
+        {
+          title: "Baseline Pipeline",
+          value: metrics ? fmt(metrics.baselineG) : loading ? "…" : "—",
+          unit: "g CO₂e",
+        },
+        {
+          title: "Carbon Saved",
+          value: metrics ? fmt(metrics.savedG) : loading ? "…" : "—",
+          unit: "g CO₂e",
+        },
+        {
+          title: "Efficiency",
+          value: metrics ? fmt(metrics.reductionPct, 1) : loading ? "…" : "—",
+          unit: "%",
+        },
+      ]
+
+  const icons = [Leaf, Scale, TrendingDown, Gauge]
+
   return (
     <GuestOwnerGate>
       <div className="flex">
@@ -112,106 +173,137 @@ export default function Dashboard() {
           <TopBar />
           <main className="p-8">
             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
-              <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4 mb-8">
+              <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4 mb-6">
                 <div>
                   <h1 className="text-3xl font-bold mb-2">Dashboard & Analytics</h1>
                   <p className="text-muted-foreground">
                     {!personaReady
                       ? "Loading dashboard…"
-                      : isGuest
-                        ? "Latest job snapshot mirrors the same finalized metrics as Results."
-                        : "Latest job mirrors Results. Historical analytics aggregate every completed job for this Owner."}
+                      : showHistorical
+                        ? "Sum of every completed job in the selected range for this account."
+                        : "Finalized metrics from your most recent completed job — same numbers as Results."}
                   </p>
                 </div>
 
                 {personaReady && !isGuest ? (
-                  <Card className="p-4 border-border/50 bg-card/70 backdrop-blur-sm w-full lg:w-auto">
-                    <div className="flex flex-col sm:flex-row gap-3 sm:items-end">
-                      <div className="space-y-1.5 min-w-[180px]">
-                        <Label className="text-xs text-muted-foreground">
-                          Historical range
-                        </Label>
-                        <Select value={range} onValueChange={(v) => setRange(v as RangeKey)}>
-                          <SelectTrigger className="bg-background border-border">
-                            <SelectValue placeholder="Select range" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="today">Today</SelectItem>
-                            <SelectItem value="7d">Last 7 Days</SelectItem>
-                            <SelectItem value="30d">Last 30 Days</SelectItem>
-                            <SelectItem value="90d">Last 90 Days</SelectItem>
-                            <SelectItem value="custom">Custom Range</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      {range === "custom" ? (
-                        <>
-                          <div className="space-y-1.5">
-                            <Label className="text-xs text-muted-foreground">Start</Label>
-                            <Input
-                              type="date"
-                              value={customStart}
-                              onChange={(e) => setCustomStart(e.target.value)}
-                              className="bg-background border-border"
-                            />
-                          </div>
-                          <div className="space-y-1.5">
-                            <Label className="text-xs text-muted-foreground">End</Label>
-                            <Input
-                              type="date"
-                              value={customEnd}
-                              onChange={(e) => setCustomEnd(e.target.value)}
-                              className="bg-background border-border"
-                            />
-                          </div>
-                        </>
-                      ) : null}
-                    </div>
-                  </Card>
+                  <div
+                    className="inline-flex rounded-md border border-border/60 bg-card/70 p-1 backdrop-blur-sm"
+                    role="tablist"
+                    aria-label="Analytics view"
+                  >
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={view === "latest"}
+                      data-testid="dashboard-view-latest"
+                      onClick={() => setView("latest")}
+                      className={cn(
+                        "px-3.5 py-1.5 text-sm font-medium rounded transition-colors",
+                        view === "latest"
+                          ? "bg-primary text-primary-foreground"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      Latest job
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={view === "historical"}
+                      data-testid="dashboard-view-historical"
+                      onClick={() => setView("historical")}
+                      className={cn(
+                        "px-3.5 py-1.5 text-sm font-medium rounded transition-colors",
+                        view === "historical"
+                          ? "bg-primary text-primary-foreground"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      Historical
+                    </button>
+                  </div>
                 ) : null}
               </div>
 
-              {/* ── Layer 1: Latest Job Snapshot ── */}
+              {/* Historical range controls — only when Historical is active */}
+              {showHistorical ? (
+                <Card className="p-4 border-border/50 bg-card/70 backdrop-blur-sm mb-6 w-full lg:w-auto lg:inline-flex">
+                  <div className="flex flex-col sm:flex-row gap-3 sm:items-end">
+                    <div className="space-y-1.5 min-w-[180px]">
+                      <Label className="text-xs text-muted-foreground">Range</Label>
+                      <Select value={range} onValueChange={(v) => setRange(v as RangeKey)}>
+                        <SelectTrigger className="bg-background border-border">
+                          <SelectValue placeholder="Select range" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="today">Today</SelectItem>
+                          <SelectItem value="7d">Last 7 Days</SelectItem>
+                          <SelectItem value="30d">Last 30 Days</SelectItem>
+                          <SelectItem value="90d">Last 90 Days</SelectItem>
+                          <SelectItem value="custom">Custom Range</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    {range === "custom" ? (
+                      <>
+                        <div className="space-y-1.5">
+                          <Label className="text-xs text-muted-foreground">Start</Label>
+                          <Input
+                            type="date"
+                            value={customStart}
+                            onChange={(e) => setCustomStart(e.target.value)}
+                            className="bg-background border-border"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <Label className="text-xs text-muted-foreground">End</Label>
+                          <Input
+                            type="date"
+                            value={customEnd}
+                            onChange={(e) => setCustomEnd(e.target.value)}
+                            className="bg-background border-border"
+                          />
+                        </div>
+                      </>
+                    ) : null}
+                  </div>
+                </Card>
+              ) : null}
+
+              {/* Single analytics section */}
               <p className="text-xs uppercase tracking-wide text-muted-foreground mb-3">
-                Latest job snapshot
-                {jobId ? (
+                {showHistorical ? "Historical analytics" : "Latest job snapshot"}
+                {showHistorical && stats ? (
+                  <span className="normal-case tracking-normal ml-2 text-muted-foreground/80">
+                    · {stats.total_docs} document{stats.total_docs === 1 ? "" : "s"} · range{" "}
+                    {stats.range}
+                  </span>
+                ) : null}
+                {!showHistorical && jobId ? (
                   <span className="normal-case tracking-normal ml-2 text-muted-foreground/80">
                     · {jobId.slice(0, 8)} · rev {revision}
                     {updatedAt ? ` · ${updatedAt.slice(0, 19)}` : ""}
                   </span>
                 ) : null}
               </p>
+
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-4">
-                <KPICard
-                  title="Estimated Optimized Emissions"
-                  value={metrics ? fmt(metrics.optimizedG) : latestLoading ? "…" : "—"}
-                  unit="g CO₂e"
-                  icon={Leaf}
-                  delay={0}
-                />
-                <KPICard
-                  title="Estimated Baseline Pipeline"
-                  value={metrics ? fmt(metrics.baselineG) : latestLoading ? "…" : "—"}
-                  unit="g CO₂e"
-                  icon={Scale}
-                  delay={0.05}
-                />
-                <KPICard
-                  title="Estimated Carbon Saved"
-                  value={metrics ? fmt(metrics.savedG) : latestLoading ? "…" : "—"}
-                  unit="g CO₂e"
-                  icon={TrendingDown}
-                  delay={0.1}
-                />
-                <KPICard
-                  title="Efficiency"
-                  value={metrics ? fmt(metrics.reductionPct, 1) : latestLoading ? "…" : "—"}
-                  unit="%"
-                  icon={Gauge}
-                  delay={0.15}
-                />
+                {kpis.map((kpi, i) => {
+                  const Icon = icons[i]
+                  return (
+                    <KPICard
+                      key={`${view}-${kpi.title}`}
+                      title={kpi.title}
+                      value={kpi.value}
+                      unit={kpi.unit}
+                      icon={Icon}
+                      delay={i * 0.05}
+                    />
+                  )
+                })}
               </div>
-              {metrics ? (
+
+              {!showHistorical && metrics ? (
                 <p className="text-xs text-muted-foreground mb-8">
                   Same as Results · {metrics.region} · {fmtIntensity(metrics.intensityGco2Kwh)} ·{" "}
                   {metrics.totalChunks} chunks · L{metrics.tierMix.light}/M
@@ -222,95 +314,56 @@ export default function Dashboard() {
                     </span>
                   ) : null}
                 </p>
-              ) : (
+              ) : null}
+              {!showHistorical && !metrics && !loading ? (
                 <p className="text-xs text-muted-foreground mb-8">
                   Process a document to populate the latest job snapshot.
                 </p>
-              )}
+              ) : null}
+              {showHistorical && stats && stats.total_docs > 1 ? (
+                <p className="text-xs text-muted-foreground mb-8">
+                  Totals sum {stats.total_docs} completed jobs — not the same as a single latest job.
+                </p>
+              ) : showHistorical ? (
+                <div className="mb-8" />
+              ) : null}
 
-              {/* Latest job model bars (same CompactJobMetrics.modelBars as Results) */}
-              {metrics && latestCharts.modelBars.length > 0 ? (
-                <div className="mb-8">
-                  <DashboardCharts
-                    carbonTrend={[
-                      {
-                        date: jobId ? `Job ${jobId.slice(0, 8)}` : "Latest",
-                        baseline: metrics.baselineG,
-                        actual: metrics.optimizedG,
-                        carbon_saved: metrics.savedG,
-                        efficiency: metrics.reductionPct,
-                        docs_processed: 1,
-                      },
-                    ]}
-                    energyTrend={[]}
-                    modelBars={latestCharts.modelBars}
-                    sparse
-                    emptyMessage="Latest job — identical metrics object fields as Results."
-                  />
+              {/* Single charts slot — no duplicate skeletons */}
+              {loading ? (
+                <DashboardChartsSkeleton />
+              ) : showHistorical ? (
+                <DashboardCharts
+                  carbonTrend={stats?.carbon_trend || []}
+                  energyTrend={stats?.energy_trend || []}
+                  sparse={histSparse}
+                  emptyMessage={histEmpty}
+                />
+              ) : metrics && latestCharts.modelBars.length > 0 ? (
+                <DashboardCharts
+                  carbonTrend={[
+                    {
+                      date: jobId ? `Job ${jobId.slice(0, 8)}` : "Latest",
+                      baseline: metrics.baselineG,
+                      actual: metrics.optimizedG,
+                      carbon_saved: metrics.savedG,
+                      efficiency: metrics.reductionPct,
+                      docs_processed: 1,
+                    },
+                  ]}
+                  energyTrend={[]}
+                  modelBars={latestCharts.modelBars}
+                  sparse
+                  emptyMessage="Latest job — identical metrics object fields as Results."
+                />
+              ) : null}
+
+              {personaReady && !isGuest ? (
+                <div className="mt-8 mb-8">
+                  <DocumentHistory />
                 </div>
               ) : null}
 
-              {/* ── Layer 2: Historical Analytics (signed-in only) ── */}
-              {personaReady && !isGuest ? (
-                <>
-                  <p className="text-xs uppercase tracking-wide text-muted-foreground mb-3">
-                    Historical analytics
-                    {stats ? (
-                      <span className="normal-case tracking-normal ml-2 text-muted-foreground/80">
-                        · {stats.total_docs} document{stats.total_docs === 1 ? "" : "s"} · range{" "}
-                        {stats.range}
-                      </span>
-                    ) : null}
-                  </p>
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-                    <KPICard
-                      title="Total Optimized Emissions"
-                      value={stats ? fmt(stats.total_carbon_consumed) : histLoading ? "…" : "—"}
-                      unit="g CO₂e"
-                      icon={Leaf}
-                      delay={0}
-                    />
-                    <KPICard
-                      title="Total Baseline Pipeline"
-                      value={stats ? fmt(stats.total_baseline_carbon) : histLoading ? "…" : "—"}
-                      unit="g CO₂e"
-                      icon={Scale}
-                      delay={0.05}
-                    />
-                    <KPICard
-                      title="Total Carbon Saved"
-                      value={stats ? fmt(stats.total_carbon_saved) : histLoading ? "…" : "—"}
-                      unit="g CO₂e"
-                      icon={TrendingDown}
-                      delay={0.1}
-                    />
-                    <KPICard
-                      title="Average Efficiency"
-                      value={stats ? fmt(stats.avg_efficiency, 1) : histLoading ? "…" : "—"}
-                      unit="%"
-                      icon={Gauge}
-                      delay={0.15}
-                    />
-                  </div>
-
-                  {stats || !histLoading ? (
-                    <DashboardCharts
-                      carbonTrend={stats?.carbon_trend || []}
-                      energyTrend={stats?.energy_trend || []}
-                      sparse={histSparse}
-                      emptyMessage={histEmpty}
-                    />
-                  ) : (
-                    <DashboardChartsSkeleton />
-                  )}
-
-                  <div className="mb-8">
-                    <DocumentHistory />
-                  </div>
-                </>
-              ) : null}
-
-              {metrics ? (
+              {!showHistorical && metrics ? (
                 <p className="text-xs text-muted-foreground mt-2">
                   Latest fingerprint · Optimized {fmtG(metrics.optimizedG)} · Baseline{" "}
                   {fmtG(metrics.baselineG)} · Saved {fmtG(metrics.savedG)} ·{" "}

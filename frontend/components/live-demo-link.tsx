@@ -10,7 +10,7 @@ type Props = {
   children: ReactNode
   className?: string
   "data-testid"?: string
-  /** Where to land after guest/auth is ready. Default: dashboard. */
+  /** Where to land after guest/auth is ready. Default: new job. */
   nextPath?: string
 } & Omit<ComponentProps<typeof Link>, "href" | "prefetch">
 
@@ -23,7 +23,7 @@ export function LiveDemoLink({
   children,
   className,
   onClick,
-  nextPath = "/dashboard",
+  nextPath = "/new-job",
   ...rest
 }: Props) {
   const router = useRouter()

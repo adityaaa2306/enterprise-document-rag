@@ -24,7 +24,7 @@ export default function Stack() {
         </div>
 
         <div className="border border-white/10 bg-[#080808]">
-          <div className="grid grid-cols-12 px-6 py-3 hairline-b font-mono text-[10px] uppercase tracking-[0.18em] text-neutral-500">
+          <div className="grid grid-cols-12 px-4 sm:px-6 py-3 hairline-b font-mono text-[10px] uppercase tracking-[0.18em] text-neutral-500">
             <div className="col-span-4">Layer</div>
             <div className="col-span-8">Components</div>
           </div>
@@ -35,12 +35,23 @@ export default function Stack() {
               whileInView={{ opacity: 1 }}
               viewport={{ once: true }}
               transition={{ delay: i * 0.06, duration: 0.5 }}
-              className="grid grid-cols-12 px-6 py-5 hairline-b last:border-b-0 group hover:bg-white/[0.02] transition-colors"
+              className="grid grid-cols-12 px-4 sm:px-6 py-4 sm:py-5 hairline-b last:border-b-0 group hover:bg-white/[0.02] transition-colors"
             >
-              <div className="col-span-4 font-mono text-[12px] uppercase tracking-[0.14em] text-white">
-                {r.area}
+              <div className="col-span-4 font-mono text-[11px] sm:text-[12px] uppercase tracking-[0.14em] text-white pr-2 leading-snug">
+                {r.area === "Carbon data" ? (
+                  <>
+                    <span className="md:hidden">
+                      Carbon
+                      <br />
+                      data
+                    </span>
+                    <span className="hidden md:inline">Carbon data</span>
+                  </>
+                ) : (
+                  r.area
+                )}
               </div>
-              <div className="col-span-8 font-mono text-[13px] text-neutral-400 group-hover:text-neutral-200 transition-colors">
+              <div className="col-span-8 font-mono text-[12px] sm:text-[13px] text-neutral-400 group-hover:text-neutral-200 transition-colors leading-snug break-words">
                 {r.items}
               </div>
             </motion.div>

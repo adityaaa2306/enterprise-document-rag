@@ -4,6 +4,23 @@ import { motion } from "framer-motion";
 import { ArrowUpRight } from "lucide-react";
 import { LiveDemoLink } from "@/components/live-demo-link";
 
+const CHUNK_BARS = [
+  { h: 40, label: "C1" },
+  { h: 90, label: "C2" },
+  { h: 30, label: "C3" },
+  { h: 140, label: "C4" },
+  { h: 20, label: "C5" },
+  { h: 110, label: "C6" },
+  { h: 55, label: "C7" },
+  { h: 25, label: "C8" },
+];
+
+function barColor(h) {
+  if (h > 100) return "#F43F5E";
+  if (h > 60) return "#F59E0B";
+  return "#14B8A6";
+}
+
 export default function DashboardPreview() {
   return (
     <section id="dashboard" data-testid="dashboard-preview" className="relative py-24 md:py-32 hairline-t">
@@ -19,6 +36,7 @@ export default function DashboardPreview() {
           </div>
           <div className="lg:col-span-5 flex items-end justify-start lg:justify-end">
             <LiveDemoLink
+              nextPath="/new-job"
               data-testid="dashboard-cta"
               className="group inline-flex items-center gap-2 bg-emerald-500 text-black px-5 py-3 font-mono text-[11px] uppercase tracking-[0.18em] hover:bg-emerald-400 transition-colors emerald-glow"
             >
@@ -42,18 +60,18 @@ export default function DashboardPreview() {
               <span className="w-2.5 h-2.5 rounded-full bg-amber-500/70" />
               <span className="w-2.5 h-2.5 rounded-full bg-emerald-500/70" />
             </div>
-            <div className="ml-4 flex-1 flex items-center gap-2 font-mono text-[11px] text-neutral-500 bg-[#141414] px-3 py-1.5 max-w-md">
-              <span className="text-neutral-600">▲</span>
-              green-agentic.systems/dashboard/run/4c8a
+            <div className="ml-4 flex-1 flex items-center gap-2 font-mono text-[11px] text-neutral-500 bg-[#141414] px-3 py-1.5 max-w-md min-w-0 truncate">
+              <span className="text-neutral-600 shrink-0">▲</span>
+              <span className="truncate">green-agentic.systems/dashboard/run/4c8a</span>
             </div>
-            <div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.14em] text-emerald-400">
+            <div className="hidden sm:flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.14em] text-emerald-400 shrink-0">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
               live
             </div>
           </div>
 
           {/* Dashboard body — schematic */}
-          <div className="grid grid-cols-12 gap-4 p-6 md:p-8">
+          <div className="grid grid-cols-12 gap-4 p-4 sm:p-6 md:p-8">
             {/* KPI row */}
             {[
               { label: "CO₂ saved", value: "52.1%", accent: "#10B981" },
@@ -67,30 +85,41 @@ export default function DashboardPreview() {
               </div>
             ))}
 
-            {/* chart placeholder */}
-            <div className="col-span-12 md:col-span-8 border border-white/10 p-4 h-64 relative overflow-hidden">
+            {/* CO₂ per chunk chart — CSS bars (SVG height animation was blanking out) */}
+            <div
+              className="col-span-12 md:col-span-8 border border-white/10 p-4 h-64 relative overflow-hidden bg-[#060606]"
+              data-testid="dashboard-co2-chart"
+            >
               <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-neutral-500 mb-3">
                 CO₂ per chunk · last run
               </div>
-              <svg viewBox="0 0 400 180" className="w-full h-[calc(100%-1.5rem)]">
-                {Array.from({ length: 8 }).map((_, i) => (
-                  <line key={i} x1={0} y1={i * 25} x2={400} y2={i * 25} stroke="rgba(255,255,255,0.04)" />
-                ))}
-                {[40, 90, 30, 140, 20, 110, 55, 25].map((h, i) => {
-                  const color = h > 100 ? "#F43F5E" : h > 60 ? "#F59E0B" : "#14B8A6";
+              <div
+                className="relative h-[calc(100%-1.5rem)] flex items-end gap-1.5 sm:gap-2 px-0.5"
+                role="img"
+                aria-label="CO2 per chunk bar chart for last run"
+              >
+                {/* horizontal guides */}
+                <div className="pointer-events-none absolute inset-0 flex flex-col justify-between py-0.5" aria-hidden>
+                  {Array.from({ length: 5 }).map((_, i) => (
+                    <div key={i} className="w-full border-t border-white/[0.06]" />
+                  ))}
+                </div>
+                {CHUNK_BARS.map((bar, i) => {
+                  const color = barColor(bar.h);
+                  const pct = Math.max(8, (bar.h / 140) * 100);
                   return (
-                    <motion.rect
-                      key={i}
-                      x={20 + i * 46} y={180 - h - 10} width={30}
-                      initial={{ height: 0, y: 170 }}
-                      whileInView={{ height: h, y: 180 - h - 10 }}
-                      viewport={{ once: true }}
-                      transition={{ delay: i * 0.06, duration: 0.6 }}
-                      fill={color}
-                    />
+                    <div key={bar.label} className="relative z-[1] flex-1 h-full flex flex-col justify-end min-w-0">
+                      <motion.div
+                        className="w-full rounded-[1px]"
+                        style={{ backgroundColor: color }}
+                        initial={{ height: "0%" }}
+                        animate={{ height: `${pct}%` }}
+                        transition={{ delay: 0.15 + i * 0.06, duration: 0.55, ease: [0.22, 1, 0.36, 1] }}
+                      />
+                    </div>
                   );
                 })}
-              </svg>
+              </div>
             </div>
 
             {/* Tier breakdown */}

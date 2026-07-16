@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation"
 import SmoothScroll from "@/components/site/SmoothScroll"
 import Nav from "@/components/site/Nav"
 import Hero from "@/components/site/Hero"
+import HeroStats from "@/components/site/HeroStats"
 import Ticker from "@/components/site/Ticker"
 
 /** Below-fold sections — loaded after first paint so Live Demo stays snappy. */
@@ -72,6 +73,7 @@ export default function HomeClient() {
         <main data-testid="home-root" className="relative">
           <Nav />
           <Hero />
+          <HeroStats />
           <Ticker />
           <Problem />
           <SystemOverview />

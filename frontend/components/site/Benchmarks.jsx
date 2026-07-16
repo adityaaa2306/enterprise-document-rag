@@ -77,10 +77,12 @@ export default function Benchmarks() {
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true }}
               transition={{ delay: i * 0.08, duration: 0.6 }}
-              className="p-6 md:p-8"
+              className="p-4 sm:p-6 md:p-8 min-w-0 overflow-hidden"
             >
-              <div className="font-display text-4xl md:text-5xl text-white tracking-tighter">{m.value}</div>
-              <div className="mt-3 font-mono text-[10px] uppercase tracking-[0.16em] text-neutral-500 leading-relaxed">
+              <div className="font-display text-[clamp(1.35rem,5.5vw,3rem)] md:text-5xl text-white tracking-tighter leading-none break-all sm:break-normal">
+                {m.value}
+              </div>
+              <div className="mt-3 font-mono text-[9px] sm:text-[10px] uppercase tracking-[0.14em] sm:tracking-[0.16em] text-neutral-500 leading-relaxed">
                 {m.label}
               </div>
               {m.note && (
@@ -110,27 +112,27 @@ export default function Benchmarks() {
                 <div className="font-mono text-[12px] uppercase tracking-[0.14em] text-neutral-300">
                   {r.chunks} chunks · {r.speedup}x speedup
                 </div>
-                <div className="grid grid-cols-12 items-center gap-2">
+                <div className="grid grid-cols-12 items-center gap-1.5 sm:gap-2">
                   <div className="col-span-2 font-mono text-[10px] text-neutral-500">seq</div>
-                  <div className="col-span-8 h-2 bg-white/5 rounded-full overflow-hidden">
+                  <div className="col-span-7 sm:col-span-8 h-2 bg-white/5 rounded-full overflow-hidden">
                     <div
                       className="h-full bg-neutral-500"
                       style={{ width: `${((r.sequential_wall_ms || 0) / maxWall) * 100}%` }}
                     />
                   </div>
-                  <div className="col-span-2 font-mono text-[11px] text-neutral-400 tabular-nums text-right">
+                  <div className="col-span-3 sm:col-span-2 font-mono text-[10px] sm:text-[11px] text-neutral-400 tabular-nums text-right truncate">
                     {Math.round(r.sequential_wall_ms || 0)}
                   </div>
                 </div>
-                <div className="grid grid-cols-12 items-center gap-2">
+                <div className="grid grid-cols-12 items-center gap-1.5 sm:gap-2">
                   <div className="col-span-2 font-mono text-[10px] text-emerald-400">dag</div>
-                  <div className="col-span-8 h-2 bg-white/5 rounded-full overflow-hidden">
+                  <div className="col-span-7 sm:col-span-8 h-2 bg-white/5 rounded-full overflow-hidden">
                     <div
                       className="h-full bg-emerald-400"
                       style={{ width: `${((r.parallel_wall_ms || 0) / maxWall) * 100}%` }}
                     />
                   </div>
-                  <div className="col-span-2 font-mono text-[11px] text-emerald-400 tabular-nums text-right">
+                  <div className="col-span-3 sm:col-span-2 font-mono text-[10px] sm:text-[11px] text-emerald-400 tabular-nums text-right truncate">
                     {Math.round(r.parallel_wall_ms || 0)}
                   </div>
                 </div>
@@ -148,15 +150,15 @@ export default function Benchmarks() {
                 <div className="font-mono text-[12px] uppercase tracking-[0.14em] text-neutral-300">
                   {r.label || "FinalReport.pdf"} · {r.chunks} chunks · live validation
                 </div>
-                <div className="grid grid-cols-12 items-center gap-2">
+                <div className="grid grid-cols-12 items-center gap-1.5 sm:gap-2">
                   <div className="col-span-2 font-mono text-[10px] text-emerald-400">dag</div>
-                  <div className="col-span-8 h-2 bg-white/5 rounded-full overflow-hidden">
+                  <div className="col-span-7 sm:col-span-8 h-2 bg-white/5 rounded-full overflow-hidden">
                     <div
                       className="h-full bg-emerald-400"
                       style={{ width: `${((r.parallel_wall_ms || 0) / maxWall) * 100}%` }}
                     />
                   </div>
-                  <div className="col-span-2 font-mono text-[11px] text-emerald-400 tabular-nums text-right">
+                  <div className="col-span-3 sm:col-span-2 font-mono text-[10px] sm:text-[11px] text-emerald-400 tabular-nums text-right truncate">
                     {Math.round(r.parallel_wall_ms || 0)}
                   </div>
                 </div>

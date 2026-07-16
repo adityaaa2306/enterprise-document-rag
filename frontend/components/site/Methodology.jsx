@@ -13,7 +13,7 @@ const TERMS = [
 export default function Methodology() {
   return (
     <section id="methodology" data-testid="methodology-section" className="relative py-24 md:py-32 hairline-t">
-      <div className="max-w-[1400px] mx-auto px-6 md:px-10">
+      <div className="max-w-[1400px] mx-auto px-4 sm:px-6 md:px-10">
         <div className="mb-12">
           <div className="flex items-baseline gap-4 mb-3">
             <span className="font-serif italic text-6xl md:text-7xl text-neutral-800 leading-none">III.</span>
@@ -32,24 +32,27 @@ export default function Methodology() {
           whileInView={{ opacity: 1, y: 0 }}
           viewport={{ once: true }}
           transition={{ duration: 0.7 }}
-          className="border border-white/10 bg-[#080808] p-10 md:p-16"
+          className="border border-white/10 bg-[#080808] p-5 sm:p-10 md:p-16 overflow-hidden"
         >
-          <div className="font-mono text-[10px] uppercase tracking-[0.24em] text-neutral-500 mb-8">
+          <div className="font-mono text-[10px] uppercase tracking-[0.24em] text-neutral-500 mb-6 md:mb-8">
             eq. 01 — carbon accounting
           </div>
-          <div className="font-mono text-3xl md:text-5xl text-white tracking-tight leading-tight">
+          {/* Mobile: stacked / wrapped so the equation never leaves the box */}
+          <div className="font-mono text-[clamp(1.05rem,4.2vw,1.5rem)] sm:text-2xl md:text-5xl text-white tracking-tight leading-snug md:leading-tight break-words">
             <span className="text-neutral-500">CO₂</span>
-            <span className="text-neutral-600 mx-2">=</span>
-            <span className="text-white">Σ<sub className="text-lg text-neutral-500">chunks</sub></span>
-            <span className="text-neutral-600 mx-1">(</span>
+            <span className="text-neutral-600 mx-1.5 md:mx-2">=</span>
+            <span className="text-white whitespace-nowrap">
+              Σ<sub className="text-[0.55em] md:text-lg text-neutral-500">chunks</sub>
+            </span>
+            <span className="text-neutral-600 mx-0.5 md:mx-1">(</span>
             <span className="text-white">T</span>
-            <span className="text-neutral-600 mx-1">·</span>
+            <span className="text-neutral-600 mx-0.5 md:mx-1">·</span>
             <span style={{ color: "#F59E0B" }}>E</span>
-            <span className="text-neutral-600 mx-1">·</span>
+            <span className="text-neutral-600 mx-0.5 md:mx-1">·</span>
             <span className="text-emerald-400">G</span>
-            <span className="text-neutral-600 mx-1">·</span>
+            <span className="text-neutral-600 mx-0.5 md:mx-1">·</span>
             <span className="text-neutral-500">10⁻⁶</span>
-            <span className="text-neutral-600 mx-1">)</span>
+            <span className="text-neutral-600 mx-0.5 md:mx-1">)</span>
           </div>
           <div className="mt-10 grid grid-cols-2 md:grid-cols-5 gap-6">
             {TERMS.map((t) => (
