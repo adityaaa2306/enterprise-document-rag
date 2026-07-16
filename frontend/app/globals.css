@@ -560,7 +560,7 @@
 
 .landing-root .landing-hero-title-mobile {
   /*
-   * Phone cinematic cover: ~15–20% larger again so the headline nearly
+   * Phone cinematic cover: another ~15–20% larger so the headline nearly
    * fills the first viewport. Family/weight/tracking unchanged; desktop
    * uses .landing-hero-title-desktop only.
    */
@@ -569,19 +569,19 @@
   max-width: 100%;
   width: 100%;
   font-size: clamp(
-    2.25rem,
+    2.65rem,
     min(
-      10.8vw,
+      12.6vw,
       calc(
         (
           100svh - var(--landing-hero-pad-top) - var(--landing-hero-pad-bottom) -
             var(--landing-hero-mobile-chrome)
-        ) / 4.85
+        ) / 4.15
       )
     ),
-    3.5rem
+    4.1rem
   );
-  line-height: 1.05;
+  line-height: 1.02;
   letter-spacing: -0.03em;
   overflow-wrap: break-word;
   word-break: normal;
@@ -592,17 +592,17 @@
 @supports not (height: 100svh) {
   .landing-root .landing-hero-title-mobile {
     font-size: clamp(
-      2.25rem,
+      2.65rem,
       min(
-        10.8vw,
+        12.6vw,
         calc(
           (
             100dvh - var(--landing-hero-pad-top) - var(--landing-hero-pad-bottom) -
               var(--landing-hero-mobile-chrome)
-          ) / 4.85
+          ) / 4.15
         )
       ),
-      3.5rem
+      4.1rem
     );
   }
 }
@@ -658,10 +658,10 @@
  */
 @media (max-width: 1023px) {
   .landing-root .landing-hero {
-    /* Reserved for pillars + CTAs sitting on the bottom safe edge */
-    --landing-hero-mobile-chrome: 7.75rem;
-    --landing-hero-pad-top: calc(var(--landing-nav-h) + env(safe-area-inset-top, 0px) + 0.4rem);
-    --landing-hero-pad-bottom: calc(0.45rem + env(safe-area-inset-bottom, 0px));
+    /* Slim chrome so headline can grow; pillars + CTAs stay on the bottom edge */
+    --landing-hero-mobile-chrome: 7.15rem;
+    --landing-hero-pad-top: calc(var(--landing-nav-h) + env(safe-area-inset-top, 0px) + 0.3rem);
+    --landing-hero-pad-bottom: calc(0.3rem + env(safe-area-inset-bottom, 0px));
     height: 100dvh;
     height: 100svh;
     max-height: 100dvh;
@@ -706,12 +706,12 @@
 
   .landing-root .landing-hero-sub {
     margin: 0 !important;
-    font-size: clamp(0.8125rem, 0.75rem + 0.45vw, 0.95rem);
-    line-height: 1.35;
+    font-size: clamp(0.78rem, 0.72rem + 0.4vw, 0.9rem);
+    line-height: 1.32;
   }
 
   .landing-root .landing-hero-ctas {
-    margin-top: 0.7rem !important;
+    margin-top: 0.55rem !important;
   }
 }
 
