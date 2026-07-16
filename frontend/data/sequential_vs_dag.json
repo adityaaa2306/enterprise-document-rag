@@ -1,0 +1,133 @@
+{
+  "generated_at": "2026-07-15T04:41:56.287158+00:00",
+  "note": "Measured against live NIM. Includes FinalReport.pdf rate-limit-fix validation row.",
+  "headline": {
+    "median_speedup": 6.02,
+    "best_speedup": 6.02,
+    "label": "vs sequential reduce \u00b7 live NIM"
+  },
+  "rows": [
+    {
+      "chunks": 4,
+      "sequential_wall_ms": 106278.7,
+      "parallel_wall_ms": 17663.9,
+      "speedup": 6.02,
+      "sequential_carbon_g": 0.0838,
+      "parallel_carbon_g": 0.3296,
+      "provider": "nim"
+    },
+    {
+      "chunks": 8,
+      "sequential_wall_ms": 54051.9,
+      "parallel_wall_ms": 50020.9,
+      "speedup": 1.08,
+      "sequential_carbon_g": 1.2236,
+      "parallel_carbon_g": 1.3457,
+      "provider": "nim"
+    },
+    {
+      "chunks": 8,
+      "sequential_wall_ms": null,
+      "parallel_wall_ms": 263249.6,
+      "speedup": null,
+      "sequential_carbon_g": null,
+      "parallel_carbon_g": 0.924,
+      "provider": "nim",
+      "label": "FinalReport.pdf live validation",
+      "qva_confidence": 0.7523,
+      "rate_limit_requeues": 0,
+      "hard_isolation_timeouts": 2,
+      "wall_clock_sec": 263.2
+    }
+  ],
+  "full": [
+    {
+      "provider": "nim",
+      "chunks": 4,
+      "sequential_wall_ms": 106278.7,
+      "parallel_wall_ms": 17663.9,
+      "speedup": 6.02,
+      "sequential_carbon_g": 0.0838,
+      "parallel_carbon_g": 0.3296,
+      "parallel_avg_latency_ms": 9323.4,
+      "parallel_critical_path_ms": 9323.4,
+      "workers": 4,
+      "seq_detail": {
+        "mode": "sequential",
+        "provider": "nim",
+        "chunks": 4,
+        "workers": 1,
+        "wall_ms": 106278.7,
+        "compile_calls": 1,
+        "carbon_g": 0.0838,
+        "final_len": 1669,
+        "avg_node_latency_ms": 14227.9,
+        "critical_path_ms": 14227.9,
+        "used_heavy": true,
+        "qva_hint": "live_models"
+      },
+      "par_detail": {
+        "mode": "parallel_dag",
+        "provider": "nim",
+        "chunks": 4,
+        "workers": 4,
+        "wall_ms": 17663.9,
+        "compile_calls": 1,
+        "carbon_g": 0.3296,
+        "final_len": 1754,
+        "avg_node_latency_ms": 9323.4,
+        "critical_path_ms": 9323.4,
+        "used_heavy": true,
+        "qva_hint": "live_models"
+      }
+    },
+    {
+      "provider": "nim",
+      "chunks": 8,
+      "sequential_wall_ms": 54051.9,
+      "parallel_wall_ms": 50020.9,
+      "speedup": 1.08,
+      "sequential_carbon_g": 1.2236,
+      "parallel_carbon_g": 1.3457,
+      "parallel_avg_latency_ms": 8232.5,
+      "parallel_critical_path_ms": 10399.7,
+      "workers": 4,
+      "seq_detail": {
+        "mode": "sequential",
+        "provider": "nim",
+        "chunks": 8,
+        "workers": 1,
+        "wall_ms": 54051.9,
+        "compile_calls": 3,
+        "carbon_g": 1.2236,
+        "final_len": 2733,
+        "avg_node_latency_ms": 8050.6,
+        "critical_path_ms": 8412.2,
+        "used_heavy": true,
+        "qva_hint": "live_models"
+      },
+      "par_detail": {
+        "mode": "parallel_dag",
+        "provider": "nim",
+        "chunks": 8,
+        "workers": 4,
+        "wall_ms": 50020.9,
+        "compile_calls": 3,
+        "carbon_g": 1.3457,
+        "final_len": 1726,
+        "avg_node_latency_ms": 8232.5,
+        "critical_path_ms": 10399.7,
+        "used_heavy": true,
+        "qva_hint": "live_models"
+      }
+    }
+  ],
+  "finalreport_validation": {
+    "wall_clock_sec": 263.2,
+    "chunks": 8,
+    "qva_confidence": 0.7523,
+    "rate_limit_requeues": 0,
+    "hard_isolation_timeouts": 2,
+    "generated_at": "2026-07-15T06:56:56.707921+00:00"
+  }
+}
