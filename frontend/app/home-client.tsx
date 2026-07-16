@@ -52,6 +52,8 @@ function PrefetchCriticalRoutes() {
       router.prefetch("/results")
       router.prefetch("/settings")
       router.prefetch("/signup")
+      // Idle prewarm: create/touch guest session without blocking browsing
+      void import("@/lib/guest-session").then((m) => m.prewarmGuestSession())
     })
     return () => {
       if (typeof window !== "undefined" && "cancelIdleCallback" in window) {

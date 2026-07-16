@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation"
 import { motion } from "framer-motion"
 import { Sidebar } from "@/components/sidebar"
 import { TopBar } from "@/components/top-bar"
-import { GuestOwnerGate } from "@/components/guest-owner-gate"
+import { GuestOwnerGate, useGuestOwner } from "@/components/guest-owner-gate"
 import { UploadZone } from "@/components/upload-zone"
 import { SmartRoutingPanel } from "@/components/smart-routing-panel"
 import { getAccessToken } from "@/lib/api"
@@ -76,21 +76,30 @@ function uploadSummarize(
   })
 }
 
-export default function NewJobPage() {
+function NewJobContent() {
   const router = useRouter()
+  const { ownerReady, connecting } = useGuestOwner()
   const [step, setStep] = useState<"upload" | "confirm">("upload")
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [preference, setPreference] = useState<RoutingPreference>("automatic")
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [uploadPct, setUploadPct] = useState<number | null>(null)
 
+  const uploadDisabled = !ownerReady
+  const uploadStatus = connecting
+    ? "Connecting demo workspace…"
+    : uploadDisabled
+      ? "Waiting for demo workspace…"
+      : null
+
   const handleFileSelect = (file: File) => {
+    if (!ownerReady) return
     setSelectedFile(file)
     setStep("confirm")
   }
 
   const handleSubmit = async () => {
-    if (!selectedFile || isSubmitting) return
+    if (!selectedFile || isSubmitting || !ownerReady) return
     setIsSubmitting(true)
     setUploadPct(0)
     try {
@@ -110,7 +119,6 @@ export default function NewJobPage() {
   }
 
   return (
-    <GuestOwnerGate>
     <div className="flex">
       <Sidebar />
       <div className="flex-1">
@@ -128,7 +136,11 @@ export default function NewJobPage() {
               </div>
               <div className="xl:col-span-3">
                 {step === "upload" || !selectedFile ? (
-                  <UploadZone onFileSelect={handleFileSelect} />
+                  <UploadZone
+                    onFileSelect={handleFileSelect}
+                    disabled={uploadDisabled}
+                    statusMessage={uploadStatus}
+                  />
                 ) : (
                   <SmartRoutingPanel
                     fileName={selectedFile.name}
@@ -149,6 +161,13 @@ export default function NewJobPage() {
         </main>
       </div>
     </div>
+  )
+}
+
+export default function NewJobPage() {
+  return (
+    <GuestOwnerGate>
+      <NewJobContent />
     </GuestOwnerGate>
   )
 }

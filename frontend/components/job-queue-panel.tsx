@@ -3,8 +3,12 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
-import { apiFetch } from "@/lib/api"
+import { apiFetch, getAccessToken } from "@/lib/api"
 import { rememberJobId } from "@/lib/job-session"
+import {
+  getGuestSessionId,
+  subscribeGuestSessionReady,
+} from "@/lib/guest-session"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Loader2, XCircle, RefreshCw, ListTodo } from "lucide-react"
@@ -103,6 +107,10 @@ export function JobQueuePanel({
   const needsFastPollRef = useRef(true)
 
   const refresh = useCallback(async () => {
+    // Skip until Owner identity exists (JWT or guest) — avoids noisy 401s during bootstrap
+    if (!getAccessToken() && !getGuestSessionId()) {
+      return
+    }
     try {
       const [qRes, hRes] = await Promise.all([
         apiFetch("/queue"),
@@ -145,6 +153,12 @@ export function JobQueuePanel({
       setError("Could not load job queue")
     }
   }, [autoSelectLatest, currentJobId, onSelectJob])
+
+  useEffect(() => {
+    return subscribeGuestSessionReady(() => {
+      void refresh()
+    })
+  }, [refresh])
 
   useEffect(() => {
     let cancelled = false

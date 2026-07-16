@@ -19,6 +19,12 @@ export type GuestSessionInfo = {
   resumed?: boolean
 }
 
+type ReadyListener = (info: GuestSessionInfo) => void
+
+const readyListeners = new Set<ReadyListener>()
+/** Single-flight: landing idle prewarm + Live Demo click + GuestOwnerGate share one POST. */
+let ensureInflight: Promise<GuestSessionInfo> | null = null
+
 function logGuest(event: string, detail?: Record<string, unknown>) {
   if (typeof console !== "undefined") {
     console.info(`[Guest] ${event}`, detail || "")
@@ -69,7 +75,25 @@ function persistGuest(data: GuestSessionInfo): void {
   sessionStorage.setItem(GUEST_META_KEY, JSON.stringify(data))
 }
 
-export async function ensureGuestSession(): Promise<GuestSessionInfo> {
+function notifyGuestReady(info: GuestSessionInfo): void {
+  for (const cb of readyListeners) {
+    try {
+      cb(info)
+    } catch {
+      /* ignore listener errors */
+    }
+  }
+}
+
+/** Subscribe when a guest session is created/resumed (after persist). */
+export function subscribeGuestSessionReady(cb: ReadyListener): () => void {
+  readyListeners.add(cb)
+  return () => {
+    readyListeners.delete(cb)
+  }
+}
+
+async function createOrTouchGuestSession(): Promise<GuestSessionInfo> {
   const existing = getGuestSessionId()
   const headers: Record<string, string> = { "Content-Type": "application/json" }
   if (existing) headers["X-Guest-Session-Id"] = existing
@@ -94,7 +118,32 @@ export async function ensureGuestSession(): Promise<GuestSessionInfo> {
     anonymous_name: data.anonymous_name,
     expires_at: data.expires_at,
   })
+  notifyGuestReady(data)
   return data
+}
+
+/**
+ * Create or resume guest session. Dedupes concurrent callers.
+ * If a valid id already exists locally, callers can proceed immediately;
+ * this still touches expiry in the background via the same single-flight.
+ */
+export async function ensureGuestSession(): Promise<GuestSessionInfo> {
+  if (ensureInflight) return ensureInflight
+  ensureInflight = createOrTouchGuestSession().finally(() => {
+    ensureInflight = null
+  })
+  return ensureInflight
+}
+
+/** Fire-and-forget idle prewarm — never throws to callers. */
+export function prewarmGuestSession(): void {
+  if (typeof window === "undefined") return
+  try {
+    if (localStorage.getItem("access_token")) return
+  } catch {
+    /* ignore */
+  }
+  void ensureGuestSession().catch(() => undefined)
 }
 
 export async function fetchGuestSessionInfo(): Promise<Record<string, unknown> | null> {

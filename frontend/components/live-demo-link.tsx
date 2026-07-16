@@ -4,20 +4,20 @@ import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { useEffect, type ComponentProps, type MouseEvent, type ReactNode } from "react"
 import { getAccessToken } from "@/lib/api"
-import { ensureGuestSession, getGuestSessionId } from "@/lib/guest-session"
+import { ensureGuestSession } from "@/lib/guest-session"
 
 type Props = {
   children: ReactNode
   className?: string
   "data-testid"?: string
-  /** Where to land after guest/auth is ready. Default: new job. */
+  /** Where to land after click. Default: new job. */
   nextPath?: string
 } & Omit<ComponentProps<typeof Link>, "href" | "prefetch">
 
 /**
  * Live Demo / Try Demo CTA.
- * Creates a guest session (no login) and routes into the app.
- * Authed users / existing guests navigate immediately (session touch in background).
+ * Navigates immediately — never awaits networking.
+ * Guest session create/resume runs in the background (and in GuestOwnerGate).
  */
 export function LiveDemoLink({
   children,
@@ -31,31 +31,21 @@ export function LiveDemoLink({
   useEffect(() => {
     router.prefetch(nextPath)
     router.prefetch("/new-job")
+    router.prefetch("/dashboard")
+    router.prefetch("/results")
+    router.prefetch("/settings")
     router.prefetch("/login")
   }, [router, nextPath])
 
-  const handleClick = async (e: MouseEvent<HTMLAnchorElement>) => {
+  const handleClick = (e: MouseEvent<HTMLAnchorElement>) => {
     onClick?.(e)
     if (e.defaultPrevented) return
     e.preventDefault()
-    try {
-      // Instant path: already have owner identity
-      if (getAccessToken() || getGuestSessionId()) {
-        router.push(nextPath)
-        if (!getAccessToken()) {
-          void ensureGuestSession().catch(() => undefined)
-        }
-        return
-      }
-      // Warm navigation while session creates (feels instant)
-      router.prefetch(nextPath)
-      await ensureGuestSession()
-      router.push(nextPath)
-    } catch (err) {
-      console.error("[Guest] Live Demo failed", err)
-      window.alert(
-        "Could not start a guest demo session. Check that the API is running, then retry.",
-      )
+    // Navigation must never wait on networking
+    router.push(nextPath)
+    // Race ahead of GuestOwnerGate mount (single-flight dedupes with gate/prewarm)
+    if (!getAccessToken()) {
+      void ensureGuestSession().catch(() => undefined)
     }
   }
 
