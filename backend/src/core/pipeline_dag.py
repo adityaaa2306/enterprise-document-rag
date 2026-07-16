@@ -317,6 +317,44 @@ def build_hierarchy_onto_chunks(
             )
         elif len(top) == 1 and nodes[top[0]].kind != "chunk":
             nodes[top[0]].kind = "executive"
+        elif len(top) == 1 and nodes[top[0]].kind == "chunk":
+            # Tiny/flat docs: skip_regional leaves a lone chunk at the top.
+            # Always wrap it so executive compile still runs (avoids dag_empty stitch).
+            fid = "final-executive"
+            nodes[fid] = DagNode(
+                id=fid,
+                kind="executive",
+                depth=len(level_ids),
+                dep_ids=list(top),
+                status="pending",
+                section_path="executive",
+            )
+
+    # Safety: if hierarchy produced no compile nodes but we have completed/pending
+    # chunk leaves with text, still attach a final-executive over them.
+    has_exec = any(n.kind in ("executive", "final") for n in nodes.values())
+    if not has_exec:
+        chunk_ids = sorted(
+            (
+                nid
+                for nid, n in nodes.items()
+                if n.kind == "chunk"
+                and (
+                    str(n.output_summary or "").strip()
+                    or str(n.input_text or "").strip()
+                )
+            ),
+            key=lambda x: x,
+        )
+        if chunk_ids:
+            nodes["final-executive"] = DagNode(
+                id="final-executive",
+                kind="executive",
+                depth=max((n.depth for n in nodes.values()), default=0) + 1,
+                dep_ids=list(chunk_ids),
+                status="pending",
+                section_path="executive",
+            )
 
     _link_parents_children(nodes)
     return nodes

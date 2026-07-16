@@ -702,6 +702,7 @@ def execute_document_dag(
             "compile_calls": dag_out.get("compile_calls"),
             "compile_carbon_g": dag_out.get("compile_carbon_g"),
             "used_heavy": dag_out.get("used_heavy"),
+            "used_stitched_fallback": bool(dag_out.get("used_stitched_fallback")),
             "hierarchy": dag_out.get("hierarchy"),
             "dag_nodes": dag_out.get("dag_nodes"),
             "carbon_rollups": rollups,

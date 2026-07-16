@@ -3,6 +3,7 @@ from src.core.pipeline_dag import (
     DagNode,
     allow_planning_overflow,
     build_chunk_nodes,
+    build_hierarchy_onto_chunks,
     compute_dynamic_fan_in,
     context_token_budget,
     ensure_prompt_budget,
@@ -33,6 +34,32 @@ def test_build_chunk_nodes_are_pending_not_stub_completed():
     assert len(nodes) == 2
     assert all(n.status == "pending" for n in nodes.values())
     assert nodes["chunk-0"].tier == "light"
+    assert nodes["chunk-0"].kind == "chunk"
+
+
+def test_tiny_single_chunk_always_gets_final_executive():
+    """Regression: skip_regional_below=99 + 1 chunk must not leave a chunk-only DAG (dag_empty)."""
+    chunks = [_C("Trip itinerary Ahmedabad to Pune with baggage and fare details. " * 8)]
+    summaries = [
+        "Extractive fallback: Ahmedabad to Pune IndiGo flight with passenger details."
+    ]
+    nodes = build_chunk_nodes(chunks, routes={0: {"tier": "light"}})
+    nodes["chunk-0"].status = "completed"
+    nodes["chunk-0"].output_summary = summaries[0]
+    nodes = build_hierarchy_onto_chunks(
+        nodes,
+        chunks,
+        summaries,
+        fan_in=8,
+        max_depth=2,
+        skip_regional_below=99,
+    )
+    exec_nodes = [n for n in nodes.values() if n.kind in ("executive", "final")]
+    assert exec_nodes, "expected final-executive for tiny/flat single-chunk docs"
+    assert any(n.id == "final-executive" for n in exec_nodes)
+    fe = nodes["final-executive"]
+    assert fe.dep_ids == ["chunk-0"]
+    assert fe.kind == "executive"
     assert nodes["chunk-0"].kind == "chunk"
 
 

@@ -796,8 +796,12 @@ def run_dag_compile(
             for n in nodes.values()
             if n.depth == depth_max and n.kind != "chunk" and n.status == "completed"
         ]
+    used_stitched_fallback = False
     if len(final_nodes) == 1:
         final_summary = final_nodes[0].output_summary
+        # If the sole "executive" output is itself a stitch marker, keep flag for UI.
+        if "stitched fallback" in str(final_summary or "").lower():
+            used_stitched_fallback = True
     elif final_nodes:
         joined = "\n\n".join(n.output_summary for n in final_nodes)
         try:
@@ -809,14 +813,46 @@ def run_dag_compile(
             )
             compile_calls += 1
             api_calls += 1
+            if "stitched fallback" in str(final_summary or "").lower():
+                used_stitched_fallback = True
         except Exception:
             final_summary = models.stitch_compile_fallback(
                 [n.output_summary for n in final_nodes], reason="final_merge_failed"
             )
+            used_stitched_fallback = True
     else:
-        final_summary = models.stitch_compile_fallback(
-            list(summaries), reason="dag_empty"
-        )
+        # Chunk-only DAG should be rare after hierarchy always wraps an executive.
+        # Prefer a real LLM compile over stitching when summaries exist.
+        usable = [str(s).strip() for s in (summaries or []) if str(s or "").strip()]
+        if usable and (
+            deadline_mono is None or float(deadline_mono) - time.monotonic() > 8.0
+        ):
+            try:
+                final_summary = models.run_compile_with_models(
+                    usable,
+                    state,
+                    heavy_chain or medium_chain,
+                    deadline_mono=deadline_mono,
+                )
+                compile_calls += 1
+                api_calls += 1
+                if "stitched fallback" in str(final_summary or "").lower():
+                    used_stitched_fallback = True
+                else:
+                    log.info(
+                        "Recovered executive summary via direct compile after empty DAG finals"
+                    )
+            except Exception as e:
+                log.warning("Direct compile after dag_empty failed: %s", e)
+                final_summary = models.stitch_compile_fallback(
+                    usable, reason="no_executive_node"
+                )
+                used_stitched_fallback = True
+        else:
+            final_summary = models.stitch_compile_fallback(
+                list(summaries), reason="no_executive_node"
+            )
+            used_stitched_fallback = True
 
     _progress("DAG compile complete")
     wall_ms = (time.perf_counter() - t_wall0) * 1000.0
@@ -926,6 +962,7 @@ def run_dag_compile(
         "compile_calls": compile_calls,
         "compile_carbon_g": round(carbon_total, 4),
         "used_heavy": any(n.used_heavy for n in nodes.values()),
+        "used_stitched_fallback": used_stitched_fallback,
         "hierarchy": levels_ui,
         "dag_nodes": node_status,
         "workers": workers,

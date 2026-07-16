@@ -465,6 +465,7 @@
    * hypothesis (~2.75rem) + sub (~3.75rem) + CTAs (~3rem) + gaps (~2.5rem)
    */
   --landing-hero-chrome: 12.5rem;
+  --landing-hero-mobile-chrome: 8.25rem;
   height: 100dvh;
   height: 100svh;
   max-height: 100dvh;
@@ -558,9 +559,46 @@
 }
 
 .landing-root .landing-hero-title-mobile {
-  font-size: clamp(1.65rem, 1rem + 2.8vw, 2.15rem);
+  /*
+   * Phone: fill leftover viewport after reserved sub + CTAs chrome.
+   * ~6–7 lines of headline, then pillars + buttons still on-screen.
+   */
+  flex: 0 0 auto;
+  margin: 0;
+  max-width: none;
+  font-size: clamp(
+    1.55rem,
+    min(
+      7.2vw,
+      calc(
+        (
+          100svh - var(--landing-hero-pad-top) - var(--landing-hero-pad-bottom) -
+            var(--landing-hero-mobile-chrome)
+        ) / 7.2
+      )
+    ),
+    2.35rem
+  );
   line-height: 1.08;
-  max-width: 20rem;
+  letter-spacing: -0.03em;
+}
+
+@supports not (height: 100svh) {
+  .landing-root .landing-hero-title-mobile {
+    font-size: clamp(
+      1.55rem,
+      min(
+        7.2vw,
+        calc(
+          (
+            100dvh - var(--landing-hero-pad-top) - var(--landing-hero-pad-bottom) -
+              var(--landing-hero-mobile-chrome)
+          ) / 7.2
+        )
+      ),
+      2.35rem
+    );
+  }
 }
 
 .landing-root .landing-hero-title-desktop {
@@ -608,22 +646,61 @@
   line-height: 1.45;
 }
 
-/* Mobile: keep hyp + title + sub + CTAs in first screen; diagram scrolls after */
+/*
+ * Phone first viewport = ONLY headline + pillars + Try Demo / Sign In.
+ * Diagram lives in a separate section below (HeroMobileDiagram).
+ */
 @media (max-width: 1023px) {
   .landing-root .landing-hero {
-    height: auto;
-    max-height: none;
+    /* Reserved for pillars (~3.5rem) + CTAs (~3rem) + gaps (~1.5rem) */
+    --landing-hero-mobile-chrome: 8.25rem;
+    --landing-hero-pad-top: calc(var(--landing-nav-h) + env(safe-area-inset-top, 0px) + 0.55rem);
+    --landing-hero-pad-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px));
+    height: 100dvh;
+    height: 100svh;
+    max-height: 100dvh;
+    max-height: 100svh;
     min-height: 100dvh;
     min-height: 100svh;
-    overflow: visible;
+    overflow: hidden;
+  }
+
+  .landing-root .landing-hero-frame {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    height: 100%;
+  }
+
+  .landing-root .landing-hero-grid {
+    flex: 1 1 auto;
+    min-height: 0;
+    height: 100%;
+  }
+
+  .landing-root .landing-hero-copy {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    height: 100%;
+    min-height: 0;
+    max-height: 100%;
   }
 
   .landing-root .landing-hero-footer {
-    margin-top: 1rem;
+    flex-shrink: 0;
+    margin-top: 0.85rem;
+  }
+
+  .landing-root .landing-hero-sub {
+    margin: 0 !important;
+    font-size: clamp(0.8125rem, 0.75rem + 0.45vw, 0.95rem);
+    line-height: 1.4;
   }
 
   .landing-root .landing-hero-ctas {
-    margin-top: 0.9rem !important;
+    margin-top: 0.85rem !important;
   }
 }
 

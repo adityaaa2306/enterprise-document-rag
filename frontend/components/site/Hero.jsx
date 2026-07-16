@@ -129,15 +129,16 @@ export default function Hero() {
       <div className="relative max-w-[1400px] mx-auto px-4 sm:px-6 md:px-10 w-full landing-hero-frame">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 lg:gap-6 landing-hero-grid">
           <motion.div style={{ y, opacity }} className="lg:col-span-7 xl:col-span-8 relative min-w-0 landing-hero-copy">
-            <div className="flex items-baseline gap-3 md:gap-4 landing-hero-mark">
-              <span className="font-serif italic text-[1.75rem] md:text-4xl lg:text-[2.5rem] text-neutral-700 leading-none">I.</span>
+            {/* Desktop chapter mark only — phone first viewport is headline + sub + CTAs */}
+            <div className="hidden lg:flex items-baseline gap-3 md:gap-4 landing-hero-mark">
+              <span className="font-serif italic text-[2.5rem] text-neutral-700 leading-none">I.</span>
               <span className="font-mono text-[10px] uppercase tracking-[0.24em] text-neutral-500">
                 Hypothesis
               </span>
             </div>
 
-            {/* Mobile flowing headline */}
-            <h1 className="font-display font-medium text-white tracking-[-0.03em] lg:hidden landing-hero-title-mobile mt-2">
+            {/* Mobile: fill leftover viewport height; sub + CTAs locked below */}
+            <h1 className="font-display font-medium text-white tracking-[-0.03em] lg:hidden landing-hero-title-mobile">
               <motion.span
                 className="block"
                 initial={{ opacity: 0, y: 16 }}
@@ -234,32 +235,35 @@ export default function Hero() {
             </div>
           </motion.div>
         </div>
+      </div>
+    </section>
+  );
+}
 
-        {/* Mobile diagram — after CTAs, still in hero but typically below fold on phones */}
-        <motion.div
-          initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }}
-          transition={{ delay: 0.5, duration: 1.2, ease: [0.22, 1, 0.36, 1] }}
-          className="mt-8 lg:hidden relative min-w-0"
-        >
-          <div className="relative aspect-[4/5] sm:aspect-[3/4] border border-white/10 bg-[#080808]">
-            {["tl","tr","bl","br"].map((c) => (
-              <div key={c} className={`absolute w-3 h-3 border-emerald-400/60
-                ${c==="tl"?"top-2 left-2 border-t border-l":""}
-                ${c==="tr"?"top-2 right-2 border-t border-r":""}
-                ${c==="bl"?"bottom-2 left-2 border-b border-l":""}
-                ${c==="br"?"bottom-2 right-2 border-b border-r":""}
-              `} />
-            ))}
-            <div className="absolute top-3 left-3 flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.2em] text-neutral-500">
-              <span className="w-1 h-1 bg-emerald-400 rounded-full" />
-              fig. 01 — routing topology
-            </div>
-            <div className="absolute bottom-3 right-3 font-mono text-[10px] uppercase tracking-[0.2em] text-neutral-600">
-              8 nodes / 5 chunks
-            </div>
-            <NodeGraph />
-          </div>
-        </motion.div>
+/** Mobile-only routing topology — lives below the first viewport hero. */
+export function HeroMobileDiagram() {
+  return (
+    <section
+      data-testid="hero-mobile-diagram"
+      className="relative lg:hidden px-4 sm:px-6 pb-10"
+    >
+      <div className="relative aspect-[4/5] sm:aspect-[3/4] border border-white/10 bg-[#080808] max-w-[1400px] mx-auto">
+        {["tl","tr","bl","br"].map((c) => (
+          <div key={c} className={`absolute w-3 h-3 border-emerald-400/60
+            ${c==="tl"?"top-2 left-2 border-t border-l":""}
+            ${c==="tr"?"top-2 right-2 border-t border-r":""}
+            ${c==="bl"?"bottom-2 left-2 border-b border-l":""}
+            ${c==="br"?"bottom-2 right-2 border-b border-r":""}
+          `} />
+        ))}
+        <div className="absolute top-3 left-3 flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.2em] text-neutral-500">
+          <span className="w-1 h-1 bg-emerald-400 rounded-full" />
+          fig. 01 — routing topology
+        </div>
+        <div className="absolute bottom-3 right-3 font-mono text-[10px] uppercase tracking-[0.2em] text-neutral-600">
+          8 nodes / 5 chunks
+        </div>
+        <NodeGraph />
       </div>
     </section>
   );
