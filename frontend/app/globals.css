@@ -560,43 +560,49 @@
 
 .landing-root .landing-hero-title-mobile {
   /*
-   * Phone: fill leftover viewport after reserved sub + CTAs chrome.
-   * ~6–7 lines of headline, then pillars + buttons still on-screen.
+   * Phone cinematic cover: ~15–20% larger again so the headline nearly
+   * fills the first viewport. Family/weight/tracking unchanged; desktop
+   * uses .landing-hero-title-desktop only.
    */
   flex: 0 0 auto;
   margin: 0;
-  max-width: none;
+  max-width: 100%;
+  width: 100%;
   font-size: clamp(
-    1.55rem,
+    2.25rem,
     min(
-      7.2vw,
+      10.8vw,
       calc(
         (
           100svh - var(--landing-hero-pad-top) - var(--landing-hero-pad-bottom) -
             var(--landing-hero-mobile-chrome)
-        ) / 7.2
+        ) / 4.85
       )
     ),
-    2.35rem
+    3.5rem
   );
-  line-height: 1.08;
+  line-height: 1.05;
   letter-spacing: -0.03em;
+  overflow-wrap: break-word;
+  word-break: normal;
+  /* Balanced wraps so oversized lines stay editorial, not ragged */
+  text-wrap: balance;
 }
 
 @supports not (height: 100svh) {
   .landing-root .landing-hero-title-mobile {
     font-size: clamp(
-      1.55rem,
+      2.25rem,
       min(
-        7.2vw,
+        10.8vw,
         calc(
           (
             100dvh - var(--landing-hero-pad-top) - var(--landing-hero-pad-bottom) -
               var(--landing-hero-mobile-chrome)
-          ) / 7.2
+          ) / 4.85
         )
       ),
-      2.35rem
+      3.5rem
     );
   }
 }
@@ -652,10 +658,10 @@
  */
 @media (max-width: 1023px) {
   .landing-root .landing-hero {
-    /* Reserved for pillars (~3.5rem) + CTAs (~3rem) + gaps (~1.5rem) */
-    --landing-hero-mobile-chrome: 8.25rem;
-    --landing-hero-pad-top: calc(var(--landing-nav-h) + env(safe-area-inset-top, 0px) + 0.55rem);
-    --landing-hero-pad-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px));
+    /* Reserved for pillars + CTAs sitting on the bottom safe edge */
+    --landing-hero-mobile-chrome: 7.75rem;
+    --landing-hero-pad-top: calc(var(--landing-nav-h) + env(safe-area-inset-top, 0px) + 0.4rem);
+    --landing-hero-pad-bottom: calc(0.45rem + env(safe-area-inset-bottom, 0px));
     height: 100dvh;
     height: 100svh;
     max-height: 100dvh;
@@ -671,36 +677,41 @@
     flex-direction: column;
     min-height: 0;
     height: 100%;
+    overflow: hidden;
   }
 
   .landing-root .landing-hero-grid {
     flex: 1 1 auto;
     min-height: 0;
     height: 100%;
+    overflow: hidden;
   }
 
   .landing-root .landing-hero-copy {
     display: flex;
     flex-direction: column;
-    justify-content: space-between;
+    justify-content: flex-start;
     height: 100%;
     min-height: 0;
     max-height: 100%;
+    overflow: hidden;
   }
 
+  /* Pin pillars + CTAs to the bottom of the first viewport (above home indicator) */
   .landing-root .landing-hero-footer {
     flex-shrink: 0;
-    margin-top: 0.85rem;
+    margin-top: auto;
+    padding-bottom: 0;
   }
 
   .landing-root .landing-hero-sub {
     margin: 0 !important;
     font-size: clamp(0.8125rem, 0.75rem + 0.45vw, 0.95rem);
-    line-height: 1.4;
+    line-height: 1.35;
   }
 
   .landing-root .landing-hero-ctas {
-    margin-top: 0.85rem !important;
+    margin-top: 0.7rem !important;
   }
 }
 
