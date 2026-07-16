@@ -49,15 +49,22 @@ class ConversationState:
     turns: List[ConversationTurn] = field(default_factory=list)
     created_at: float = field(default_factory=lambda: time.time())
     updated_at: float = field(default_factory=lambda: time.time())
+    owner_type: Optional[str] = None
+    owner_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "conversation_id": self.conversation_id,
             "document_id": self.document_id,
             "turns": [t.to_dict() for t in self.turns],
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+        if self.owner_type:
+            d["owner_type"] = self.owner_type
+        if self.owner_id:
+            d["owner_id"] = self.owner_id
+        return d
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ConversationState":
@@ -67,6 +74,8 @@ class ConversationState:
             turns=[ConversationTurn.from_dict(t) for t in (d.get("turns") or []) if isinstance(t, dict)],
             created_at=float(d.get("created_at") or time.time()),
             updated_at=float(d.get("updated_at") or time.time()),
+            owner_type=str(d["owner_type"]) if d.get("owner_type") else None,
+            owner_id=str(d["owner_id"]) if d.get("owner_id") else None,
         )
 
 
@@ -200,6 +209,8 @@ class MemoryService:
         user_id: Optional[int] = None,
     ) -> None:
         state.updated_at = time.time()
+        state.owner_type = str(owner_type)
+        state.owner_id = str(owner_id)
         if getattr(settings, "PERSIST_CONVERSATIONS_TO_DB", True):
             try:
                 from src.db import conversations as conv_db
@@ -215,11 +226,27 @@ class MemoryService:
                 )
                 if ok:
                     return
+            except PermissionError:
+                raise
             except Exception as e:
                 log.warning(f"DB conversation save failed, falling back to file: {e}")
 
         path = _conv_path(state.conversation_id)
         tmp = path + ".tmp"
+        # Refuse file overwrite when an existing file belongs to someone else.
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    prior = json.load(f)
+                pot, poid = prior.get("owner_type"), prior.get("owner_id")
+                if pot and poid and (
+                    str(pot) != str(owner_type) or str(poid) != str(owner_id)
+                ):
+                    raise PermissionError("Conversation ownership mismatch")
+            except PermissionError:
+                raise
+            except Exception:
+                pass
         payload = state.to_dict()
         payload["owner_type"] = owner_type
         payload["owner_id"] = owner_id
@@ -252,11 +279,31 @@ class MemoryService:
         owner_id: str,
         user_id: Optional[int] = None,
     ) -> ConversationState:
+        from src.core.owner import owners_match
+
         cid = conversation_id or str(uuid.uuid4())
         existing = self.get_conversation(cid)
         if existing and existing.document_id == document_id:
+            # IDOR guard: never return another owner's conversation.
+            if existing.owner_type and existing.owner_id:
+                if not owners_match(
+                    {"owner_type": owner_type, "owner_id": owner_id},
+                    owner_type=str(existing.owner_type),
+                    owner_id=str(existing.owner_id),
+                ):
+                    raise PermissionError("Conversation ownership mismatch")
+            elif existing.turns:
+                # Legacy conversation without owner stamp — fail closed.
+                raise PermissionError("Conversation ownership unknown")
             return existing
-        state = ConversationState(conversation_id=cid, document_id=document_id)
+        if existing and existing.document_id != document_id:
+            raise PermissionError("Conversation/document mismatch")
+        state = ConversationState(
+            conversation_id=cid,
+            document_id=document_id,
+            owner_type=str(owner_type),
+            owner_id=str(owner_id),
+        )
         self.save_conversation(
             state, owner_type=owner_type, owner_id=owner_id, user_id=user_id
         )
@@ -274,9 +321,18 @@ class MemoryService:
         owner_id: str,
         user_id: Optional[int] = None,
     ) -> Optional[ConversationState]:
+        from src.core.owner import owners_match
+
         state = self.get_conversation(conversation_id)
         if not state:
             return None
+        if state.owner_type and state.owner_id:
+            if not owners_match(
+                {"owner_type": owner_type, "owner_id": owner_id},
+                owner_type=str(state.owner_type),
+                owner_id=str(state.owner_id),
+            ):
+                raise PermissionError("Conversation ownership mismatch")
         state.turns.append(
             ConversationTurn(
                 role=role,

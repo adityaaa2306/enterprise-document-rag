@@ -53,6 +53,24 @@ services:
         value: r2
       - key: CORS_ALLOW_ALL
         value: "false"
+      - key: FORCE_HTTPS
+        value: "true"
+      - key: TRUST_PROXY_HEADERS
+        value: "true"
+      - key: AUTH_COOKIE_SECURE
+        value: "true"
+      - key: DATABASE_REQUIRE_SSL
+        value: "true"
+      - key: ABUSE_PROTECTION_ENABLED
+        value: "true"
+      - key: API_RATE_LIMIT
+        value: "120"
+      - key: AI_RATE_LIMIT
+        value: "20"
+      - key: AI_RATE_LIMIT_GUEST
+        value: "10"
+      - key: SCRAPE_RATE_LIMIT
+        value: "60"
       - key: DATABASE_URL
         sync: false
       - key: JWT_SECRET_KEY

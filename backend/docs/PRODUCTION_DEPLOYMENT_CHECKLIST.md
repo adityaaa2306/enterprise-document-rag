@@ -10,8 +10,10 @@ Platforms: **Vercel** + **Render** + **Neon** + **Cloudflare R2** + **NVIDIA NIM
 ### Render (Web Service `green-agentic-api`)
 
 - [ ] `APP_ENV=production`
-- [ ] `DATABASE_URL` = Neon **pooled** URL with SSL (`postgresql://…` or `postgresql+psycopg://…`)
-- [ ] `JWT_SECRET_KEY` generated (Blueprint `generateValue` or manual)
+- [ ] `DATABASE_URL` = Neon **pooled** URL with SSL (`…?sslmode=require` or provider default TLS)
+- [ ] Neon: **restrict IP / no public unrestricted access** (prefer platform private networking; never open `0.0.0.0:5432`)
+- [ ] `JWT_SECRET_KEY` generated in Render secret store (Blueprint `generateValue` or manual ≥32 chars) — **never** in git / `NEXT_PUBLIC_*`
+- [ ] `FORCE_HTTPS=true`, `TRUST_PROXY_HEADERS=true`, `AUTH_COOKIE_SECURE=true`
 - [ ] `NVIDIA_API_KEY` set (optional peer keys if using pool)
 - [ ] `OBJECT_STORAGE_BACKEND=r2`
 - [ ] `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`
@@ -27,6 +29,8 @@ Platforms: **Vercel** + **Render** + **Neon** + **Cloudflare R2** + **NVIDIA NIM
 - [ ] Docker Build Target = **`api`**
 - [ ] Health Check Path = `/api/health`
 - [ ] Docker Command = `/app/scripts/docker-entrypoint-api.sh`
+- [ ] Confirm logs stream `security.audit` (login_success / login_failure / unusual_traffic / rate_limited)
+- [ ] Abuse protection on (`ABUSE_PROTECTION_ENABLED=true`; tune `API_RATE_LIMIT` / `AI_RATE_LIMIT` / `SCRAPE_RATE_LIMIT` if needed)
 
 ### Vercel (Root Directory = `frontend`)
 
@@ -34,6 +38,7 @@ Platforms: **Vercel** + **Render** + **Neon** + **Cloudflare R2** + **NVIDIA NIM
 - [ ] Optional: `NEXT_PUBLIC_JOB_POLL_TIMEOUT_MS`
 - [ ] Framework preset: Next.js
 - [ ] Confirm build uses `next build` / `next start`
+- [ ] No server secrets in Vercel env (only `NEXT_PUBLIC_*` API URL)
 
 ---
 

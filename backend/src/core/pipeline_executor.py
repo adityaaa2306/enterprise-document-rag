@@ -207,9 +207,54 @@ def execute_document_dag(
         except Exception:
             return False
 
-    # Capture job wall before nested workers name their param ``deadline_mono``
-    # (required so ``_supports_deadline`` returns True for the scheduler).
-    job_deadline = deadline_mono
+    # Capture absolute job wall, then isolate a reserved executive-compile budget
+    # so map / escalate / regional / chapter cannot consume it.
+    absolute_job_deadline = deadline_mono
+    reserved_sec = float(getattr(settings, "COMPILE_RESERVED_SEC", 60.0) or 60.0)
+    if absolute_job_deadline is not None:
+        # Carve the reserve from the job wall. Do NOT heal by pushing this
+        # ceiling into the reserved tail — that would let map steal compile time.
+        pre_executive_ceiling = float(absolute_job_deadline) - reserved_sec
+        job_deadline = pre_executive_ceiling
+        if pre_executive_ceiling <= time.monotonic():
+            log.warning(
+                "Job %s: pre-executive ceiling already elapsed "
+                "(map will extractive-fallback); executive still owns reserved=%.0fs",
+                job_id,
+                reserved_sec,
+            )
+    else:
+        pre_executive_ceiling = None
+        job_deadline = None
+    try:
+        from src.core.dag_scheduler import compute_compile_budget_timeline
+
+        _tl = compute_compile_budget_timeline(
+            now_mono=time.monotonic(),
+            absolute_job_deadline_mono=absolute_job_deadline,
+            reserved_sec=reserved_sec,
+            per_task_hard_sec=map_hard,
+        )
+        log.info(
+            "Job %s: compile budget timeline reserved=%.0fs "
+            "pre_executive_remaining=%.1fs absolute_remaining=%.1fs "
+            "executive_owned=%.1fs",
+            job_id,
+            reserved_sec,
+            (
+                float(_tl["pre_executive_ceiling_mono"]) - time.monotonic()
+                if _tl.get("pre_executive_ceiling_mono") is not None
+                else -1.0
+            ),
+            float(_tl["absolute_remaining_sec"] or -1.0),
+            float(_tl["stages"]["executive"]["remaining_sec"]),
+        )
+    except Exception:
+        log.info(
+            "Job %s: compile budget isolation reserved=%.0fs",
+            job_id,
+            reserved_sec,
+        )
 
     def _deadline_remaining(task_deadline: Optional[float] = None) -> float:
         eff = task_deadline if task_deadline is not None else job_deadline
@@ -415,6 +460,7 @@ def execute_document_dag(
         max_attempts=map_attempts,
         is_success=_chunk_ok,
         on_progress=lambda p, m: _emit(p.message("DAG map"), 35.0 + 25.0 * p.completed / max(1, p.total)),
+        deadline_ceiling_mono=job_deadline,
     )
 
     summaries = [""] * len(chunks)
@@ -565,6 +611,7 @@ def execute_document_dag(
             hard_timeout_sec=map_hard,
             max_attempts=min(map_attempts, 3),
             is_success=_chunk_ok,
+            deadline_ceiling_mono=job_deadline,
         )
         # Re-validate only escalated
         try:
@@ -625,10 +672,12 @@ def execute_document_dag(
         medium_first=medium_first,
         qva_tau=compile_tau,
         max_workers=compile_workers,
-        deadline_mono=deadline_mono,
+        deadline_mono=absolute_job_deadline,
         progress_cb=lambda pct, msg, extra: _emit(msg, pct),
         existing_nodes=nodes,
         frozen_plan=exec_plan,
+        pre_executive_ceiling_mono=pre_executive_ceiling,
+        executive_reserved_sec=reserved_sec,
     )
     # Merge node dicts back
     for nid, d in (dag_out.get("dag_nodes") or {}).items():
@@ -702,7 +751,16 @@ def execute_document_dag(
             "compile_calls": dag_out.get("compile_calls"),
             "compile_carbon_g": dag_out.get("compile_carbon_g"),
             "used_heavy": dag_out.get("used_heavy"),
-            "used_stitched_fallback": bool(dag_out.get("used_stitched_fallback")),
+            # Never claim stitched when a durable executive summary is returned.
+            "used_stitched_fallback": bool(dag_out.get("used_stitched_fallback"))
+            and not models.is_executive_compile_success(dag_out.get("final_summary")),
+            "compile_status": dag_out.get("compile_status"),
+            "compile_attempts": dag_out.get("compile_attempts") or [],
+            "best_compile_model": dag_out.get("best_compile_model"),
+            "heavy_compile_skipped": dag_out.get("heavy_compile_skipped"),
+            "summary_source": dag_out.get("summary_source"),
+            "executive_reserved_sec": dag_out.get("executive_reserved_sec")
+            or reserved_sec,
             "hierarchy": dag_out.get("hierarchy"),
             "dag_nodes": dag_out.get("dag_nodes"),
             "carbon_rollups": rollups,

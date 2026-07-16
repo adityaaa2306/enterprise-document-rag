@@ -1,9 +1,15 @@
-WATTTIME_USERNAME = "your_username"
-WATTTIME_PASSWORD = "YourStrongP@ssw0rd!"  # must include letters, numbers, and special chars
-EMAIL = "you@example.com"
-ORG = "your_org"
+# Copy patterns into your shell / .env — do not put real secrets in tracked files.
+#   export WATTTIME_USERNAME=your_username
+#   export WATTTIME_PASSWORD=your_password
+#   export WATTTIME_EMAIL=you@example.com
+#   export WATTTIME_ORG=your_org
+#
+# settings.py reads these from the environment.
 
-# Location to validate region lookup and data fetch (Eugene, Oregon)
+WATTTIME_USERNAME = ""  # set via WATTTIME_USERNAME
+WATTTIME_PASSWORD = ""  # set via WATTTIME_PASSWORD
+EMAIL = ""              # set via WATTTIME_EMAIL
+ORG = ""                # set via WATTTIME_ORG
+
 TEST_LAT = 44.0521
 TEST_LON = -123.0868
-

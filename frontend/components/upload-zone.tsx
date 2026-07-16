@@ -6,6 +6,7 @@ import { motion } from "framer-motion"
 import { Card } from "@/components/ui/card"
 import { Upload, FileText } from "lucide-react"
 import { useState, useRef } from "react"
+import { validateUploadFile } from "@/lib/input-validation"
 
 interface UploadZoneProps {
   onFileSelect: (file: File) => void
@@ -22,7 +23,20 @@ export function UploadZone({
 }: UploadZoneProps) {
   const [isDragging, setIsDragging] = useState(false)
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [localError, setLocalError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const acceptFile = (file: File) => {
+    const result = validateUploadFile(file)
+    if (!result.ok) {
+      setLocalError(result.error)
+      setSelectedFile(null)
+      return
+    }
+    setLocalError(null)
+    setSelectedFile(file)
+    onFileSelect(file)
+  }
 
   const handleCardClick = () => {
     if (disabled) return
@@ -33,10 +47,10 @@ export function UploadZone({
     if (disabled) return
     const files = e.target.files
     if (files && files.length > 0) {
-      const file = files[0]
-      setSelectedFile(file)
-      onFileSelect(file)
+      acceptFile(files[0])
     }
+    // Allow re-selecting the same file after a rejection
+    e.target.value = ""
   }
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -56,9 +70,7 @@ export function UploadZone({
 
     const files = e.dataTransfer.files
     if (files.length > 0) {
-      const file = files[0]
-      setSelectedFile(file)
-      onFileSelect(file)
+      acceptFile(files[0])
     }
   }
 
@@ -98,6 +110,11 @@ export function UploadZone({
           {statusMessage ? (
             <p className="text-xs text-muted-foreground text-center mb-2" role="status">
               {statusMessage}
+            </p>
+          ) : null}
+          {localError ? (
+            <p className="text-xs text-destructive text-center mb-2" role="alert">
+              {localError}
             </p>
           ) : null}
 

@@ -12,12 +12,7 @@ import Link from "next/link"
 import { setTokens } from "@/lib/api"
 import { seedCurrentUserCache } from "@/lib/current-user-cache"
 import { API_BASE_URL } from "@/config"
-
-function safeNextPath(raw: string | null): string {
-  if (!raw || !raw.startsWith("/") || raw.startsWith("//")) return "/dashboard"
-  if (raw.includes("://")) return "/dashboard"
-  return raw
-}
+import { safeNextPath } from "@/lib/input-validation"
 
 function LoginForm() {
   const router = useRouter()

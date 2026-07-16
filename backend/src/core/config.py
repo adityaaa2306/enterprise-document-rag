@@ -216,6 +216,11 @@ class Settings(BaseSettings):
     COMPILE_MAX_WORKERS: int = 6
     # Per-node hard timeout (cancel/reassign one node without stalling siblings)
     COMPILE_NODE_HARD_TIMEOUT_SEC: float = 90.0
+    # Wall-clock reserved exclusively for the executive compile stage when the
+    # job starts. Map / regional / chapter / escalate / accounting must not
+    # consume this tail; executive compile always receives a fresh reserved
+    # window (capped by the absolute job deadline). Does not raise JOB_MAX_RUNTIME.
+    COMPILE_RESERVED_SEC: float = 60.0
     # LLM provider: openai_compatible (NIM) | ollama
     LLM_PROVIDER: str = "openai_compatible"
     OLLAMA_BASE_URL: str = "http://127.0.0.1:11434"
@@ -377,15 +382,57 @@ class Settings(BaseSettings):
     # --- Authentication Settings ---
     # Empty by default — production MUST set JWT_SECRET_KEY via env.
     # Development falls back to an insecure placeholder (logged as warning).
+    # Never expose JWT_SECRET_KEY (or any server secret) to the frontend.
     JWT_SECRET_KEY: str = ""
     JWT_ALGORITHM: str = "HS256"
     # Access tokens are short-lived; refresh tokens renew the session.
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 14
-    # When true, also set httpOnly refresh cookie (path=/auth). Body still includes tokens.
+    # bcrypt work factor for new password hashes (existing hashes keep their cost).
+    BCRYPT_ROUNDS: int = 12
+    # Auth endpoint rate limits (per IP sliding window).
+    AUTH_LOGIN_RATE_LIMIT: int = 10
+    AUTH_LOGIN_RATE_WINDOW_SEC: float = 900.0
+    AUTH_REGISTER_RATE_LIMIT: int = 5
+    AUTH_REGISTER_RATE_WINDOW_SEC: float = 3600.0
+    AUTH_REFRESH_RATE_LIMIT: int = 60
+    AUTH_REFRESH_RATE_WINDOW_SEC: float = 900.0
+    AUTH_GUEST_RATE_LIMIT: int = 30
+    AUTH_GUEST_RATE_WINDOW_SEC: float = 3600.0
+    # Coarse per-IP auth middleware cap (handlers enforce tighter action limits).
+    AUTH_IP_RATE_LIMIT: int = 40
+    AUTH_IP_RATE_WINDOW_SEC: float = 60.0
+    # --- Abuse protection (API / AI / scrape) ---
+    ABUSE_PROTECTION_ENABLED: bool = True
+    API_RATE_LIMIT: int = 120
+    API_RATE_WINDOW_SEC: float = 60.0
+    AI_RATE_LIMIT: int = 20
+    AI_RATE_WINDOW_SEC: float = 60.0
+    AI_RATE_LIMIT_GUEST: int = 10
+    SCRAPE_RATE_LIMIT: int = 60
+    SCRAPE_RATE_WINDOW_SEC: float = 60.0
+    ABUSE_BLOCK_EMPTY_USER_AGENT: bool = True
+    ABUSE_BLOCK_BOT_USER_AGENTS: bool = True
+    ABUSE_BOT_LIMIT_FACTOR: float = 0.25
+    ABUSE_LOG_BOT_CLIENTS: bool = True
+    # When true, also set httpOnly refresh cookie (path=/auth).
     AUTH_COOKIE_ENABLED: bool = False
     AUTH_COOKIE_SECURE: bool = False
     AUTH_COOKIE_SAMESITE: str = "lax"
+    # Cross-origin SPAs need refresh in JSON; set false when cookie-only.
+    AUTH_RETURN_REFRESH_IN_BODY: bool = True
+    # HTTPS / transport security (None = enforce automatically when APP_ENV=production)
+    FORCE_HTTPS: Optional[bool] = None
+    TRUST_PROXY_HEADERS: bool = True  # honor X-Forwarded-Proto from Render/Vercel
+    HSTS_MAX_AGE_SEC: int = 31536000
+    # Comma-separated hosts for TrustedHostMiddleware; empty = disabled
+    TRUSTED_HOSTS: str = ""
+    # Require TLS on DATABASE_URL for non-private hosts in production
+    DATABASE_REQUIRE_SSL: bool = True
+
+    # --- Uploads (HTTP /summarize) ---
+    # Hard cap for authenticated users (guests use GUEST_MAX_PDF_BYTES = 25 MiB).
+    MAX_UPLOAD_BYTES: int = 50 * 1024 * 1024
 
     # --- Object storage (Phase 2) — PDFs/files; not embeddings ---
     # local | r2 | s3
@@ -431,6 +478,10 @@ class Settings(BaseSettings):
         """Return JWT secret; apply insecure dev fallback when appropriate."""
         key = (self.JWT_SECRET_KEY or "").strip()
         if key:
+            if self.is_production and len(key) < 32:
+                raise RuntimeError(
+                    "JWT_SECRET_KEY must be at least 32 characters in production"
+                )
             return key
         if self.is_production:
             raise RuntimeError(
@@ -596,6 +647,18 @@ class Settings(BaseSettings):
         map_hard = float(self.NIM_HARD_TIMEOUT_SEC or map_http or 0.0)
         map_wall = float(self.MAP_CHUNK_HARD_TIMEOUT_SEC or 0.0)
         node_wall = float(self.COMPILE_NODE_HARD_TIMEOUT_SEC or 0.0)
+        reserved = float(self.COMPILE_RESERVED_SEC or 0.0)
+        if reserved <= 0:
+            raise ValueError("COMPILE_RESERVED_SEC must be positive")
+        if node_wall > 0 and reserved > node_wall:
+            log.warning(
+                "COMPILE_RESERVED_SEC (%.0f) > COMPILE_NODE_HARD_TIMEOUT_SEC (%.0f); "
+                "clamping reserved to node wall",
+                reserved,
+                node_wall,
+            )
+            object.__setattr__(self, "COMPILE_RESERVED_SEC", node_wall)
+            reserved = node_wall
         if compile_read <= 0 or compile_wall <= 0:
             raise ValueError(
                 "NIM_COMPILE_TIMEOUT_SEC and COMPILE_CALL_MAX_SEC must be positive"
@@ -674,6 +737,40 @@ class Settings(BaseSettings):
                     "DATABASE_URL must be a Postgres URL when APP_ENV=production "
                     "(SQLite is not durable on Render's ephemeral filesystem). "
                     "Set DATABASE_URL=postgresql+psycopg://… (Neon pooled recommended)."
+                )
+            if bool(getattr(self, "DATABASE_REQUIRE_SSL", True)):
+                from src.api.security_middleware import (
+                    validate_database_url_for_public_exposure,
+                )
+
+                validate_database_url_for_public_exposure(self.DATABASE_URL)
+
+            jwt_key = (self.JWT_SECRET_KEY or "").strip().lower()
+            if any(
+                bad in jwt_key
+                for bad in (
+                    "change-me",
+                    "dev-only",
+                    "insecure",
+                    "your-secret",
+                    "placeholder",
+                )
+            ):
+                raise RuntimeError(
+                    "JWT_SECRET_KEY looks like a placeholder — set a unique secret "
+                    "(≥32 chars) via the platform secret store, never in source control."
+                )
+
+            # Cookies over HTTPS in production
+            if bool(getattr(self, "AUTH_COOKIE_ENABLED", False)):
+                object.__setattr__(self, "AUTH_COOKIE_SECURE", True)
+
+            force_https = getattr(self, "FORCE_HTTPS", None)
+            if force_https is None or force_https:
+                log.info(
+                    "HTTPS enforcement enabled (FORCE_HTTPS=%s TRUST_PROXY_HEADERS=%s)",
+                    force_https if force_https is not None else "auto",
+                    bool(getattr(self, "TRUST_PROXY_HEADERS", True)),
                 )
 
             if not (self.NVIDIA_API_KEY or "").strip() and self.nim_endpoint_count() < 1:

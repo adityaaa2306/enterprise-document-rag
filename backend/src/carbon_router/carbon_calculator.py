@@ -15,10 +15,7 @@ with open(os.path.join(current_dir, "servers.json"), "r", encoding="utf-8") as f
 # Import settings from the same package
 from .settings import WATTTIME_USERNAME, WATTTIME_PASSWORD
 
-print(f"WATTTIME_USERNAME (after import): {WATTTIME_USERNAME}")
-# print(f"WATTTIME_PASSWORD (after import): {WATTTIME_PASSWORD}") # Don't print password in logs
-
-USE_WATTTIME = True # Force WattTime usage since credentials are provided in settings.py
+USE_WATTTIME = bool(WATTTIME_USERNAME and WATTTIME_PASSWORD)
 
 # Simple mock intensities in gCO2/kWh for fallback/demo
 MOCK_INTENSITY_BY_HINT = {

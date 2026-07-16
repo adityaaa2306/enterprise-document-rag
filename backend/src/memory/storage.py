@@ -1114,17 +1114,18 @@ def create_user(email: str, hashed_password: str, full_name: str) -> Optional[Di
     Returns user info if successful, None if email already exists.
     """
     try:
+        email_norm = (email or "").strip().lower()
         db = _session()
         
         # Check if user already exists
-        existing_user = db.query(UserModel).filter(UserModel.email == email).first()
+        existing_user = db.query(UserModel).filter(UserModel.email == email_norm).first()
         if existing_user:
             db.close()
             return None
         
         # Create new user
         new_user = UserModel(
-            email=email,
+            email=email_norm,
             hashed_password=hashed_password,
             full_name=full_name
         )
@@ -1141,7 +1142,7 @@ def create_user(email: str, hashed_password: str, full_name: str) -> Optional[Di
         }
         
         db.close()
-        log.info(f"Created new user: {email}")
+        log.info("Created new user: %s", email_norm)
         return user_data
         
     except Exception as e:
@@ -1153,10 +1154,12 @@ def get_user_by_email(email: str):
     """
     Retrieve a user by email address.
     Returns the full UserModel (including hashed_password) for authentication.
+    Never serialize this model into an API response.
     """
     try:
+        email_norm = (email or "").strip().lower()
         db = _session()
-        user = db.query(UserModel).filter(UserModel.email == email).first()
+        user = db.query(UserModel).filter(UserModel.email == email_norm).first()
         db.close()
         return user
     except Exception as e:

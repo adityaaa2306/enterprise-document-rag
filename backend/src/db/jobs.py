@@ -280,6 +280,8 @@ def get_job(job_id: str, *, include_result: bool = True) -> Optional[Dict[str, A
                                 load_only(
                                     JobModel.id,
                                     JobModel.user_id,
+                                    JobModel.owner_type,
+                                    JobModel.owner_id,
                                     JobModel.status,
                                     JobModel.progress,
                                     JobModel.message,
@@ -1064,17 +1066,35 @@ def is_cancel_requested(job_id: str) -> bool:
     return False
 
 
-def cancel_job(job_id: str, *, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+def cancel_job(
+    job_id: str,
+    *,
+    user_id: Optional[int] = None,
+    owner_type: Optional[str] = None,
+    owner_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """
     Mark a pending/processing job cancelled so the worker can free the slot.
 
     Already-terminal jobs are returned unchanged (idempotent).
-    Ownership must be enforced by the API (assert_document_owner_for) before call.
+    When owner_type/owner_id are provided, ownership is re-checked here
+    (defense in depth; API should also assert first).
     """
     _ = user_id
     current = get_job(job_id)
     if not current:
         return None
+
+    if owner_type and owner_id:
+        from src.core.owner import owners_match
+
+        if not owners_match(
+            {"owner_type": owner_type, "owner_id": owner_id},
+            owner_type=str(current.get("owner_type") or ""),
+            owner_id=str(current.get("owner_id") or ""),
+            user_id=current.get("user_id"),
+        ):
+            raise PermissionError("Not allowed to cancel this job")
 
     status = str(current.get("status") or "")
     if status in (

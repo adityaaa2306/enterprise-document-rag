@@ -115,15 +115,24 @@ def get_optional_user(
 
 def _guest_id_from_request(request: Request) -> Optional[str]:
     # Prefer explicit header (cross-origin / Vercel→Render) over cookie.
+    from src.api.input_validation import require_uuid
+
+    raw: Optional[str] = None
     header = request.headers.get(GUEST_HEADER_NAME) or request.headers.get(
         GUEST_HEADER_NAME.lower()
     )
     if header and header.strip():
-        return header.strip()
-    cookie = request.cookies.get(GUEST_COOKIE_NAME)
-    if cookie:
-        return cookie.strip()
-    return None
+        raw = header.strip()
+    else:
+        cookie = request.cookies.get(GUEST_COOKIE_NAME)
+        if cookie:
+            raw = cookie.strip()
+    if not raw:
+        return None
+    try:
+        return require_uuid(raw, field="guest_session_id")
+    except ValueError:
+        return None
 
 
 def get_current_owner(
@@ -213,17 +222,47 @@ def assert_document_owner_for(owner: Dict[str, Any], document_id: str) -> None:
 
 
 def assert_conversation_owner_for(owner: Dict[str, Any], conversation_id: str, document_id: str) -> None:
-    assert_document_owner_for(owner, document_id)
-    from src.db import conversations as conv_db
+    """
+    Enforce that an existing conversation belongs to the caller.
 
-    data = conv_db.load_conversation(conversation_id)
-    if data is None:
+    Missing conversation → OK (caller may create it).
+    Existing conversation → require document match + owner match (never skip).
+    Checks DB first, then file-backed MemoryService fallback.
+    """
+    assert_document_owner_for(owner, document_id)
+    if not (conversation_id or "").strip():
         return
-    if data.get("document_id") != document_id:
+
+    data: Optional[Dict[str, Any]] = None
+    try:
+        from src.db import conversations as conv_db
+
+        data = conv_db.load_conversation(conversation_id)
+    except Exception:
+        data = None
+
+    if data is None:
+        try:
+            from src.memory.service import MemoryService
+
+            state = MemoryService().get_conversation(conversation_id)
+            if state is not None:
+                payload = state.to_dict()
+                # File payloads may carry owner_* alongside state fields.
+                data = dict(payload)
+        except Exception:
+            data = None
+
+    if data is None:
+        # Truly new conversation id — create path will stamp ownership.
+        return
+
+    if str(data.get("document_id") or "") != str(document_id):
         raise HTTPException(status_code=400, detail="Conversation/document mismatch")
     ot = data.get("owner_type")
     oid = data.get("owner_id")
     if not ot or not oid:
+        # Legacy conversation without owner stamp — deny access (fail closed).
         raise HTTPException(status_code=404, detail="Conversation not found")
     if not owners_match(owner, owner_type=str(ot), owner_id=str(oid)):
         raise HTTPException(status_code=403, detail="Forbidden")

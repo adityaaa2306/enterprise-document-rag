@@ -14,10 +14,7 @@ with open(os.path.join(os.path.dirname(__file__), "servers.json"), "r", encoding
 
 from settings import WATTTIME_USERNAME, WATTTIME_PASSWORD
 
-print(f"WATTTIME_USERNAME (after import): {WATTTIME_USERNAME}")
-print(f"WATTTIME_PASSWORD (after import): {WATTTIME_PASSWORD}")
-
-USE_WATTTIME = True # Force WattTime usage since credentials are provided in settings.py
+USE_WATTTIME = bool(WATTTIME_USERNAME and WATTTIME_PASSWORD)
 
 # Simple mock intensities in gCO2/kWh for fallback/demo
 MOCK_INTENSITY_BY_HINT = {

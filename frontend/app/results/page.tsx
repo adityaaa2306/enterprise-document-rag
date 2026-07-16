@@ -14,6 +14,7 @@ import { Card } from "@/components/ui/card"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { apiFetch } from "@/lib/api"
 import { getLastJobId, rememberJobId } from "@/lib/job-session"
+import { isUuid } from "@/lib/input-validation"
 import type { ProcessingInsightsData } from "@/components/processing-insights"
 import { unwrapOuterMarkdownFence } from "@/lib/utils"
 import { stripSummaryMetrics } from "@/lib/strip-summary-metrics"
@@ -190,12 +191,16 @@ function ResultsContent() {
   // Restore last job when visiting /results without query (sidebar nav)
   useEffect(() => {
     if (urlJobId) {
+      if (!isUuid(urlJobId)) {
+        setJobId(null)
+        return
+      }
       setJobId(urlJobId)
       rememberJobId(urlJobId)
       return
     }
     const last = getLastJobId()
-    if (last) {
+    if (last && isUuid(last)) {
       setJobId(last)
       router.replace(`/results?job_id=${last}`)
     }
@@ -203,6 +208,7 @@ function ResultsContent() {
 
   const selectJob = useCallback(
     (id: string) => {
+      if (!isUuid(id)) return
       rememberJobId(id)
       setJobId(id)
       setIsComplete(false)

@@ -1543,6 +1543,24 @@ def stitch_compile_fallback(
     )
 
 
+def is_stitched_fallback(text: Optional[str]) -> bool:
+    """True when text is the deterministic stitched compile fallback (not LLM)."""
+    low = str(text or "").strip().lower()
+    if not low:
+        return False
+    return "stitched fallback from chunk summaries" in low
+
+
+def is_executive_compile_success(text: Optional[str]) -> bool:
+    """
+    True when text is a durable executive compile artifact (usable LLM output).
+    Stitched fallbacks and empty/error markers are not successes.
+    """
+    if is_stitched_fallback(text):
+        return False
+    return _is_usable_summary(str(text or ""))
+
+
 def _call_compile_llm(
     text_of_summaries: str,
     chain: List[str],

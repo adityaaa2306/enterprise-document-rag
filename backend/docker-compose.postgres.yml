@@ -6,8 +6,9 @@ services:
       POSTGRES_USER: green
       POSTGRES_PASSWORD: green
       POSTGRES_DB: green_agentic
+    # Loopback only — do not publish Postgres on the public interface.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - green_pgdata:/var/lib/postgresql/data
     healthcheck:

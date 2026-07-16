@@ -197,6 +197,7 @@ def run_capacity_pool(
     is_success: Optional[Callable[[R], bool]] = None,
     on_progress: Optional[Callable[[TaskProgress, SchedulerMetrics], None]] = None,
     progress_interval_sec: float = 2.0,
+    deadline_ceiling_mono: Optional[float] = None,
 ) -> tuple[List[Optional[R]], TaskProgress, SchedulerMetrics]:
     """
     Pull-based capacity-aware execution.
@@ -207,6 +208,8 @@ def run_capacity_pool(
     - Prefer deadline-aware workers (``deadline_mono=``) so NIM leases release
       before the hard wall; non-compliant workers still use a watchdog thread
     - Failed / empty results retry up to ``max_attempts``
+    - ``deadline_ceiling_mono`` clamps each task lease so earlier stages cannot
+      borrow time reserved for a later phase (executive compile reserve)
     """
     total = len(items)
     progress = TaskProgress(submitted=total, queued=total, total=total)
@@ -506,6 +509,12 @@ def run_capacity_pool(
             err: Optional[BaseException] = None
             orphaned = False
             deadline_mono = time.monotonic() + hard_timeout_sec
+            if deadline_ceiling_mono is not None:
+                deadline_mono = min(deadline_mono, float(deadline_ceiling_mono))
+            # Capacity wait must not extend past the phase ceiling either.
+            sem_wait = hard_timeout_sec
+            if deadline_ceiling_mono is not None:
+                sem_wait = max(0.05, min(sem_wait, float(deadline_ceiling_mono) - time.monotonic()))
 
             _lifecycle(
                 "CAPACITY_WAIT",
@@ -513,9 +522,9 @@ def run_capacity_pool(
                 role=role,
                 attempt=item.attempt + 1,
                 worker=wname,
-                sem_timeout_s=hard_timeout_sec,
+                sem_timeout_s=sem_wait,
             )
-            acquired = capacity_sem.acquire(timeout=hard_timeout_sec)
+            acquired = capacity_sem.acquire(timeout=sem_wait)
             if not acquired:
                 _lifecycle(
                     "CAPACITY_WAIT_TIMEOUT",

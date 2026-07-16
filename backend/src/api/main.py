@@ -46,7 +46,23 @@ from src.api.deps import (
     enforce_job_owner_dict,
     seed_user_cache,
 )
+from src.api.abuse_protection import AbuseProtectionMiddleware
 from src.api.request_logging import RequestLoggingMiddleware
+from src.api.security_middleware import (
+    HttpsRedirectMiddleware,
+    SecurityHeadersMiddleware,
+)
+from src.api.input_validation import (
+    NodeIdPath,
+    ResourceIdPath,
+    read_upload_limited,
+    require_optional_date,
+    require_routing_mode,
+    require_uuid,
+    require_dashboard_range,
+    safe_filename,
+    validate_upload_bytes,
+)
 from src.core.owner import (
     GUEST_COOKIE_NAME,
     GUEST_INACTIVITY_HOURS,
@@ -68,9 +84,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 def _safe_filename(name: Optional[str]) -> str:
-    base = os.path.basename(name or "upload.bin")
-    cleaned = "".join(c if c.isalnum() or c in "._- " else "_" for c in base).strip()
-    return (cleaned or "upload.bin")[:180]
+    return safe_filename(name)
 
 
 # --- Startup/Shutdown Events ---
@@ -223,8 +237,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Access logs (Phase 5 operational validation)
+# Access logs + security audit hooks (errors / unusual traffic)
 app.add_middleware(RequestLoggingMiddleware)
+# Security headers on every response
+app.add_middleware(SecurityHeadersMiddleware)
+# HTTPS redirect when FORCE_HTTPS / production (trusts X-Forwarded-Proto)
+app.add_middleware(HttpsRedirectMiddleware)
+# Abuse protection (API / AI / scrape / bot heuristics) — runs early
+app.add_middleware(AbuseProtectionMiddleware)
+
+# Optional host allowlist (set TRUSTED_HOSTS=api.example.com,www.example.com)
+_trusted = [
+    h.strip()
+    for h in str(getattr(settings, "TRUSTED_HOSTS", "") or "").split(",")
+    if h.strip()
+]
+if _trusted:
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_trusted)
 
 # Health / readiness (Phase 0)
 app.include_router(health_router)
@@ -247,19 +278,22 @@ async def ingest_upload_to_object_storage(
     job_id = str(uuid.uuid4())
     document_id = job_id
     original = _safe_filename(file.filename)
-    content_type = file.content_type or "application/octet-stream"
     owner_path = owner_id if owner_type == "guest" else str(user_id or owner_id)
+    # owner_path is server-derived (user id / guest uuid) — never client path segments
+    if "/" in owner_path or "\\" in owner_path or ".." in owner_path:
+        raise HTTPException(status_code=400, detail="Invalid owner context.")
     storage_key = f"documents/{owner_type}/{owner_path}/{document_id}/{original}"
 
+    limit = int(max_bytes) if max_bytes is not None else int(
+        getattr(settings, "MAX_UPLOAD_BYTES", 50 * 1024 * 1024) or (50 * 1024 * 1024)
+    )
     try:
-        contents = await file.read()
-        if not contents:
-            raise HTTPException(status_code=400, detail="Empty upload.")
-        if max_bytes is not None and len(contents) > int(max_bytes):
-            raise HTTPException(
-                status_code=413,
-                detail=f"File too large. Guest limit is {int(max_bytes) // (1024 * 1024)} MB.",
-            )
+        contents = await read_upload_limited(file, max_bytes=limit)
+        content_type = validate_upload_bytes(
+            original,
+            file.content_type or "application/octet-stream",
+            contents,
+        )
         store = get_object_storage()
         stored = store.put_bytes(
             storage_key,
@@ -317,15 +351,31 @@ def worker_health(response: Response):
     """
     Worker heartbeat status (Phase 3).
     Returns 200 if at least one worker heartbeat is fresh; 503 otherwise.
+
+    Public response is sanitized — never includes current_job_id or other
+    tenant-identifying metadata (IDOR / enumeration defense).
     """
     from fastapi import status as http_status
 
     workers = job_store.list_worker_heartbeats()
     alive = [w for w in workers if w.get("alive")]
+    public_workers = [
+        {
+            "worker_id": w.get("worker_id"),
+            "status": w.get("status"),
+            "alive": bool(w.get("alive")),
+            "busy": bool(
+                (isinstance(w.get("meta"), dict) and w["meta"].get("current_job_id"))
+                or str(w.get("status") or "") == "busy"
+            ),
+            "last_seen_at": w.get("last_seen_at"),
+        }
+        for w in workers
+    ]
     body = {
         "status": "ok" if alive else "no_live_workers",
         "alive_count": len(alive),
-        "workers": workers,
+        "workers": public_workers,
         "stale_after_sec": settings.WORKER_HEARTBEAT_STALE_SEC,
     }
     if not alive:
@@ -408,13 +458,19 @@ def get_queue_snapshot(
 
 @app.post("/jobs/{job_id}/cancel", response_model=CancelJobResponse)
 def cancel_my_job(
-    job_id: str,
+    job_id: ResourceIdPath,
     current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """Cancel a pending/processing job and free the worker slot."""
     assert_document_owner_for(current_owner, job_id)
+    stamp = stamp_owner_fields(current_owner)
     try:
-        updated = job_store.cancel_job(job_id, user_id=current_owner.get("user_id"))
+        updated = job_store.cancel_job(
+            job_id,
+            user_id=stamp.get("user_id"),
+            owner_type=str(stamp.get("owner_type") or ""),
+            owner_id=str(stamp.get("owner_id") or ""),
+        )
     except PermissionError:
         raise HTTPException(status_code=403, detail="Not allowed to cancel this job.")
     if not updated:
@@ -430,8 +486,8 @@ def cancel_my_job(
 
 @app.post("/jobs/{job_id}/nodes/{node_id}/cancel")
 def cancel_dag_node(
-    job_id: str,
-    node_id: str,
+    job_id: ResourceIdPath,
+    node_id: NodeIdPath,
     current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
@@ -488,7 +544,7 @@ def _retain_latest_job_bg(
 async def summarize_document(
     file: UploadFile,
     background_tasks: BackgroundTasks,
-    mode: str = "automatic",
+    mode: str = Query("automatic", min_length=1, max_length=64),
     current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
@@ -496,7 +552,11 @@ async def summarize_document(
 
     Same pipeline for User and Guest — only ownership stamp differs.
     """
-    preference = normalize_routing_preference(mode)
+    try:
+        mode_key = require_routing_mode(mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    preference = normalize_routing_preference(mode_key)
     stamp = stamp_owner_fields(current_owner)
     log.info(
         "Received file: %s (Type: %s) preference=%s owner=%s:%s",
@@ -507,7 +567,11 @@ async def summarize_document(
         stamp.get("owner_id"),
     )
 
-    max_bytes = GUEST_MAX_PDF_BYTES if current_owner.get("is_guest") else None
+    max_bytes = (
+        GUEST_MAX_PDF_BYTES
+        if current_owner.get("is_guest")
+        else int(getattr(settings, "MAX_UPLOAD_BYTES", 50 * 1024 * 1024))
+    )
     meta = await ingest_upload_to_object_storage(
         file,
         user_id=stamp.get("user_id"),
@@ -707,7 +771,7 @@ def _job_status_payload(job_id: str, status_dict: Dict[str, Any]) -> JobStatus:
 
 @app.get("/job-status/{job_id}", response_model=JobStatus)
 def get_job_status(
-    job_id: str,
+    job_id: ResourceIdPath,
     current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
@@ -773,12 +837,12 @@ def get_job_status(
         return _job_status_payload(job_id, status_dict)
     except Exception as e:
         log.error(f"Error validating job status for {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error validating status: {status_dict}")
+        raise HTTPException(status_code=500, detail="Error validating job status.")
 
 
 @app.get("/job-events/{job_id}")
 async def job_events_sse(
-    job_id: str,
+    job_id: ResourceIdPath,
     current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
@@ -832,7 +896,7 @@ async def job_events_sse(
 
 @app.get("/job-result/{job_id}", response_model=SummaryResponse)
 def get_job_result(
-    job_id: str,
+    job_id: ResourceIdPath,
     current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
@@ -1142,13 +1206,16 @@ def chat_document(
         assert_conversation_owner_for(current_owner, request.conversation_id, request.document_id)
 
     mem = MemoryService()
-    state = mem.start_conversation(
-        request.document_id,
-        request.conversation_id,
-        owner_type=str(stamp["owner_type"]),
-        owner_id=str(stamp["owner_id"]),
-        user_id=uid,
-    )
+    try:
+        state = mem.start_conversation(
+            request.document_id,
+            request.conversation_id,
+            owner_type=str(stamp["owner_type"]),
+            owner_id=str(stamp["owner_id"]),
+            user_id=uid,
+        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Forbidden")
     return _run_rag_query(
         document_id=request.document_id,
         query=request.query,
@@ -1396,23 +1463,26 @@ def _iter_rag_query_sse(
         if conversation_id and mem is not None:
             if not owner_type or not owner_id:
                 raise HTTPException(status_code=500, detail="Owner required to persist conversation")
-            mem.append_turn(
-                conversation_id, "user", query,
-                entities=list(prior_entities),
-                owner_type=str(owner_type),
-                owner_id=str(owner_id),
-                user_id=user_id,
-            )
-            mem.append_turn(
-                conversation_id,
-                "assistant",
-                answer,
-                entities=entities_used,
-                meta={"skill": skill, "model_used": model_used},
-                owner_type=str(owner_type),
-                owner_id=str(owner_id),
-                user_id=user_id,
-            )
+            try:
+                mem.append_turn(
+                    conversation_id, "user", query,
+                    entities=list(prior_entities),
+                    owner_type=str(owner_type),
+                    owner_id=str(owner_id),
+                    user_id=user_id,
+                )
+                mem.append_turn(
+                    conversation_id,
+                    "assistant",
+                    answer,
+                    entities=entities_used,
+                    meta={"skill": skill, "model_used": model_used},
+                    owner_type=str(owner_type),
+                    owner_id=str(owner_id),
+                    user_id=user_id,
+                )
+            except PermissionError:
+                raise HTTPException(status_code=403, detail="Forbidden")
 
         yield _sse_line(done_payload)
     except Exception as e:
@@ -1686,23 +1756,26 @@ def _run_rag_query(
         if persist_conversation and conversation_id and mem is not None:
             if not owner_type or not owner_id:
                 raise HTTPException(status_code=500, detail="Owner required to persist conversation")
-            mem.append_turn(
-                conversation_id, "user", query,
-                entities=list(prior_entities),
-                owner_type=str(owner_type),
-                owner_id=str(owner_id),
-                user_id=user_id,
-            )
-            mem.append_turn(
-                conversation_id,
-                "assistant",
-                answer,
-                entities=entities_used,
-                meta={"skill": skill, "model_used": model_used},
-                owner_type=str(owner_type),
-                owner_id=str(owner_id),
-                user_id=user_id,
-            )
+            try:
+                mem.append_turn(
+                    conversation_id, "user", query,
+                    entities=list(prior_entities),
+                    owner_type=str(owner_type),
+                    owner_id=str(owner_id),
+                    user_id=user_id,
+                )
+                mem.append_turn(
+                    conversation_id,
+                    "assistant",
+                    answer,
+                    entities=entities_used,
+                    meta={"skill": skill, "model_used": model_used},
+                    owner_type=str(owner_type),
+                    owner_id=str(owner_id),
+                    user_id=user_id,
+                )
+            except PermissionError:
+                raise HTTPException(status_code=403, detail="Forbidden")
 
         return RagQueryResponse(**resp_kwargs)
     except HTTPException:
@@ -1736,7 +1809,7 @@ def get_documents(current_owner: Dict[str, Any] = Depends(get_current_owner)):
 
 @app.get("/documents/{document_id}/routing")
 def get_document_routing(
-    document_id: str,
+    document_id: ResourceIdPath,
     current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
@@ -1754,7 +1827,7 @@ def get_document_routing(
 
 @app.get("/documents/{document_id}/knowledge", response_model=KnowledgeResponse)
 def get_document_knowledge(
-    document_id: str,
+    document_id: ResourceIdPath,
     current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
@@ -1793,7 +1866,7 @@ def get_document_knowledge(
 
 @app.get("/documents/{document_id}/graph", response_model=GraphResponse)
 def get_document_graph(
-    document_id: str,
+    document_id: ResourceIdPath,
     current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
@@ -1830,9 +1903,9 @@ def get_document_graph(
 @app.get("/dashboard-stats")
 def get_dashboard_stats(
     current_owner: Dict[str, Any] = Depends(get_current_owner),
-    range: str = Query("30d"),
-    start_date: Optional[str] = Query(None),
-    end_date: Optional[str] = Query(None),
+    range: str = Query("30d", min_length=2, max_length=16),
+    start_date: Optional[str] = Query(None, max_length=10),
+    end_date: Optional[str] = Query(None, max_length=10),
 ):
     """
         Get aggregated statistics for the dashboard (current Owner only).
@@ -1847,14 +1920,26 @@ def get_dashboard_stats(
     try:
         from src.core.frontier_carbon_compare import METHODOLOGY_TEXT
 
+        try:
+            range_key = require_dashboard_range(range)
+            start_ok = require_optional_date(start_date)
+            end_ok = require_optional_date(end_date)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if range_key == "custom" and start_ok is None and end_ok is None:
+            raise HTTPException(
+                status_code=422,
+                detail="custom range requires start_date and/or end_date (YYYY-MM-DD).",
+            )
+
         stamp = stamp_owner_fields(current_owner)
         stats = storage.get_dashboard_stats(
             user_id=stamp.get("user_id"),
             owner_type=str(stamp["owner_type"]),
             owner_id=str(stamp["owner_id"]),
-            range_key=range,
-            start_date=start_date,
-            end_date=end_date,
+            range_key=range_key,
+            start_date=start_ok,
+            end_date=end_ok,
         )
         if isinstance(stats, dict):
             stats = dict(stats)
@@ -1900,11 +1985,18 @@ def create_or_resume_guest_session(request: Request, response: Response):
     Create a guest session (or resume via cookie/header).
     Returns guest_session_id for clients that cannot use cross-origin cookies.
     """
+    from src.api.auth_rate_limit import enforce_auth_rate_limit
+
+    enforce_auth_rate_limit(request, action="guest")
     existing = request.cookies.get(GUEST_COOKIE_NAME) or request.headers.get(
         "X-Guest-Session-Id"
     )
     if existing:
-        sess = guest_store.touch_guest_session(existing.strip())
+        try:
+            sid = require_uuid(existing.strip(), field="guest_session_id")
+        except ValueError:
+            sid = None
+        sess = guest_store.touch_guest_session(sid) if sid else None
         if sess and str(sess.get("status")) == "active":
             _set_guest_cookie(response, sess["session_id"])
             return {
@@ -1966,11 +2058,21 @@ def upgrade_guest_to_user(
     """
     Transfer guest-owned resources to the authenticated account.
     Call after login while the guest cookie/header is still present.
+
+    Only active (non-upgraded/expired) guest sessions can be claimed — prevents
+    takeover of arbitrary historical session IDs.
     """
+    from src.api.auth_rate_limit import enforce_auth_rate_limit
+
+    enforce_auth_rate_limit(request, action="guest")
     sid = request.cookies.get(GUEST_COOKIE_NAME) or request.headers.get("X-Guest-Session-Id")
     if not sid:
         raise HTTPException(status_code=400, detail="No guest session to upgrade")
-    result = guest_store.transfer_guest_to_user(sid.strip(), int(current_user["id"]))
+    sid = sid.strip()
+    sess = guest_store.get_guest_session(sid)
+    if sess is None or str(sess.get("status") or "") != "active":
+        raise HTTPException(status_code=404, detail="Guest session not found or not active")
+    result = guest_store.transfer_guest_to_user(sid, int(current_user["id"]))
     if not result.get("ok"):
         raise HTTPException(status_code=500, detail=result.get("error") or "Upgrade failed")
     _clear_guest_cookie(response)
@@ -2008,28 +2110,65 @@ def _refresh_from_request(request: Request, body: Optional[RefreshRequest]) -> O
 
 
 @app.post("/auth/register", response_model=UserResponse)
-def register_user(user_data: UserRegister):
+def register_user(user_data: UserRegister, request: Request):
     """
     Register a new user account.
     """
-    if "@" not in user_data.email or "." not in user_data.email:
+    from src.api.auth_rate_limit import enforce_auth_rate_limit
+    from src.api.security_audit import log_auth_event
+
+    enforce_auth_rate_limit(request, action="register")
+    email = auth.normalize_email(user_data.email)
+    if "@" not in email or "." not in email.split("@")[-1]:
+        log_auth_event(
+            "register_failure",
+            request=request,
+            email=email,
+            success=False,
+            detail="invalid_email",
+        )
         raise HTTPException(status_code=400, detail="Invalid email format")
-    
-    if len(user_data.password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long")
-    
-    hashed_password = auth.get_password_hash(user_data.password)
-    
+
+    pw_err = auth.validate_password_strength(user_data.password)
+    if pw_err:
+        log_auth_event(
+            "register_failure",
+            request=request,
+            email=email,
+            success=False,
+            detail="weak_password",
+        )
+        raise HTTPException(status_code=400, detail=pw_err)
+
+    try:
+        hashed_password = auth.get_password_hash(user_data.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
     user = storage.create_user(
-        email=user_data.email,
+        email=email,
         hashed_password=hashed_password,
-        full_name=user_data.full_name
+        full_name=(user_data.full_name or "").strip() or email.split("@")[0],
     )
-    
+
     if user is None:
+        log_auth_event(
+            "register_failure",
+            request=request,
+            email=email,
+            success=False,
+            detail="email_taken",
+        )
         raise HTTPException(status_code=400, detail="Email already registered")
-    
-    log.info(f"New user registered: {user_data.email}")
+
+    log_auth_event(
+        "register_success",
+        request=request,
+        email=email,
+        success=True,
+        user_id=int(user["id"]),
+    )
+    log.info("New user registered: %s", email)
     return UserResponse(**user)
 
 
@@ -2038,15 +2177,36 @@ def login_user(user_data: UserLogin, request: Request, response: Response):
     """
     Authenticate user and return access + refresh tokens.
     """
-    user = storage.get_user_by_email(user_data.email)
-    
-    if user is None:
+    from src.api.auth_rate_limit import enforce_auth_rate_limit
+    from src.api.security_audit import log_auth_event
+
+    email = auth.normalize_email(user_data.email)
+    enforce_auth_rate_limit(request, action="login", identity=email)
+
+    user = storage.get_user_by_email(email)
+    hashed = getattr(user, "hashed_password", None) if user is not None else None
+    # Always perform bcrypt work (dummy hash when user missing) to reduce timing leaks.
+    password_ok = auth.verify_password_with_dummy(user_data.password, hashed)
+
+    if user is None or not password_ok:
+        log_auth_event(
+            "login_failure",
+            request=request,
+            email=email,
+            success=False,
+            detail="invalid_credentials",
+        )
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    
-    if not auth.verify_password(user_data.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    
+
     if not user.is_active:
+        log_auth_event(
+            "login_failure",
+            request=request,
+            email=email,
+            success=False,
+            detail="inactive",
+            user_id=int(user.id),
+        )
         raise HTTPException(status_code=403, detail="Account is inactive")
 
     user_payload = {
@@ -2063,8 +2223,17 @@ def login_user(user_data: UserLogin, request: Request, response: Response):
         user_agent=request.headers.get("user-agent"),
     )
     _set_refresh_cookie(response, pair["refresh_token"])
-    log.info(f"User logged in: {user_data.email}")
-    return Token(**pair, user=UserResponse(**user_payload))
+    include_refresh = bool(getattr(settings, "AUTH_RETURN_REFRESH_IN_BODY", True))
+    log_auth_event(
+        "login_success",
+        request=request,
+        email=email,
+        success=True,
+        user_id=int(user.id),
+    )
+    log.info("User logged in: %s", email)
+    payload = auth.token_response_payload(pair, include_refresh_in_body=include_refresh)
+    return Token(**payload, user=UserResponse(**user_payload))
 
 
 @app.post("/auth/refresh", response_model=Token)
@@ -2077,13 +2246,29 @@ def refresh_session(
     Rotate refresh token and issue a new access token.
     Accepts refresh_token in JSON body or httpOnly cookie.
     """
+    from src.api.auth_rate_limit import enforce_auth_rate_limit
+    from src.api.security_audit import log_auth_event
+
+    enforce_auth_rate_limit(request, action="refresh")
     raw = _refresh_from_request(request, body)
     if not raw:
+        log_auth_event(
+            "refresh_failure",
+            request=request,
+            success=False,
+            detail="missing_token",
+        )
         raise HTTPException(status_code=401, detail="Refresh token required")
 
     pair = auth.rotate_token_pair(raw, user_agent=request.headers.get("user-agent"))
     if not pair:
         _clear_refresh_cookie(response)
+        log_auth_event(
+            "refresh_failure",
+            request=request,
+            success=False,
+            detail="invalid_or_revoked",
+        )
         raise HTTPException(status_code=401, detail="Invalid or revoked refresh token")
 
     # Ensure user still exists / active
@@ -2094,12 +2279,15 @@ def refresh_session(
         raise HTTPException(status_code=401, detail="User not found or inactive")
 
     _set_refresh_cookie(response, pair["refresh_token"])
-    return Token(
-        access_token=pair["access_token"],
-        refresh_token=pair["refresh_token"],
-        token_type=pair["token_type"],
-        expires_in=pair["expires_in"],
+    include_refresh = bool(getattr(settings, "AUTH_RETURN_REFRESH_IN_BODY", True))
+    log_auth_event(
+        "refresh_success",
+        request=request,
+        success=True,
+        user_id=int(pair["user_id"]),
     )
+    payload = auth.token_response_payload(pair, include_refresh_in_body=include_refresh)
+    return Token(**payload)
 
 
 @app.post("/auth/logout")
@@ -2113,6 +2301,8 @@ def logout_user(
     Revoke refresh token (or all sessions for the user when authenticated + revoke_all).
     Works even if the access token is expired (refresh cookie/body still accepted).
     """
+    from src.api.security_audit import log_auth_event
+
     raw = None
     revoke_all = False
     if body:
@@ -2127,6 +2317,13 @@ def logout_user(
     else:
         auth.logout_refresh(raw)
     _clear_refresh_cookie(response)
+    log_auth_event(
+        "logout",
+        request=request,
+        success=True,
+        user_id=uid,
+        detail="revoke_all" if revoke_all else "single",
+    )
     return {"status": "ok"}
 
 

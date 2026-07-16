@@ -66,6 +66,7 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog"
+import { MAX_QUERY_CHARS, sanitizeQuery } from "@/lib/input-validation"
 
 const SUGGESTIONS = [
   "Summarize this document in one paragraph",
@@ -995,8 +996,23 @@ export function DocumentChat({ result }: Props) {
 
   const sendQuery = useCallback(
     async (raw: string) => {
-      const query = raw.trim()
-      if (!query || loading) return
+      if (loading) return
+      let query: string
+      try {
+        query = sanitizeQuery(raw)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Invalid query"
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: uid(),
+            role: "assistant",
+            content: msg,
+            createdAt: Date.now(),
+          },
+        ])
+        return
+      }
 
       const userMsg: ChatMessage = {
         id: uid(),
@@ -1271,10 +1287,11 @@ export function DocumentChat({ result }: Props) {
                 ref={textareaRef}
                 rows={1}
                 value={input}
-                onChange={(e) => setInput(e.target.value)}
+                onChange={(e) => setInput(e.target.value.slice(0, MAX_QUERY_CHARS))}
                 onKeyDown={onKeyDown}
                 placeholder="Ask anything about your document..."
                 disabled={loading}
+                maxLength={MAX_QUERY_CHARS}
                 className="w-full resize-none bg-transparent px-4 py-3 pr-12 text-sm leading-relaxed placeholder:text-muted-foreground focus:outline-none disabled:opacity-60"
               />
               <button

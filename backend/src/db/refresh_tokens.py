@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -19,7 +20,12 @@ def _now() -> datetime:
 
 
 def hash_token(raw: str) -> str:
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    """
+    Peppered HMAC-SHA256 of the opaque refresh token.
+    DB leak alone is insufficient without the server JWT secret.
+    """
+    secret = settings.resolved_jwt_secret().encode("utf-8")
+    return hmac.new(secret, (raw or "").encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def generate_raw_token() -> str:

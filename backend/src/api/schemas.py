@@ -1,5 +1,17 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Optional
+
+from src.api.input_validation import (
+    EmailStrStrict,
+    FullNameStr,
+    MAX_PASSWORD_CHARS,
+    MAX_QUERY_CHARS,
+    MAX_REFRESH_TOKEN_CHARS,
+    OptionalUuidStr,
+    PasswordStr,
+    QueryText,
+    UuidStr,
+)
 
 # This defines the structure of the Carbon Report in the final summary
 class CarbonData(BaseModel):
@@ -245,9 +257,9 @@ class SummaryResponse(BaseModel):
 
 # This is the request model for the /rag-query endpoint
 class RagQueryRequest(BaseModel):
-    document_id: str
-    query: str
-    conversation_id: Optional[str] = None  # Phase 2.H optional multi-turn
+    document_id: UuidStr
+    query: QueryText = Field(..., min_length=1, max_length=MAX_QUERY_CHARS)
+    conversation_id: OptionalUuidStr = None  # Phase 2.H optional multi-turn
 
 
 # This is the response model for the /rag-query endpoint
@@ -278,9 +290,9 @@ class RagQueryResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     """Phase 2.H — multi-turn chat over a document."""
-    document_id: str
-    query: str
-    conversation_id: Optional[str] = None
+    document_id: UuidStr
+    query: QueryText = Field(..., min_length=1, max_length=MAX_QUERY_CHARS)
+    conversation_id: OptionalUuidStr = None
 
 class DocumentResponse(BaseModel):
     document_id: str
@@ -315,14 +327,14 @@ class GraphResponse(BaseModel):
 
 class UserRegister(BaseModel):
     """Schema for user registration"""
-    email: str
-    password: str
-    full_name: str
+    email: EmailStrStrict
+    password: PasswordStr = Field(..., min_length=8, max_length=MAX_PASSWORD_CHARS)
+    full_name: FullNameStr
 
 class UserLogin(BaseModel):
     """Schema for user login"""
-    email: str
-    password: str
+    email: EmailStrStrict
+    password: PasswordStr = Field(..., min_length=1, max_length=MAX_PASSWORD_CHARS)
 
 class UserResponse(BaseModel):
     """Schema for user information (without password)"""
@@ -345,9 +357,9 @@ class Token(BaseModel):
 
 class RefreshRequest(BaseModel):
     """Body refresh; cookie also accepted when AUTH_COOKIE_ENABLED."""
-    refresh_token: Optional[str] = None
+    refresh_token: Optional[str] = Field(default=None, max_length=MAX_REFRESH_TOKEN_CHARS)
 
 
 class LogoutRequest(BaseModel):
-    refresh_token: Optional[str] = None
+    refresh_token: Optional[str] = Field(default=None, max_length=MAX_REFRESH_TOKEN_CHARS)
     revoke_all: bool = False

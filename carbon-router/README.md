@@ -65,8 +65,8 @@ python 3-makerequest.py
 
 5) Run API with live WattTime data:
 ```
-$env:WATTTIME_USERNAME="<from settings>"
-$env:WATTTIME_PASSWORD="<from settings>"
+$env:WATTTIME_USERNAME="your_username"
+$env:WATTTIME_PASSWORD="your_password"
 $env:USE_WATTTIME="1"
 uvicorn main:app --reload --port 8000
 ```

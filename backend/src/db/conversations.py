@@ -114,10 +114,22 @@ def save_conversation_state(
             )
             db.add(row)
         else:
-            row.document_id = document_id
-            row.owner_type = str(owner_type)
-            row.owner_id = str(owner_id)
-            if user_id is not None:
+            # Never reassign ownership — IDOR defense in depth.
+            existing_ot = getattr(row, "owner_type", None)
+            existing_oid = getattr(row, "owner_id", None)
+            if existing_ot and existing_oid:
+                if str(existing_ot) != str(owner_type) or str(existing_oid) != str(owner_id):
+                    log.warning(
+                        "save_conversation_state ownership mismatch for %s",
+                        conversation_id,
+                    )
+                    raise PermissionError("Conversation ownership mismatch")
+            if str(row.document_id) != str(document_id):
+                raise PermissionError("Conversation/document mismatch")
+            if not existing_ot or not existing_oid:
+                row.owner_type = str(owner_type)
+                row.owner_id = str(owner_id)
+            if user_id is not None and row.user_id is None:
                 row.user_id = user_id
             row.updated_at = now
             row.expires_at = now + _ttl()
@@ -143,6 +155,9 @@ def save_conversation_state(
             )
         db.commit()
         return True
+    except PermissionError:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         log.error(f"save_conversation_state failed: {e}")

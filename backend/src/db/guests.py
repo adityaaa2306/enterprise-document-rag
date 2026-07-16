@@ -350,8 +350,12 @@ def purge_guest_resources(session_id: str) -> Dict[str, Any]:
 
 
 def transfer_guest_to_user(session_id: str, user_id: int) -> Dict[str, Any]:
-    """Reassign all guest-owned resources to an authenticated user (no recompute)."""
-    from sqlalchemy import select, update
+    """Reassign all guest-owned resources to an authenticated user (no recompute).
+
+    Only sessions with status=active are transferable (prevents claiming
+    expired/upgraded/purged session IDs).
+    """
+    from sqlalchemy import update
 
     from src.db.models import ConversationModel, DocumentModel, GuestSessionModel, JobModel
     from src.db.session import get_session
@@ -359,6 +363,9 @@ def transfer_guest_to_user(session_id: str, user_id: int) -> Dict[str, Any]:
     db = get_session()
     moved = {"jobs": 0, "documents": 0, "conversations": 0}
     try:
+        row = db.get(GuestSessionModel, session_id)
+        if row is None or str(row.status or "") != "active":
+            return {"ok": False, "error": "Guest session not found or not active"}
         for Model, key in (
             (JobModel, "jobs"),
             (DocumentModel, "documents"),
@@ -377,10 +384,8 @@ def transfer_guest_to_user(session_id: str, user_id: int) -> Dict[str, Any]:
                 )
             )
             moved[key] = int(result.rowcount or 0)
-        row = db.get(GuestSessionModel, session_id)
-        if row:
-            row.status = "upgraded"
-            row.upgraded_user_id = int(user_id)
+        row.status = "upgraded"
+        row.upgraded_user_id = int(user_id)
         db.commit()
         return {"ok": True, "session_id": session_id, "user_id": user_id, **moved}
     except Exception as e:

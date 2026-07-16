@@ -3,7 +3,8 @@ Hierarchical DAG compile engine (unified with pipeline_dag schema).
 
 Map chunk nodes are real graph citizens (see pipeline_dag.build_chunk_nodes).
 Compile nodes execute through the same MAX_PARALLEL_WORKERS capacity pool as map.
-Medium→QVA→heavy escalation in _compile_node_text is preserved.
+Medium→QVA→optional heavy enhancement in _compile_node_text is monotonic:
+a successful executive summary is never replaced by stitch or failure.
 """
 from __future__ import annotations
 
@@ -27,6 +28,100 @@ ProgressCb = Optional[Callable[[float, str, Dict[str, Any]], None]]
 # Re-export unified schema
 DagNode = pdag.DagNode
 _context_token_budget = pdag.context_token_budget
+
+
+def compute_compile_budget_timeline(
+    *,
+    now_mono: float,
+    absolute_job_deadline_mono: Optional[float],
+    reserved_sec: float,
+    per_task_hard_sec: float,
+) -> Dict[str, Any]:
+    """
+    Exclusive compile-budget ownership timeline.
+
+    Map / regional / chapter share the pre-reserve window ending at
+    ``absolute_job_deadline - reserved``. Executive / final own a fresh
+    ``reserved_sec`` wall starting when they run — never
+    ``min(remaining_job_wall, reserved)``.
+    """
+    reserved = max(0.0, float(reserved_sec))
+    hard = max(0.0, float(per_task_hard_sec))
+    abs_dl = (
+        float(absolute_job_deadline_mono)
+        if absolute_job_deadline_mono is not None
+        else None
+    )
+    pre_ceiling = (abs_dl - reserved) if abs_dl is not None else None
+
+    def _pre_stage(label: str) -> Dict[str, Any]:
+        # Per-task lease is hard timeout, clamped to the pre-executive ceiling.
+        lease_end = now_mono + hard
+        if pre_ceiling is not None:
+            lease_end = min(lease_end, pre_ceiling)
+        remaining = max(0.0, lease_end - now_mono)
+        return {
+            "stage": label,
+            "deadline_mono": lease_end if abs_dl is not None or pre_ceiling is not None else None,
+            "remaining_sec": remaining if abs_dl is not None else hard,
+            "ceiling": "pre_executive",
+            "owns_reserved_budget": False,
+        }
+
+    # Executive/final: exclusive reserved wall from *now* — not job remainder.
+    exec_end = now_mono + reserved
+    final_end = now_mono + reserved
+    return {
+        "now_mono": now_mono,
+        "absolute_job_deadline_mono": abs_dl,
+        "pre_executive_ceiling_mono": pre_ceiling,
+        "reserved_sec": reserved,
+        "absolute_remaining_sec": (abs_dl - now_mono) if abs_dl is not None else None,
+        "stages": {
+            "map": _pre_stage("map"),
+            "regional": _pre_stage("regional"),
+            "chapter": _pre_stage("chapter"),
+            "executive": {
+                "stage": "executive",
+                "deadline_mono": exec_end,
+                "remaining_sec": reserved,
+                "ceiling": "exclusive_reserved",
+                "owns_reserved_budget": True,
+            },
+            "final": {
+                "stage": "final",
+                "deadline_mono": final_end,
+                "remaining_sec": reserved,
+                "ceiling": "exclusive_reserved",
+                "owns_reserved_budget": True,
+            },
+        },
+    }
+
+
+def phase_deadline_mono(
+    kind: str,
+    *,
+    now_mono: float,
+    absolute_job_deadline_mono: Optional[float],
+    pre_executive_ceiling_mono: Optional[float],
+    reserved_sec: float,
+    per_task_lease_mono: Optional[float] = None,
+) -> Optional[float]:
+    """Resolve the wall-clock deadline for a DAG node kind."""
+    if kind in ("executive", "final"):
+        # Exclusive: full reserved window from this moment. Do NOT clamp to
+        # remaining absolute job wall — that reintroduces shared-deadline starvation.
+        return float(now_mono) + float(reserved_sec)
+    d = per_task_lease_mono
+    if d is None and absolute_job_deadline_mono is not None:
+        d = float(absolute_job_deadline_mono)
+    if d is None:
+        return None
+    d = float(d)
+    if pre_executive_ceiling_mono is not None:
+        d = min(d, float(pre_executive_ceiling_mono))
+    return d
 
 
 def build_compile_dag(
@@ -70,6 +165,16 @@ def build_compile_dag(
     )
 
 
+def _compile_status_base() -> Dict[str, Any]:
+    return {
+        "compile_status": "pending",
+        "compile_attempts": [],
+        "best_compile_model": None,
+        "heavy_compile_skipped": None,
+        "summary_source": None,
+    }
+
+
 def _compile_node_text(
     text: str,
     *,
@@ -82,11 +187,12 @@ def _compile_node_text(
     assigned_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Medium-first compile + optional heavy for one node.
+    Medium-first compile + optional heavy enhancement for one node.
 
-    Prompt-size control is handled by pipeline_dag.ensure_prompt_budget (extra
-    hierarchy levels) BEFORE this is called — we do not split inside the node.
+    Invariant: a successful executive summary is only replaced by a strictly
+    better successful executive summary — never by stitch, timeout, or failure.
     """
+    status = _compile_status_base()
     # Guard: if somehow still oversized, refuse to concat-split; stitch instead
     budget = _context_token_budget()
     if estimate_tokens(text) > int(budget * 1.15):
@@ -96,6 +202,13 @@ def _compile_node_text(
             budget,
         )
         stitched = models.stitch_compile_fallback([text], reason="over_budget_no_split")
+        status.update(
+            {
+                "compile_status": "stitched_fallback",
+                "summary_source": "stitched_fallback",
+                "compile_attempts": [{"phase": "over_budget", "result": "stitched"}],
+            }
+        )
         return {
             "summary": stitched,
             "used_heavy": False,
@@ -108,53 +221,170 @@ def _compile_node_text(
             "latency_ms": 0.0,
             "model": None,
             "tier": "medium",
+            "qva_passed": False,
+            "compile_status": status,
         }
 
     used_heavy = False
     model_used = assigned_model
+    best_summary: Optional[str] = None
+    best_model: Optional[str] = None
     t0 = time.perf_counter()
     intensity = float((state.get("features") or {}).get("grid_intensity") or 500.0)
+    enhance_min_sec = 15.0
 
-    def _one(prompt: str, chain: List[str]) -> str:
+    def _remaining() -> float:
+        if deadline_mono is None:
+            return 1e9
+        return float(deadline_mono) - time.monotonic()
+
+    def _try_compile(prompt: str, chain: List[str], *, phase: str) -> Optional[str]:
+        """Run one compile chain; return durable executive text or None (stitch/fail)."""
         nonlocal model_used
-        # Prefer assigned model first if present in chain
         use_chain = list(chain)
         if assigned_model and assigned_model in use_chain:
             use_chain = [assigned_model] + [m for m in use_chain if m != assigned_model]
-        elif assigned_model:
+        elif assigned_model and phase == "medium":
             use_chain = [assigned_model] + use_chain
-        out = models.run_compile_with_models(
-            [prompt],
-            state,
-            use_chain,
-            deadline_mono=deadline_mono,
-        )
-        model_used = (state.get("models_used") or [model_used])[-1] if state.get("models_used") else model_used
-        return out
+        attempt: Dict[str, Any] = {
+            "phase": phase,
+            "chain_head": use_chain[0] if use_chain else None,
+            "budget_sec": round(_remaining(), 2),
+        }
+        try:
+            out = models.run_compile_with_models(
+                [prompt],
+                state,
+                use_chain,
+                deadline_mono=deadline_mono,
+            )
+            out = models.strip_outer_markdown_fence(out)
+            used = None
+            if state.get("models_used"):
+                used = (state.get("models_used") or [None])[-1]
+                model_used = used or model_used
+            if models.is_executive_compile_success(out):
+                attempt["result"] = "success"
+                attempt["model"] = used
+                status["compile_attempts"].append(attempt)
+                return out
+            attempt["result"] = "stitched_or_unusable"
+            attempt["model"] = used
+            status["compile_attempts"].append(attempt)
+            log.info(
+                "Compile %s produced non-durable output (stitch/unusable); not adopting",
+                phase,
+            )
+            return None
+        except Exception as e:
+            attempt["result"] = "error"
+            attempt["error"] = str(e)[:160]
+            status["compile_attempts"].append(attempt)
+            log.warning("Compile %s failed: %s", phase, e)
+            return None
 
-    chain = medium_chain if medium_first else heavy_chain
-    summary = _one(text, chain)
-    verdict = quality_validation.validate_final([text], summary)
-    if (not verdict.passed or float(verdict.confidence) < qva_tau) and medium_first:
-        if deadline_mono is None or (deadline_mono - time.monotonic()) > 15:
-            summary = _one(text, heavy_chain)
+    def _adopt(summary: str, *, model: Optional[str], source: str) -> None:
+        nonlocal best_summary, best_model
+        best_summary = summary
+        best_model = model or best_model
+        status["best_compile_model"] = best_model
+        status["summary_source"] = source
+
+    # --- Primary compile (medium-first or heavy-only) ---
+    primary_chain = medium_chain if medium_first else heavy_chain
+    primary_phase = "medium" if medium_first else "heavy"
+    primary = _try_compile(text, primary_chain, phase=primary_phase)
+    if primary:
+        _adopt(primary, model=model_used, source="executive_compile")
+        status["compile_status"] = "ok"
+        if not medium_first:
             used_heavy = True
-            verdict = quality_validation.validate_final([text], summary)
+
+    if best_summary:
+        verdict = quality_validation.validate_final([text], best_summary)
+    else:
+        verdict = quality_validation.ValidationVerdict(
+            passed=False,
+            confidence=0.0,
+            faithfulness=0.0,
+            coverage=0.0,
+            hallucination_rate=1.0,
+            contradiction_rate=0.0,
+            codes=["no_executive_compile"],
+            details={"reason": "no_executive_compile"},
+        )
+
+    # --- Optional heavy enhancement (never degrades best) ---
+    if medium_first and best_summary:
+        needs_enhance = (not verdict.passed) or float(verdict.confidence) < qva_tau
+        if needs_enhance:
+            rem = _remaining()
+            if rem > enhance_min_sec:
+                heavy_out = _try_compile(text, heavy_chain, phase="heavy_enhance")
+                if heavy_out:
+                    _adopt(heavy_out, model=model_used, source="executive_compile")
+                    used_heavy = True
+                    status["compile_status"] = "ok"
+                    status["heavy_compile_skipped"] = None
+                    verdict = quality_validation.validate_final([text], best_summary)
+                else:
+                    # Keep medium success — failures must not overwrite.
+                    status["heavy_compile_skipped"] = "compile_failed"
+                    status["compile_status"] = "degraded_enhance_failed"
+                    log.info(
+                        "Heavy enhance failed/skipped; keeping best executive "
+                        "(model=%s)",
+                        status.get("best_compile_model"),
+                    )
+            else:
+                status["heavy_compile_skipped"] = "deadline_budget"
+                status["compile_status"] = "degraded_timeout"
+                status["compile_attempts"].append(
+                    {
+                        "phase": "heavy_enhance",
+                        "result": "skipped",
+                        "reason": "deadline_budget",
+                        "budget_sec": round(rem, 2),
+                    }
+                )
+                log.info(
+                    "Heavy enhance skipped (remaining=%.1fs); keeping best executive",
+                    rem,
+                )
+
+    # Stitch only when no executive compile succeeded at all.
+    if not best_summary:
+        best_summary = models.stitch_compile_fallback(
+            [text], reason="all_executive_compile_failed"
+        )
+        status["compile_status"] = "stitched_fallback"
+        status["summary_source"] = "stitched_fallback"
+        status["best_compile_model"] = None
+        verdict = quality_validation.ValidationVerdict(
+            passed=False,
+            confidence=0.35,
+            faithfulness=0.0,
+            coverage=0.0,
+            hallucination_rate=1.0,
+            contradiction_rate=0.0,
+            codes=["stitched_fallback"],
+            details={"reason": "stitched_fallback"},
+        )
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
     tier = "heavy" if used_heavy else "medium"
     tokens_in = estimate_tokens(text)
-    tokens_out = estimate_tokens(summary)
+    tokens_out = estimate_tokens(best_summary or "")
     acct = estimate_node_accounting(
         tier=tier,
         tokens_in=tokens_in,
         tokens_out=tokens_out,
         latency_ms=latency_ms,
         grid_intensity=intensity,
-        model_id=model_used,
+        model_id=best_model or model_used,
     )
     return {
-        "summary": models.strip_outer_markdown_fence(summary),
+        "summary": models.strip_outer_markdown_fence(best_summary or ""),
         "used_heavy": used_heavy,
         "confidence": float(verdict.confidence),
         "carbon_g": acct["carbon_g"],
@@ -163,9 +393,10 @@ def _compile_node_text(
         "tokens_out": tokens_out,
         "cost_usd": acct["cost_usd"],
         "latency_ms": latency_ms,
-        "model": model_used,
+        "model": best_model or model_used,
         "tier": tier,
         "qva_passed": bool(verdict.passed),
+        "compile_status": status,
     }
 
 
@@ -265,8 +496,13 @@ def recompute_branch(
                 assigned_model=assignment.get("model_id"),
             )
             _apply_result(n, result)
-            # If still failing QVA, one heavy-forced recompute of THIS node only
-            if not result.get("qva_passed") and float(result.get("confidence") or 0) < qva_tau:
+            # If still failing QVA, one heavy-forced recompute of THIS node only.
+            # Never replace a durable executive with stitch/failure.
+            if (
+                not result.get("qva_passed")
+                and float(result.get("confidence") or 0) < qva_tau
+                and models.is_executive_compile_success(result.get("summary"))
+            ):
                 n.status = "retrying"
                 n.retries += 1
                 result2 = _compile_node_text(
@@ -278,14 +514,24 @@ def recompute_branch(
                     deadline_mono=deadline_mono,
                     state=state,
                 )
-                _apply_result(n, result2)
+                if models.is_executive_compile_success(result2.get("summary")):
+                    _apply_result(n, result2)
+                else:
+                    n.status = "completed"
+                    log.info(
+                        "Branch heavy recompute non-durable for %s; keeping prior executive",
+                        tid,
+                    )
         except Exception as e:
             log.warning("Branch recompute failed for %s: %s", tid, e)
-            n.status = "failed"
-            n.output_summary = models.stitch_compile_fallback(
-                [n.input_text], reason=f"branch_recompute_{tid}"
-            )
-            n.status = "completed"
+            if models.is_executive_compile_success(n.output_summary):
+                n.status = "completed"
+            else:
+                n.status = "failed"
+                n.output_summary = models.stitch_compile_fallback(
+                    [n.input_text], reason=f"branch_recompute_{tid}"
+                )
+                n.status = "completed"
     return touched
 
 
@@ -306,6 +552,8 @@ def run_dag_compile(
     progress_cb: ProgressCb = None,
     existing_nodes: Optional[Dict[str, DagNode]] = None,
     frozen_plan: Any = None,
+    pre_executive_ceiling_mono: Optional[float] = None,
+    executive_reserved_sec: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Execute hierarchical DAG compile via the shared capacity pool.
@@ -397,9 +645,36 @@ def run_dag_compile(
         ),
     )
     hard_to = float(getattr(settings, "COMPILE_NODE_HARD_TIMEOUT_SEC", 90.0) or 90.0)
+    reserved_sec = float(
+        executive_reserved_sec
+        if executive_reserved_sec is not None
+        else getattr(settings, "COMPILE_RESERVED_SEC", 60.0)
+        or 60.0
+    )
+    abs_deadline = deadline_mono
+    pre_ceiling = pre_executive_ceiling_mono
+    if pre_ceiling is None and abs_deadline is not None:
+        pre_ceiling = float(abs_deadline) - reserved_sec
     t_wall0 = time.perf_counter()
     api_calls = 0
     queue_waits: List[float] = []
+    executive_compile_status: Dict[str, Any] = {}
+
+    def _node_deadline(
+        n: DagNode, deadline_mono_inner: Optional[float]
+    ) -> Optional[float]:
+        """
+        Budget isolation: executive/final own a fresh reserved wall (exclusive).
+        Regional/chapter are clamped to the pre-executive ceiling.
+        """
+        return phase_deadline_mono(
+            n.kind,
+            now_mono=time.monotonic(),
+            absolute_job_deadline_mono=abs_deadline,
+            pre_executive_ceiling_mono=pre_ceiling,
+            reserved_sec=reserved_sec,
+            per_task_lease_mono=deadline_mono_inner,
+        )
 
     def _ready(n: DagNode) -> bool:
         if n.status not in ("pending", "retrying"):
@@ -469,7 +744,7 @@ def run_dag_compile(
     weak_nodes: List[str] = []
 
     def _run_payload(payload, deadline_mono_inner: Optional[float] = None):
-        nonlocal api_calls, carbon_total, compile_calls
+        nonlocal api_calls, carbon_total, compile_calls, executive_compile_status
         nid = payload if isinstance(payload, str) else payload[0]
         n = nodes[nid]
         # Honor per-node cancel requests (API or timeout reassignment path)
@@ -489,9 +764,20 @@ def run_dag_compile(
         if n.cancel_requested:
             n.status = "failed"
             return nid, None
-        if deadline_mono is not None and (deadline_mono - time.monotonic()) < 5:
-            n.status = "failed"
-            return nid, None
+        node_deadline = _node_deadline(n, deadline_mono_inner)
+        # Pre-executive stages stop at the reserved boundary. Executive/final
+        # never abort because the absolute job remainder is small — they own
+        # the exclusive reserved window.
+        if n.kind not in ("executive", "final"):
+            if (
+                pre_ceiling is not None
+                and (float(pre_ceiling) - time.monotonic()) < 2
+            ):
+                n.status = "failed"
+                return nid, None
+            if node_deadline is not None and (node_deadline - time.monotonic()) < 5:
+                n.status = "failed"
+                return nid, None
         n.status = "running"
         n.started_at = time.monotonic()
         try:
@@ -598,14 +884,19 @@ def run_dag_compile(
                     heavy_chain=heavy_chain,
                     medium_first=medium_first,
                     qva_tau=qva_tau,
-                    deadline_mono=deadline_mono_inner or deadline_mono,
+                    deadline_mono=node_deadline,
                     state=state,
                     assigned_model=n.assigned_model,
                 )
 
+            node_hard = reserved_sec if n.kind in ("executive", "final") else hard_to
+            if node_deadline is not None:
+                node_hard = min(
+                    node_hard, max(1.0, float(node_deadline) - time.monotonic())
+                )
             result = _run_with_hard_isolation(
                 _invoke_compile,
-                hard_timeout_sec=hard_to,
+                hard_timeout_sec=node_hard,
                 label=nid,
             )
             api_calls += 1
@@ -619,23 +910,38 @@ def run_dag_compile(
             except Exception:
                 pass
             _apply_result(n, result, worker_id=f"w-{nid}")
+            if n.kind in ("executive", "final") and isinstance(
+                result.get("compile_status"), dict
+            ):
+                executive_compile_status = dict(result["compile_status"])
             carbon_total += n.carbon_estimate_g
             compile_calls += 1 if n.status == "completed" else 0
             if n.status == "completed" and (
                 not result.get("qva_passed")
                 or float(result.get("confidence") or 0) < qva_tau
             ):
-                weak_nodes.append(nid)
+                # Only queue repair when we lack a durable executive (monotonic).
+                if not models.is_executive_compile_success(result.get("summary")):
+                    weak_nodes.append(nid)
+                elif n.kind not in ("executive", "final"):
+                    weak_nodes.append(nid)
             _progress()
             return nid, result
         except Exception as e:
             log.warning("DAG node %s failed: %s", nid, e)
+            # Keep any durable summary already on the node (monotonic).
+            if models.is_executive_compile_success(n.output_summary):
+                n.status = "completed"
+                n.finished_at = time.monotonic()
+                _progress()
+                return nid, {"summary": n.output_summary, "kept_prior": True}
             n.retries += 1
             n.status = "retrying"
             _progress()
             # Node-level fallback: next models / heavy, without stalling siblings
+            retry_deadline = _node_deadline(n, deadline_mono_inner)
             if n.retries < 2 and (
-                deadline_mono is None or (deadline_mono - time.monotonic()) > 20
+                retry_deadline is None or (retry_deadline - time.monotonic()) > 20
             ):
                 try:
                     from src.core.pipeline_executor import _run_with_hard_isolation
@@ -647,21 +953,38 @@ def run_dag_compile(
                             heavy_chain=heavy_chain,
                             medium_first=False,
                             qva_tau=qva_tau,
-                            deadline_mono=deadline_mono,
+                            deadline_mono=retry_deadline,
                             state=state,
                         )
 
+                    retry_hard = (
+                        reserved_sec if n.kind in ("executive", "final") else hard_to
+                    )
+                    if retry_deadline is not None:
+                        retry_hard = min(
+                            retry_hard,
+                            max(1.0, float(retry_deadline) - time.monotonic()),
+                        )
                     result = _run_with_hard_isolation(
                         _invoke_retry,
-                        hard_timeout_sec=hard_to,
+                        hard_timeout_sec=retry_hard,
                         label=f"{nid}-retry",
                     )
                     api_calls += 1
-                    _apply_result(n, result)
-                    carbon_total += n.carbon_estimate_g
-                    compile_calls += 1
-                    _progress()
-                    return nid, result
+                    if models.is_executive_compile_success(result.get("summary")):
+                        _apply_result(n, result)
+                        if n.kind in ("executive", "final") and isinstance(
+                            result.get("compile_status"), dict
+                        ):
+                            executive_compile_status = dict(result["compile_status"])
+                        carbon_total += n.carbon_estimate_g
+                        compile_calls += 1
+                        _progress()
+                        return nid, result
+                    log.info(
+                        "DAG node %s retry non-durable; not adopting over empty prior",
+                        nid,
+                    )
                 except Exception as e2:
                     log.error("DAG node %s reassign/retry failed: %s", nid, e2)
             n.status = "failed"
@@ -703,24 +1026,33 @@ def run_dag_compile(
             def _worker(p, deadline_mono=None):
                 return _run_payload(p, deadline_mono)
 
+            wave_is_exec = any(n.kind in ("executive", "final") for n in wave)
+            pool_hard = reserved_sec if wave_is_exec else hard_to
+            # Executive waves: no absolute-job ceiling — hard_timeout alone
+            # grants the exclusive reserved lease. Pre-exec waves stay clamped.
+            pool_ceiling = None if wave_is_exec else pre_ceiling
             ordered, prog, mets = run_capacity_pool(
                 payloads,
                 _worker,
                 role="compile",
                 kind="compile",
                 max_workers=workers,
-                hard_timeout_sec=hard_to,
+                hard_timeout_sec=pool_hard,
                 max_attempts=2,
                 is_success=_is_ok,
                 on_progress=_on_progress,
+                deadline_ceiling_mono=pool_ceiling,
             )
             if mets:
                 queue_waits.append(float(mets.to_dict().get("avg_queue_wait_ms") or 0.0))
 
             # Failed nodes: stitch so parents can proceed (non-blocking).
-            # Skip nodes deferred for overflow — they stay pending for a later pass.
+            # Never overwrite a durable executive compile with stitch.
             for n in wave:
                 if n.status == "pending":
+                    continue
+                if models.is_executive_compile_success(n.output_summary):
+                    n.status = "completed"
                     continue
                 if n.status != "completed" or not (n.output_summary or "").strip():
                     n.output_summary = models.stitch_compile_fallback(
@@ -734,6 +1066,9 @@ def run_dag_compile(
     # Anything still pending after wave passes: stitch so the pipeline can finish.
     for n in nodes.values():
         if n.kind == "chunk":
+            continue
+        if models.is_executive_compile_success(n.output_summary):
+            n.status = "completed"
             continue
         if n.status in ("pending", "retrying", "running", "failed") and not (
             n.output_summary or ""
@@ -797,51 +1132,86 @@ def run_dag_compile(
             if n.depth == depth_max and n.kind != "chunk" and n.status == "completed"
         ]
     used_stitched_fallback = False
-    if len(final_nodes) == 1:
+    # Prefer any durable executive already on final nodes (monotonic).
+    durable_finals = [
+        n
+        for n in final_nodes
+        if models.is_executive_compile_success(n.output_summary)
+    ]
+    if len(durable_finals) == 1:
+        final_summary = durable_finals[0].output_summary
+        if not executive_compile_status:
+            executive_compile_status = {
+                "compile_status": "ok",
+                "summary_source": "executive_compile",
+                "best_compile_model": durable_finals[0].assigned_model,
+            }
+    elif len(final_nodes) == 1:
         final_summary = final_nodes[0].output_summary
-        # If the sole "executive" output is itself a stitch marker, keep flag for UI.
-        if "stitched fallback" in str(final_summary or "").lower():
+        if models.is_stitched_fallback(final_summary):
             used_stitched_fallback = True
-    elif final_nodes:
-        joined = "\n\n".join(n.output_summary for n in final_nodes)
+            executive_compile_status = {
+                "compile_status": "stitched_fallback",
+                "summary_source": "stitched_fallback",
+                "best_compile_model": None,
+            }
+    elif durable_finals:
+        # Multiple durable executives: merge only if merge yields durable text;
+        # otherwise keep the longest durable executive (never stitch over them).
+        joined = "\n\n".join(n.output_summary for n in durable_finals)
+        # Exclusive reserved wall — never min(remaining_job, reserved).
+        merge_deadline = time.monotonic() + reserved_sec
         try:
-            final_summary = models.run_compile_with_models(
+            merged = models.run_compile_with_models(
                 [joined],
                 state,
-                heavy_chain if any(n.used_heavy for n in final_nodes) else medium_chain,
-                deadline_mono=deadline_mono,
+                heavy_chain if any(n.used_heavy for n in durable_finals) else medium_chain,
+                deadline_mono=merge_deadline,
             )
             compile_calls += 1
             api_calls += 1
-            if "stitched fallback" in str(final_summary or "").lower():
-                used_stitched_fallback = True
+            if models.is_executive_compile_success(merged):
+                final_summary = merged
+            else:
+                final_summary = max(
+                    (n.output_summary for n in durable_finals),
+                    key=lambda s: len(str(s or "")),
+                )
+                log.info("Final merge non-durable; keeping best durable executive")
         except Exception:
-            final_summary = models.stitch_compile_fallback(
-                [n.output_summary for n in final_nodes], reason="final_merge_failed"
+            final_summary = max(
+                (n.output_summary for n in durable_finals),
+                key=lambda s: len(str(s or "")),
             )
-            used_stitched_fallback = True
+    elif final_nodes:
+        final_summary = models.stitch_compile_fallback(
+            [n.output_summary for n in final_nodes], reason="final_merge_failed"
+        )
+        used_stitched_fallback = True
     else:
         # Chunk-only DAG should be rare after hierarchy always wraps an executive.
-        # Prefer a real LLM compile over stitching when summaries exist.
         usable = [str(s).strip() for s in (summaries or []) if str(s or "").strip()]
-        if usable and (
-            deadline_mono is None or float(deadline_mono) - time.monotonic() > 8.0
-        ):
+        exec_deadline = time.monotonic() + reserved_sec
+        if usable and (exec_deadline - time.monotonic()) > 8.0:
             try:
-                final_summary = models.run_compile_with_models(
+                recovered = models.run_compile_with_models(
                     usable,
                     state,
                     heavy_chain or medium_chain,
-                    deadline_mono=deadline_mono,
+                    deadline_mono=exec_deadline,
                 )
                 compile_calls += 1
                 api_calls += 1
-                if "stitched fallback" in str(final_summary or "").lower():
-                    used_stitched_fallback = True
-                else:
+                if models.is_executive_compile_success(recovered):
+                    final_summary = recovered
                     log.info(
                         "Recovered executive summary via direct compile after empty DAG finals"
                     )
+                else:
+                    final_summary = models.stitch_compile_fallback(
+                        usable, reason="no_executive_node"
+                    )
+                    used_stitched_fallback = True
             except Exception as e:
                 log.warning("Direct compile after dag_empty failed: %s", e)
                 final_summary = models.stitch_compile_fallback(
@@ -853,6 +1223,15 @@ def run_dag_compile(
                 list(summaries), reason="no_executive_node"
             )
             used_stitched_fallback = True
+
+    # Never surface stitch when a durable executive exists anywhere in finals.
+    if models.is_executive_compile_success(final_summary):
+        used_stitched_fallback = False
+        if executive_compile_status.get("summary_source") != "executive_compile":
+            executive_compile_status.setdefault("summary_source", "executive_compile")
+            executive_compile_status.setdefault("compile_status", "ok")
+    elif models.is_stitched_fallback(final_summary):
+        used_stitched_fallback = True
 
     _progress("DAG compile complete")
     wall_ms = (time.perf_counter() - t_wall0) * 1000.0
@@ -957,12 +1336,26 @@ def run_dag_compile(
     except Exception as e:
         log.debug("dag audit finalize skip: %s", e)
 
+    status_out = dict(executive_compile_status or {})
+    if used_stitched_fallback and not models.is_executive_compile_success(final_summary):
+        status_out.setdefault("compile_status", "stitched_fallback")
+        status_out.setdefault("summary_source", "stitched_fallback")
+    elif models.is_executive_compile_success(final_summary):
+        status_out.setdefault("compile_status", status_out.get("compile_status") or "ok")
+        status_out.setdefault("summary_source", "executive_compile")
+
     return {
         "final_summary": models.strip_outer_markdown_fence(final_summary),
         "compile_calls": compile_calls,
         "compile_carbon_g": round(carbon_total, 4),
         "used_heavy": any(n.used_heavy for n in nodes.values()),
         "used_stitched_fallback": used_stitched_fallback,
+        "compile_status": status_out.get("compile_status"),
+        "compile_attempts": status_out.get("compile_attempts") or [],
+        "best_compile_model": status_out.get("best_compile_model"),
+        "heavy_compile_skipped": status_out.get("heavy_compile_skipped"),
+        "summary_source": status_out.get("summary_source"),
+        "executive_reserved_sec": reserved_sec,
         "hierarchy": levels_ui,
         "dag_nodes": node_status,
         "workers": workers,

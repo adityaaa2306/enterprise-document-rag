@@ -16,8 +16,9 @@ services:
       POSTGRES_USER: green
       POSTGRES_PASSWORD: green
       POSTGRES_DB: green_agentic
+    # Bind Postgres to loopback only — never expose 0.0.0.0:5432 to the LAN/WAN.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -39,7 +40,10 @@ services:
     environment:
       APP_ENV: production
       PORT: "8000"
-      JWT_SECRET_KEY: change-me-docker-compose-dev-secret-32chars
+      # Local compose only — override via .env.docker in real deploys; never commit prod secrets.
+      JWT_SECRET_KEY: composeLocalJwtSecretKey32charsMin!!
+      FORCE_HTTPS: "false"
+      DATABASE_REQUIRE_SSL: "false"
       DATABASE_URL: postgresql+psycopg://green:green@postgres:5432/green_agentic
       CHROMA_PERSIST_DIRECTORY: /data/chroma
       VECTOR_DB_PATH: /data/aux
@@ -80,7 +84,9 @@ services:
         required: false
     environment:
       APP_ENV: production
-      JWT_SECRET_KEY: change-me-docker-compose-dev-secret-32chars
+      JWT_SECRET_KEY: composeLocalJwtSecretKey32charsMin!!
+      FORCE_HTTPS: "false"
+      DATABASE_REQUIRE_SSL: "false"
       DATABASE_URL: postgresql+psycopg://green:green@postgres:5432/green_agentic
       CHROMA_PERSIST_DIRECTORY: /data/chroma
       VECTOR_DB_PATH: /data/aux
