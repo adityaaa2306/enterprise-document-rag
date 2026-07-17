@@ -82,14 +82,42 @@ function redirectToLogin() {
 export type ApiFetchOptions = RequestInit & {
   /** Skip auth header (login/register) */
   skipAuth?: boolean
+  /** Correlation id for logs (sent as X-Request-Id). Generated if omitted. */
+  requestId?: string
+}
+
+export type ApiFetchMeta = {
+  requestId: string
+  startedAt: number
+  finishedAt: number
+  latencyMs: number
+  status: number | null
+  ok: boolean | null
+  errorName: string | null
+  errorMessage: string | null
+  timedOut: boolean
+  aborted: boolean
 }
 
 /**
  * fetch wrapper with Bearer auth + guest header + single refresh retry on 401.
+ *
+ * Optional ``metaOut`` is filled with timing / status / exception fields for
+ * poll diagnostics (does not change response behavior).
  */
-export async function apiFetch(path: string, options: ApiFetchOptions = {}): Promise<Response> {
-  const { skipAuth, headers: initHeaders, ...rest } = options
+export async function apiFetch(
+  path: string,
+  options: ApiFetchOptions = {},
+  metaOut?: Partial<ApiFetchMeta>,
+): Promise<Response> {
+  const { skipAuth, headers: initHeaders, requestId: reqIdOpt, ...rest } = options
   const headers = new Headers(initHeaders || {})
+  const requestId =
+    reqIdOpt ||
+    (typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID().slice(0, 12)
+      : `fe-${Date.now().toString(36)}`)
+  headers.set("X-Request-Id", requestId)
 
   const token = skipAuth ? null : getAccessToken()
   let authMode: "jwt" | "guest" | "none" = "none"
@@ -105,17 +133,52 @@ export async function apiFetch(path: string, options: ApiFetchOptions = {}): Pro
   }
 
   if (typeof console !== "undefined" && process.env.NODE_ENV === "development") {
-    console.debug(`[API] ${rest.method || "GET"} ${path} auth=${authMode}`)
+    console.debug(`[API] ${rest.method || "GET"} ${path} auth=${authMode} request_id=${requestId}`)
   }
 
   const url = path.startsWith("http") ? path : `${API_BASE_URL}${path.startsWith("/") ? "" : "/"}${path}`
+  const startedAt = Date.now()
+  if (metaOut) {
+    metaOut.requestId = requestId
+    metaOut.startedAt = startedAt
+    metaOut.status = null
+    metaOut.ok = null
+    metaOut.errorName = null
+    metaOut.errorMessage = null
+    metaOut.timedOut = false
+    metaOut.aborted = false
+  }
 
-  let res = await fetch(url, {
-    ...rest,
-    headers,
-    // Always omit credentials — identity is Bearer or X-Guest-Session-Id
-    credentials: "omit",
-  })
+  let res: Response
+  try {
+    res = await fetch(url, {
+      ...rest,
+      headers,
+      // Always omit credentials — identity is Bearer or X-Guest-Session-Id
+      credentials: "omit",
+    })
+  } catch (err) {
+    const finishedAt = Date.now()
+    const name = err instanceof Error ? err.name : typeof err
+    const message = err instanceof Error ? err.message : String(err)
+    if (metaOut) {
+      metaOut.finishedAt = finishedAt
+      metaOut.latencyMs = finishedAt - startedAt
+      metaOut.errorName = name
+      metaOut.errorMessage = message
+      metaOut.aborted = name === "AbortError" || /aborted/i.test(message)
+      metaOut.timedOut =
+        name === "TimeoutError" || /timeout/i.test(message)
+    }
+    throw err
+  }
+
+  if (metaOut) {
+    metaOut.finishedAt = Date.now()
+    metaOut.latencyMs = metaOut.finishedAt - startedAt
+    metaOut.status = res.status
+    metaOut.ok = res.ok
+  }
 
   if (res.status === 401 && !skipAuth && token) {
     if (!refreshPromise) {
@@ -128,16 +191,25 @@ export async function apiFetch(path: string, options: ApiFetchOptions = {}): Pro
       if (getGuestSessionId()) {
         const guestHeaders = new Headers(initHeaders || {})
         guestHeaders.set("X-Guest-Session-Id", getGuestSessionId()!)
-        return fetch(url, {
+        guestHeaders.set("X-Request-Id", requestId)
+        res = await fetch(url, {
           ...rest,
           headers: guestHeaders,
           credentials: "omit",
         })
+        if (metaOut) {
+          metaOut.finishedAt = Date.now()
+          metaOut.latencyMs = metaOut.finishedAt - startedAt
+          metaOut.status = res.status
+          metaOut.ok = res.ok
+        }
+        return res
       }
       redirectToLogin()
       return res
     }
     const retryHeaders = new Headers(initHeaders || {})
+    retryHeaders.set("X-Request-Id", requestId)
     const newToken = getAccessToken()
     if (newToken) {
       retryHeaders.set("Authorization", `Bearer ${newToken}`)
@@ -147,6 +219,12 @@ export async function apiFetch(path: string, options: ApiFetchOptions = {}): Pro
       headers: retryHeaders,
       credentials: "omit",
     })
+    if (metaOut) {
+      metaOut.finishedAt = Date.now()
+      metaOut.latencyMs = metaOut.finishedAt - startedAt
+      metaOut.status = res.status
+      metaOut.ok = res.ok
+    }
     if (res.status === 401) {
       clearTokens()
       if (!getGuestSessionId()) redirectToLogin()

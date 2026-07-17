@@ -15,7 +15,12 @@ from src.perf.prefetch import (
     get_embed_prefetch,
     start_embed_prefetch,
 )
-from src.perf.progress import set_progress_throttled, flush_progress
+from src.perf.progress import (
+    flush_progress,
+    publish_lifecycle_progress,
+    resolve_progress_message,
+    set_progress_throttled,
+)
 
 __all__ = [
     "document_content_hash",
@@ -27,4 +32,6 @@ __all__ = [
     "cancel_embed_prefetch",
     "set_progress_throttled",
     "flush_progress",
+    "publish_lifecycle_progress",
+    "resolve_progress_message",
 ]

@@ -772,6 +772,7 @@ def _job_status_payload(job_id: str, status_dict: Dict[str, Any]) -> JobStatus:
 @app.get("/job-status/{job_id}", response_model=JobStatus)
 def get_job_status(
     job_id: ResourceIdPath,
+    request: Request,
     current_owner: Dict[str, Any] = Depends(get_current_owner),
 ):
     """
@@ -781,63 +782,113 @@ def get_job_status(
     Ownership is checked from the same row (no extra document/job round-trips).
     Response schema is unchanged — ``JobStatus`` never included the result blob.
     """
-    status_dict = enforce_job_owner_dict(
-        current_owner,
+    import time as _time
+
+    request_id = getattr(request.state, "request_id", None) or request.headers.get(
+        "x-request-id"
+    )
+    t0 = _time.perf_counter()
+    log.info(
+        "JOB_STATUS_POLL start request_id=%s job_id=%s",
+        request_id,
         job_id,
-        job_store.get_job(job_id, include_result=False),
     )
-
-    # Detect dead workers mid-compile (frozen "Compiling executive summary...")
-    # well before JOB_MAX_RUNTIME_SEC — requeue and surface stalled≠compiling.
     try:
-        status_dict = job_store.detect_and_handle_stalled_job(job_id, status_dict)
-    except Exception as e:
-        log.warning("Job %s: stall detection failed: %s", job_id, e)
-
-    # Heal race: result already persisted but a late heartbeat left status=processing.
-    # Only hydrate the full row when progress claims completion while status lags.
-    status = str(status_dict.get("status") or "pending")
-    progress = float(status_dict.get("progress") or 0.0)
-    needs_heal = (
-        status == job_status_mod.STATUS_PROCESSING and progress >= 100.0
-    ) or (
-        # Stale in-memory pending while DB/result already finished (guest + embedded worker).
-        status
-        in (job_status_mod.STATUS_PENDING, job_status_mod.STATUS_PROCESSING)
-        and (
-            status_dict.get("summary_ready") is True
-            or "search ready" in str(status_dict.get("message") or "").lower()
-            or "summary ready" in str(status_dict.get("message") or "").lower()
-            or progress >= 100.0
+        status_dict = enforce_job_owner_dict(
+            current_owner,
+            job_id,
+            job_store.get_job(job_id, include_result=False),
         )
-    )
-    if needs_heal:
-        full = job_store.get_job(job_id, include_result=True) or status_dict
-        if (
-            isinstance(full.get("result"), dict)
-            and (
-                full["result"].get("final_summary")
-                or full["result"].get("summary_ready")
-            )
-        ):
-            job_store.upsert_job(
-                job_id,
-                status=job_status_mod.STATUS_COMPLETE,
-                progress=100.0,
-                message=full.get("message")
-                or status_dict.get("message")
-                or "Job complete. Results are ready.",
-                claimed_by=None,
-                heartbeat_at=None,
-            )
-            status_dict = job_store.get_job(job_id, include_result=False) or full
-            status = str(status_dict.get("status") or status)
 
-    try:
-        return _job_status_payload(job_id, status_dict)
+        # Detect dead workers mid-compile (frozen "Compiling executive summary...")
+        # well before JOB_MAX_RUNTIME_SEC — requeue and surface stalled≠compiling.
+        try:
+            status_dict = job_store.detect_and_handle_stalled_job(job_id, status_dict)
+        except Exception as e:
+            log.warning("Job %s: stall detection failed: %s", job_id, e)
+
+        # Heal race: result already persisted but a late heartbeat left status=processing.
+        # Only hydrate the full row when progress claims completion while status lags.
+        status = str(status_dict.get("status") or "pending")
+        progress = float(status_dict.get("progress") or 0.0)
+        needs_heal = (
+            status == job_status_mod.STATUS_PROCESSING and progress >= 100.0
+        ) or (
+            # Stale in-memory pending while DB/result already finished (guest + embedded worker).
+            status
+            in (job_status_mod.STATUS_PENDING, job_status_mod.STATUS_PROCESSING)
+            and (
+                status_dict.get("summary_ready") is True
+                or "search ready" in str(status_dict.get("message") or "").lower()
+                or "summary ready" in str(status_dict.get("message") or "").lower()
+                or progress >= 100.0
+            )
+        )
+        if needs_heal:
+            full = job_store.get_job(job_id, include_result=True) or status_dict
+            if (
+                isinstance(full.get("result"), dict)
+                and (
+                    full["result"].get("final_summary")
+                    or full["result"].get("summary_ready")
+                )
+            ):
+                job_store.upsert_job(
+                    job_id,
+                    status=job_status_mod.STATUS_COMPLETE,
+                    progress=100.0,
+                    message=full.get("message")
+                    or status_dict.get("message")
+                    or "Job complete. Results are ready.",
+                    claimed_by=None,
+                    heartbeat_at=None,
+                )
+                status_dict = job_store.get_job(job_id, include_result=False) or full
+                status = str(status_dict.get("status") or status)
+
+        try:
+            payload = _job_status_payload(job_id, status_dict)
+            log.info(
+                "JOB_STATUS_POLL finish request_id=%s job_id=%s status=%s "
+                "progress=%s duration_ms=%.1f ok=1",
+                request_id,
+                job_id,
+                status_dict.get("status"),
+                status_dict.get("progress"),
+                (_time.perf_counter() - t0) * 1000.0,
+            )
+            return payload
+        except Exception as e:
+            log.error(
+                "JOB_STATUS_POLL exception request_id=%s job_id=%s "
+                "duration_ms=%.1f error=%s: %s",
+                request_id,
+                job_id,
+                (_time.perf_counter() - t0) * 1000.0,
+                type(e).__name__,
+                e,
+            )
+            log.error(f"Error validating job status for {job_id}: {e}")
+            raise HTTPException(status_code=500, detail="Error validating job status.")
+    except HTTPException:
+        log.info(
+            "JOB_STATUS_POLL finish request_id=%s job_id=%s duration_ms=%.1f "
+            "ok=0 http_exception=1",
+            request_id,
+            job_id,
+            (_time.perf_counter() - t0) * 1000.0,
+        )
+        raise
     except Exception as e:
-        log.error(f"Error validating job status for {job_id}: {e}")
-        raise HTTPException(status_code=500, detail="Error validating job status.")
+        log.exception(
+            "JOB_STATUS_POLL exception request_id=%s job_id=%s duration_ms=%.1f "
+            "error=%s",
+            request_id,
+            job_id,
+            (_time.perf_counter() - t0) * 1000.0,
+            type(e).__name__,
+        )
+        raise
 
 
 @app.get("/job-events/{job_id}")

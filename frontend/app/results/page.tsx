@@ -12,7 +12,7 @@ import { ExecutionGraph } from "@/components/execution-graph"
 import { JobQueuePanel } from "@/components/job-queue-panel"
 import { Card } from "@/components/ui/card"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { apiFetch } from "@/lib/api"
+import { apiFetch, type ApiFetchMeta } from "@/lib/api"
 import { getLastJobId, rememberJobId } from "@/lib/job-session"
 import { isUuid } from "@/lib/input-validation"
 import type { ProcessingInsightsData } from "@/components/processing-insights"
@@ -502,7 +502,16 @@ function ResultsContent() {
     }
 
     const pollStatus = async () => {
-      if (cancelled || inFlight) return
+      if (cancelled || inFlight) {
+        // Overlap: skip tick — does NOT append "Waiting for status…".
+        if (inFlight && !cancelled) {
+          console.info("[JOB_STATUS_POLL] skip_overlap", {
+            job_id: jobId,
+            t: new Date().toISOString(),
+          })
+        }
+        return
+      }
       inFlight = true
 
       if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
@@ -518,8 +527,23 @@ function ResultsContent() {
         return
       }
 
+      const fetchMeta: Partial<ApiFetchMeta> = {}
+      let phase = "apiFetch"
+      console.info("[JOB_STATUS_POLL] start", {
+        job_id: jobId,
+        t: new Date().toISOString(),
+      })
       try {
-        const response = await apiFetch(`/job-status/${jobId}`)
+        const response = await apiFetch(`/job-status/${jobId}`, {}, fetchMeta)
+        phase = "after_apiFetch"
+        console.info("[JOB_STATUS_POLL] response", {
+          job_id: jobId,
+          request_id: fetchMeta.requestId,
+          status: response.status,
+          ok: response.ok,
+          latency_ms: fetchMeta.latencyMs,
+          t: new Date().toISOString(),
+        })
         if (cancelled) return
 
         if (response.status === 404) {
@@ -539,9 +563,12 @@ function ResultsContent() {
         }
 
         if (response.ok) {
+          phase = "response_json"
           const data: JobStatus = await response.json()
+          phase = "after_json"
           syncTrace("Polling update received", {
             job_id: jobId,
+            request_id: fetchMeta.requestId,
             status: data.status,
             progress: data.progress,
             summary_ready: data.summary_ready,
@@ -586,6 +613,7 @@ function ResultsContent() {
               isMetricsReadyFromStatus(data)
             let latest = cachedResult || null
             if (shouldRefetch) {
+              phase = "fetchResult"
               lastResultFetchAt = now
               latest = await fetchResult(jobId, {
                 force: true,
@@ -596,6 +624,7 @@ function ResultsContent() {
               isMetricsReadyFromStatus(data) ||
               isMetricsReadyFromResult(latest)
             ) {
+              phase = "finishMetrics"
               const done = await finishMetrics("status_or_result.metrics_ready", latest)
               if (done) return
               // Keep interval alive until /job-result carries dashboard metrics.
@@ -609,11 +638,42 @@ function ResultsContent() {
             )
             return
           }
+        } else {
+          // HTTP non-OK (incl. 5xx): does not throw → does NOT show Waiting…
+          console.warn("[JOB_STATUS_POLL] non_ok_no_throw", {
+            job_id: jobId,
+            request_id: fetchMeta.requestId,
+            status: response.status,
+            latency_ms: fetchMeta.latencyMs,
+            t: new Date().toISOString(),
+          })
         }
       } catch (error) {
-        console.error("Polling error:", error)
+        const errName = error instanceof Error ? error.name : typeof error
+        const errMsg = error instanceof Error ? error.message : String(error)
+        const errStack = error instanceof Error ? error.stack : undefined
+        console.error("[JOB_STATUS_POLL] exception → Waiting for status…", {
+          job_id: jobId,
+          request_id: fetchMeta.requestId ?? null,
+          phase,
+          latency_ms: fetchMeta.latencyMs ?? null,
+          http_status: fetchMeta.status ?? null,
+          fetch_ok: fetchMeta.ok ?? null,
+          timed_out: fetchMeta.timedOut ?? false,
+          aborted: fetchMeta.aborted ?? false,
+          error_name: errName,
+          error_message: errMsg,
+          error_stack: errStack,
+          t: new Date().toISOString(),
+        })
         appendLog("Waiting for status (API busy or reconnecting)…", "info")
       } finally {
+        console.info("[JOB_STATUS_POLL] finish", {
+          job_id: jobId,
+          request_id: fetchMeta.requestId ?? null,
+          latency_ms: fetchMeta.latencyMs ?? null,
+          t: new Date().toISOString(),
+        })
         inFlight = false
       }
     }

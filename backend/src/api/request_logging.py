@@ -52,6 +52,9 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         response.headers["X-Request-Id"] = request_id
         path = request.url.path
         level = logging.DEBUG if path in ("/api/health", "/api/ready") and response.status_code < 400 else logging.INFO
+        # Always INFO for job-status polls so FE Waiting… events can be correlated.
+        if path.startswith("/job-status/"):
+            level = logging.INFO
         log.log(
             level,
             "request_id=%s method=%s path=%s status=%s duration_ms=%.1f",

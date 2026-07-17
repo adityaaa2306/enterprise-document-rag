@@ -94,51 +94,64 @@ def _publish_compile_progress(
     model_id: Optional[str],
     progress: float = 88.0,
     progress_gate: Any = None,
-) -> None:
+    cycle_id: Optional[int] = None,
+    progress_ctx: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
     """
     Push a lifecycle-aware compile progress line to Live Job Status.
 
     Phases: Planning | Trying | Completed
     Example: "Executive Summary · Trying: Llama 3.1 8B"
 
-    If ``progress_gate`` is a threading.Event that is already set, Trying/Planning
-    updates are ignored so a late hedged loser cannot overwrite Completed.
+    Writes go through ``publish_lifecycle_progress`` (locked, cycle-scoped).
+    ``Planning`` allocates a new ``compile_cycle_id`` and stores it on
+    ``progress_ctx`` when provided. ``Trying`` / ``Completed`` must pass that id.
     """
     if not job_id:
-        return
+        return None
     try:
-        from src.db import jobs as jobs_db
+        from src.perf.progress import publish_lifecycle_progress
 
         label = _compile_kind_label(kind)
         model_label = _short_model_label(model_id)
         phase_key = (phase or "Trying").strip().capitalize()
         if phase_key not in ("Planning", "Trying", "Completed"):
             phase_key = "Trying"
-        # Hedge losers may still hit HTTP_REQUEST_STARTED after a winner —
-        # do not let those clobber the Completed line.
-        if phase_key != "Completed" and progress_gate is not None:
-            try:
-                if progress_gate.is_set():
-                    return
-            except Exception:
-                pass
         msg = f"{label} · {phase_key}: {model_label}"
-        jobs_db.set_progress(job_id, float(progress), msg)
-        if phase_key == "Completed" and progress_gate is not None:
-            try:
-                progress_gate.set()
-            except Exception:
-                pass
-        log.info(
-            "EXEC_COMPILE_PROGRESS job_id=%s phase=%s model=%s label=%s ui=%r",
+        # Prefer explicit cycle_id; else the active cycle on progress_ctx.
+        cid = cycle_id
+        if cid is None and progress_ctx is not None:
+            raw = progress_ctx.get("compile_cycle_id")
+            if raw is not None:
+                try:
+                    cid = int(raw)
+                except (TypeError, ValueError):
+                    cid = None
+        new_cid = publish_lifecycle_progress(
             job_id,
-            phase_key,
-            model_id,
-            model_label,
-            msg,
+            phase=phase_key,
+            message=msg,
+            progress=float(progress),
+            cycle_id=cid,
+            progress_gate=progress_gate,
         )
+        if new_cid is not None:
+            if progress_ctx is not None:
+                progress_ctx["compile_cycle_id"] = int(new_cid)
+            log.info(
+                "EXEC_COMPILE_PROGRESS job_id=%s cycle=%s phase=%s model=%s "
+                "label=%s ui=%r",
+                job_id,
+                new_cid,
+                phase_key,
+                model_id,
+                model_label,
+                msg,
+            )
+        return new_cid
     except Exception as e:
         log.debug("compile progress publish skipped: %s", e)
+        return None
 
 
 class NimApiError(RuntimeError):
@@ -895,6 +908,7 @@ def _call_chat_with_fallback_unsliced(
                             model_id=model_id,
                             progress=float(call_meta.get("progress") or 88.0),
                             progress_gate=call_meta.get("progress_gate"),
+                            cycle_id=call_meta.get("compile_cycle_id"),
                         )
                 if measure_ttft:
 
@@ -1850,6 +1864,7 @@ def _call_compile_llm(
             "compile_kind": pctx.get("compile_kind"),
             "progress": pctx.get("progress", 88.0),
             "progress_gate": pctx.get("progress_gate"),
+            "compile_cycle_id": pctx.get("compile_cycle_id"),
         }
         return call_chat_with_fallback(
             chain,
@@ -1937,6 +1952,7 @@ def _call_compile_llm_hedged(
             "compile_kind": pctx.get("compile_kind"),
             "progress": pctx.get("progress", 88.0),
             "progress_gate": progress_gate,
+            "compile_cycle_id": pctx.get("compile_cycle_id"),
             "model_id": model_id,
         }
         meta.update(extra)
@@ -2061,15 +2077,7 @@ def _call_compile_llm_hedged(
                     chain_position=i,
                     cancel_event=ev,
                 )
-                # Surface hedge fallback immediately (HTTP_REQUEST_STARTED also updates).
-                _publish_compile_progress(
-                    pctx.get("job_id"),
-                    kind=pctx.get("compile_kind"),
-                    phase="Trying",
-                    model_id=mid,
-                    progress=float(pctx.get("progress") or 88.0),
-                    progress_gate=progress_gate,
-                )
+                # Trying is emitted only on HTTP_REQUEST_STARTED (not on hedge schedule).
                 f = pool.submit(_one, mid, md, meta)
                 futs[f] = (i, mid)
                 tracked[f] = (i, mid, ev)
@@ -2259,13 +2267,25 @@ def _hierarchical_compile(
         model_hint = (
             batch_chains[0][0] if batch_chains and batch_chains[0] else None
         )
+        batch_gate = None
+        batch_progress_ctx: Dict[str, Any] = {
+            "job_id": job_id,
+            "compile_kind": batch_kind,
+            "progress": batch_progress,
+        }
         if job_id:
+            import threading as _threading_batch
+
+            batch_gate = _threading_batch.Event()
+            batch_progress_ctx["progress_gate"] = batch_gate
             _publish_compile_progress(
                 job_id,
                 kind=batch_kind,
                 phase="Planning",
                 model_id=model_hint,
                 progress=batch_progress,
+                progress_gate=batch_gate,
+                progress_ctx=batch_progress_ctx,
             )
         log.info(
             "Compile round %s batch %s/%s (~%s tokens) models=%s",
@@ -2282,11 +2302,7 @@ def _hierarchical_compile(
                     chain,
                     intermediate=True,
                     deadline_mono=deadline_mono,
-                    progress_ctx={
-                        "job_id": job_id,
-                        "compile_kind": batch_kind,
-                        "progress": batch_progress,
-                    },
+                    progress_ctx=batch_progress_ctx,
                 )
                 _publish_compile_progress(
                     job_id,
@@ -2294,6 +2310,8 @@ def _hierarchical_compile(
                     phase="Completed",
                     model_id=used or (chain[0] if chain else None),
                     progress=batch_progress,
+                    progress_gate=batch_gate,
+                    progress_ctx=batch_progress_ctx,
                 )
                 return bi, text, used, len(batch_text), None
             except Exception as e:
@@ -2383,13 +2401,15 @@ def _hierarchical_compile(
 
                 nid = state.get("_compile_audit_nid")
                 planned = chain[0]
-                # Lifecycle step 1: planned / assigned head (not yet requested).
+                # Lifecycle step 1: new compile cycle (Planning allocates cycle_id).
                 _publish_compile_progress(
                     job_id,
                     kind=kind,
                     phase="Planning",
                     model_id=planned,
                     progress=88.0,
+                    progress_gate=progress_ctx.get("progress_gate"),
+                    progress_ctx=progress_ctx,
                 )
                 dag_audit_record_compile_stamp(
                     str(job_id),
@@ -2442,7 +2462,7 @@ def _hierarchical_compile(
                 used,
                 bool(chain and used and chain[0] == used),
             )
-            # Lifecycle final: model that actually produced the summary.
+            # Lifecycle final for this compile cycle (next Planning opens a new one).
             _publish_compile_progress(
                 job_id,
                 kind=kind,
@@ -2450,6 +2470,7 @@ def _hierarchical_compile(
                 model_id=used or (chain[0] if chain else None),
                 progress=89.0,
                 progress_gate=progress_ctx.get("progress_gate"),
+                progress_ctx=progress_ctx,
             )
             state.setdefault("model_usage_chars", {"light": 0, "medium": 0, "large": 0})
             state["model_usage_chars"]["large"] = (

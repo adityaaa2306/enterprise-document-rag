@@ -240,6 +240,13 @@ def set_progress(job_id: str, progress: float, message: str) -> None:
         job_status_mod.STATUS_CANCELLED,
     ):
         return
+    # Lifecycle lines (Planning/Trying/Completed) win over scheduler ETA/workers.
+    try:
+        from src.perf.progress import resolve_progress_message
+
+        message = resolve_progress_message(job_id, message)
+    except Exception:
+        pass
     upsert_job(job_id, progress=progress, message=message, status=status)
 
 
