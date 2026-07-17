@@ -43,6 +43,130 @@ def test_is_stitched_fallback_detection():
     assert models.is_executive_compile_success("## Summary\n\nReal executive prose.")
 
 
+def test_hedged_compile_waits_for_slow_success_after_primary_fails(monkeypatch):
+    """
+    Regression: FIRST_COMPLETED on a failed Ministral must not abort while
+    Gemma is still generating — that converted live successes into stitch.
+    """
+    from src.core import chain_time_budget as ctb
+
+    def fake_chat(chain, messages, **kwargs):
+        mid = (chain or ["?"])[0]
+        meta = kwargs.get("call_meta") or {}
+        ev = meta.get("cancel_event")
+        if "ministral" in mid.lower():
+            time.sleep(0.12)
+            raise models.NimApiError(f"primary failed: {mid}")
+        # finishes after primary failure is observed; honor cancel if signaled
+        for _ in range(20):
+            if ev is not None and ev.is_set():
+                raise models.HedgeCancelled("cancelled")
+            time.sleep(0.02)
+        return ("## Summary\n\nGemma executive that must be kept.", mid)
+
+    def plan(ordered, role="compile", wall_sec=30.0):
+        ids = list(ordered)[:2]
+        slices = [0.15, 2.0]
+        report = ctb.ChainSliceReport(
+            role=role,
+            wall_sec=wall_sec,
+            fractions=[0.4, 0.6],
+            attempts=[
+                ctb.SliceAttempt(model_id=ids[0], position=0, allocated_sec=slices[0]),
+                ctb.SliceAttempt(model_id=ids[1], position=1, allocated_sec=slices[1]),
+            ],
+        )
+        return ids, slices, report
+
+    monkeypatch.setattr(models, "call_chat_with_fallback", fake_chat)
+    monkeypatch.setattr(ctb, "plan_chain_slices", plan)
+    monkeypatch.setattr(ctb, "log_slice_report", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        ctb,
+        "get_reliability_tracker",
+        lambda: type("T", (), {"record": lambda *a, **k: None})(),
+    )
+
+    text, used = models._call_compile_llm_hedged(
+        [{"role": "user", "content": "summarize"}],
+        [
+            "mistralai/ministral-14b-instruct-2512",
+            "google/gemma-4-31b-it",
+        ],
+        intermediate=False,
+        deadline_mono=time.monotonic() + 5.0,
+        hard_sec=5.0,
+    )
+    assert "Gemma executive that must be kept" in text
+    assert used and "gemma" in used.lower()
+
+
+def test_hedge_cancels_loser_immediately_on_first_success(monkeypatch):
+    """First durable success must signal cancel_event on outstanding losers."""
+    from src.core import chain_time_budget as ctb
+
+    cancel_seen = {"ministral": False}
+    started = {"gemma": False}
+
+    def fake_chat(chain, messages, **kwargs):
+        mid = (chain or ["?"])[0]
+        meta = kwargs.get("call_meta") or {}
+        ev = meta.get("cancel_event")
+        if "gemma" in mid.lower():
+            started["gemma"] = True
+            time.sleep(0.05)
+            return ("## Summary\n\nFast gemma win.", mid)
+        # Slow primary / loser — must observe cancel after gemma wins.
+        for _ in range(80):
+            if ev is not None and ev.is_set():
+                cancel_seen["ministral"] = True
+                raise models.HedgeCancelled("loser cancelled")
+            time.sleep(0.05)
+        return ("## Summary\n\nSlow primary should not win.", mid)
+
+    def plan(ordered, role="compile", wall_sec=30.0):
+        ids = list(ordered)[:2]
+        slices = [0.08, 2.0]  # primary slice elapses quickly → hedge fires
+        report = ctb.ChainSliceReport(
+            role=role,
+            wall_sec=wall_sec,
+            fractions=[0.4, 0.6],
+            attempts=[
+                ctb.SliceAttempt(model_id=ids[0], position=0, allocated_sec=slices[0]),
+                ctb.SliceAttempt(model_id=ids[1], position=1, allocated_sec=slices[1]),
+            ],
+        )
+        return ids, slices, report
+
+    monkeypatch.setattr(models, "call_chat_with_fallback", fake_chat)
+    monkeypatch.setattr(ctb, "plan_chain_slices", plan)
+    monkeypatch.setattr(ctb, "log_slice_report", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        ctb,
+        "get_reliability_tracker",
+        lambda: type("T", (), {"record": lambda *a, **k: None})(),
+    )
+
+    text, used = models._call_compile_llm_hedged(
+        [{"role": "user", "content": "summarize"}],
+        [
+            "mistralai/ministral-14b-instruct-2512",
+            "google/gemma-4-31b-it",
+        ],
+        intermediate=False,
+        deadline_mono=time.monotonic() + 5.0,
+        hard_sec=5.0,
+    )
+    assert "Fast gemma win" in text
+    assert used and "gemma" in used.lower()
+    assert started["gemma"] is True
+    # Give loser thread a moment to observe cancel_event.
+    deadline = time.monotonic() + 2.0
+    while not cancel_seen["ministral"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert cancel_seen["ministral"] is True
+
+
 def test_monotonic_keeps_medium_when_heavy_returns_stitch(monkeypatch):
     """Gemma success must survive a later heavy stitch/timeout."""
     calls: List[Optional[List[str]]] = []

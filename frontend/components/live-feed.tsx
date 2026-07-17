@@ -42,7 +42,9 @@ export function LiveFeed({ logs }: LiveFeedProps) {
             >
               <div className="mt-1 flex-shrink-0">{getIcon(log.type)}</div>
               <div className="flex-1 min-w-0">
-                <p className="text-sm text-foreground">{log.message}</p>
+                <p className="text-sm text-foreground whitespace-pre-line">
+                  {log.message}
+                </p>
                 <p className="text-xs text-muted-foreground mt-1">{log.timestamp}</p>
               </div>
             </motion.div>

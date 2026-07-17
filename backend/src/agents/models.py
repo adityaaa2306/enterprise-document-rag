@@ -36,6 +36,111 @@ def strip_outer_markdown_fence(text: str) -> str:
     return text or ""
 
 
+def _exec_compile_lifecycle(event: str, **fields: Any) -> None:
+    """Structured breadcrumb for executive-compile forensics (Render logs)."""
+    parts = " ".join(
+        f"{k}={v!r}" if isinstance(v, str) else f"{k}={v}"
+        for k, v in fields.items()
+        if v is not None
+    )
+    log.info("EXEC_COMPILE_LIFECYCLE event=%s %s", event, parts)
+
+
+def _short_model_label(model_id: Optional[str]) -> str:
+    """Human-readable model label for Live Job Status (not the raw NIM id)."""
+    mid = (model_id or "").strip()
+    if not mid:
+        return "—"
+    low = mid.lower()
+    if "ministral" in low:
+        return "Ministral"
+    if "mistral-nemotron" in low or "mistral_nemotron" in low:
+        return "Mistral Nemotron"
+    if "llama-3.3-70b" in low or "llama-3.3-70" in low:
+        return "Llama 3.3 70B"
+    if "llama-3.1-70b" in low or "llama-3.1-70" in low:
+        return "Llama 3.1 70B"
+    if "llama-3.1-8b" in low or "llama-3.1-8" in low:
+        return "Llama 3.1 8B"
+    if "llama-3.2-3b" in low:
+        return "Llama 3.2 3B"
+    if "gpt-oss-120b" in low:
+        return "GPT-OSS 120B"
+    if "gemma-4-31b" in low:
+        return "Gemma 4 31B"
+    if "gemma-2-2b" in low:
+        return "Gemma 2 2B"
+    # Fallback: last path segment, lightly cleaned
+    leaf = mid.split("/")[-1]
+    return leaf.replace("-instruct", "").replace("-2512", "")
+
+
+def _compile_kind_label(kind: Optional[str]) -> str:
+    return {
+        "regional": "Regional Summaries",
+        "chapter": "Chapter Summaries",
+        "executive": "Executive Summary",
+        "final": "Executive Summary",
+        "compile": "Compile",
+        "chunk": "Chunk Summaries",
+    }.get(str(kind or "executive"), "Summary")
+
+
+def _publish_compile_progress(
+    job_id: Optional[str],
+    *,
+    kind: Optional[str],
+    phase: str,
+    model_id: Optional[str],
+    progress: float = 88.0,
+    progress_gate: Any = None,
+) -> None:
+    """
+    Push a lifecycle-aware compile progress line to Live Job Status.
+
+    Phases: Planning | Trying | Completed
+    Example: "Executive Summary · Trying: Llama 3.1 8B"
+
+    If ``progress_gate`` is a threading.Event that is already set, Trying/Planning
+    updates are ignored so a late hedged loser cannot overwrite Completed.
+    """
+    if not job_id:
+        return
+    try:
+        from src.db import jobs as jobs_db
+
+        label = _compile_kind_label(kind)
+        model_label = _short_model_label(model_id)
+        phase_key = (phase or "Trying").strip().capitalize()
+        if phase_key not in ("Planning", "Trying", "Completed"):
+            phase_key = "Trying"
+        # Hedge losers may still hit HTTP_REQUEST_STARTED after a winner —
+        # do not let those clobber the Completed line.
+        if phase_key != "Completed" and progress_gate is not None:
+            try:
+                if progress_gate.is_set():
+                    return
+            except Exception:
+                pass
+        msg = f"{label} · {phase_key}: {model_label}"
+        jobs_db.set_progress(job_id, float(progress), msg)
+        if phase_key == "Completed" and progress_gate is not None:
+            try:
+                progress_gate.set()
+            except Exception:
+                pass
+        log.info(
+            "EXEC_COMPILE_PROGRESS job_id=%s phase=%s model=%s label=%s ui=%r",
+            job_id,
+            phase_key,
+            model_id,
+            model_label,
+            msg,
+        )
+    except Exception as e:
+        log.debug("compile progress publish skipped: %s", e)
+
+
 class NimApiError(RuntimeError):
     """Raised when a NIM call fails due to timeout, 5xx, or connection errors."""
 
@@ -43,6 +148,10 @@ class NimApiError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.__cause__ = cause
+
+
+class HedgeCancelled(NimApiError):
+    """Raised when a hedged compile loser is cancelled after another attempt won."""
 
 
 try:
@@ -503,17 +612,69 @@ def _call_chat_with_fallback_unsliced(
     # Measure TTFT whenever soft timeout is active (stream + cancel).
     measure_ttft = bool(return_timing or use_soft_ttft)
 
+    cancel_event = (call_meta or {}).get("cancel_event")
+
     def _deadline_left() -> float:
         if deadline_mono is None:
             return 1e9
         return float(deadline_mono) - time.monotonic()
 
+    def _raise_if_cancelled(where: str) -> None:
+        if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+            raise HedgeCancelled(f"hedge cancelled at {where}")
+
     def _raise_if_deadline(where: str) -> None:
+        _raise_if_cancelled(where)
         left = _deadline_left()
         if left <= 0.25:
             raise NimApiError(
                 f"Shared call deadline exhausted at {where} (remaining={left:.2f}s)"
             )
+
+    def _release_lease_now(*, timed_out: bool = False) -> None:
+        """Drop endpoint slot immediately (hedge cancel / abandon path)."""
+        nonlocal lease
+        if use_pool and pool_mod is not None and lease is not None:
+            try:
+                pool_mod.release_endpoint(
+                    lease,
+                    ok=False,
+                    latency_ms=0.0,
+                    rate_limited=False,
+                    timed_out=timed_out,
+                )
+            except Exception:
+                pass
+            lease = None
+
+    def _run_http_cancellable(do_http):
+        """
+        Run blocking NIM HTTP; if hedge cancel fires mid-flight, release the
+        endpoint lease immediately and abandon the socket thread (no join).
+        """
+        _raise_if_cancelled("before_http")
+        if cancel_event is None:
+            return do_http()
+        import concurrent.futures
+
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        fut = ex.submit(do_http)
+        try:
+            while True:
+                try:
+                    return fut.result(timeout=0.2)
+                except concurrent.futures.TimeoutError:
+                    if cancel_event.is_set():
+                        _exec_compile_lifecycle(
+                            "http_abandoned_on_hedge_cancel",
+                            model=(call_meta or {}).get("model_id"),
+                            endpoint=lease.endpoint_id if lease else None,
+                            task=task_id,
+                        )
+                        _release_lease_now(timed_out=True)
+                        raise HedgeCancelled("hedge cancelled during HTTP")
+        finally:
+            _shutdown_executor_nowait(ex, fut)
 
     def _acquire_client():
         nonlocal lease
@@ -522,14 +683,20 @@ def _call_chat_with_fallback_unsliced(
             acq_to = acquire_timeout
             if deadline_mono is not None:
                 acq_to = min(acq_to, max(0.5, _deadline_left() - 0.25))
-            lease = pool_mod.acquire_endpoint(
-                role=role,
-                exclude_ids=exclude_endpoints or None,
-                block=True,
-                timeout=acq_to,
-            )
+            # Poll acquire so hedge cancel can free waiters without holding a slot.
+            deadline_acq = time.monotonic() + max(0.5, acq_to)
+            lease = None
+            while lease is None and time.monotonic() < deadline_acq:
+                _raise_if_cancelled("acquire_endpoint")
+                slice_to = min(0.5, max(0.05, deadline_acq - time.monotonic()))
+                lease = pool_mod.acquire_endpoint(
+                    role=role,
+                    exclude_ids=exclude_endpoints or None,
+                    block=True,
+                    timeout=slice_to,
+                )
             if lease is None and exclude_endpoints:
-                # All preferred endpoints busy/cooling — allow any with capacity
+                _raise_if_cancelled("acquire_endpoint_any")
                 lease = pool_mod.acquire_endpoint(
                     role=role,
                     block=True,
@@ -700,27 +867,64 @@ def _call_chat_with_fallback_unsliced(
                     float(getattr(req_timeout, "read", None) or 0.0),
                     _deadline_left(),
                 )
-                if measure_ttft:
-                    text, timing = _chat_completion_with_ttft(
-                        client,
-                        model_id=model_id,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        timeout=req_timeout,
-                        soft_ttft_timeout_sec=soft_ttft if use_soft_ttft else None,
-                        deadline_mono=deadline_mono,
-                        task_id=task_id,
-                    )
-                else:
-                    completion = client.chat.completions.create(
+                if role == "compile":
+                    _exec_compile_lifecycle(
+                        "request_started",
                         model=model_id,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        timeout=req_timeout,
+                        endpoint=lease.endpoint_id if lease else "primary",
+                        deadline_left_sec=round(_deadline_left(), 2),
+                        task=task_id,
                     )
-                    text = (completion.choices[0].message.content or "").strip()
+                    # Live UI: show the model actually being requested right now.
+                    if call_meta is not None:
+                        cancel_ev = call_meta.get("cancel_event")
+                        if cancel_ev is not None:
+                            try:
+                                if cancel_ev.is_set():
+                                    raise HedgeCancelled(
+                                        f"hedge cancelled before request: {model_id}"
+                                    )
+                            except HedgeCancelled:
+                                raise
+                            except Exception:
+                                pass
+                        _publish_compile_progress(
+                            call_meta.get("job_id"),
+                            kind=call_meta.get("compile_kind"),
+                            phase="Trying",
+                            model_id=model_id,
+                            progress=float(call_meta.get("progress") or 88.0),
+                            progress_gate=call_meta.get("progress_gate"),
+                        )
+                if measure_ttft:
+
+                    def _do_stream():
+                        return _chat_completion_with_ttft(
+                            client,
+                            model_id=model_id,
+                            messages=messages,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            timeout=req_timeout,
+                            soft_ttft_timeout_sec=soft_ttft if use_soft_ttft else None,
+                            deadline_mono=deadline_mono,
+                            task_id=task_id,
+                        )
+
+                    text, timing = _run_http_cancellable(_do_stream)
+                else:
+
+                    def _do_blocking():
+                        completion = client.chat.completions.create(
+                            model=model_id,
+                            messages=messages,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            timeout=req_timeout,
+                        )
+                        return (completion.choices[0].message.content or "").strip()
+
+                    text = _run_http_cancellable(_do_blocking)
                     timing = None
                 log.info(
                     "TASK_LIFECYCLE phase=RESPONSE_RECEIVED task=%s model=%s "
@@ -731,9 +935,31 @@ def _call_chat_with_fallback_unsliced(
                     lease.endpoint_id if lease else "primary",
                 )
                 if not text:
+                    if role == "compile":
+                        _exec_compile_lifecycle(
+                            "response_empty",
+                            model=model_id,
+                            task=task_id,
+                        )
                     raise ValueError(f"Empty response from {model_id}")
                 attempt_ms = (time.perf_counter() - t_attempt) * 1000.0
                 ttft_ms = float((timing or {}).get("ttft_ms") or 0.0)
+                # Blocking compile: first token is not separately observable.
+                if role == "compile":
+                    _exec_compile_lifecycle(
+                        "first_token_received",
+                        model=model_id,
+                        ttft_ms=round(ttft_ms, 1) if ttft_ms else None,
+                        mode=(timing or {}).get("mode") or "blocking_equals_complete",
+                        task=task_id,
+                    )
+                    _exec_compile_lifecycle(
+                        "response_completed",
+                        model=model_id,
+                        chars=len(text),
+                        call_ms=round(attempt_ms, 1),
+                        task=task_id,
+                    )
                 log.info(
                     "TASK_LIFECYCLE phase=SUMMARY_PARSED task=%s model=%s "
                     "chars=%s ttft_ms=%.1f call_ms=%.1f",
@@ -743,6 +969,13 @@ def _call_chat_with_fallback_unsliced(
                     ttft_ms,
                     attempt_ms,
                 )
+                if role == "compile":
+                    _exec_compile_lifecycle(
+                        "parsed_successfully",
+                        model=model_id,
+                        chars=len(text),
+                        task=task_id,
+                    )
                 attempts_log.append(
                     {
                         "model_id": model_id,
@@ -798,6 +1031,15 @@ def _call_chat_with_fallback_unsliced(
                     )
                     return text, model_id, timing_out
                 return text, model_id
+            except HedgeCancelled:
+                # Winner already chosen — free this loser's slot and exit now.
+                _release_lease_now(timed_out=True)
+                _exec_compile_lifecycle(
+                    "hedge_loser_cancelled",
+                    model=model_id,
+                    task=task_id,
+                )
+                raise
             except Exception as e:
                 from src.core.nim_rate_limit import RateLimitBackpressure
 
@@ -1567,6 +1809,7 @@ def _call_compile_llm(
     *,
     intermediate: bool = False,
     deadline_mono: Optional[float] = None,
+    progress_ctx: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Optional[str]]:
     messages = [
         {"role": "system", "content": _COMPILE_SYSTEM},
@@ -1581,6 +1824,7 @@ def _call_compile_llm(
         deadline_mono = started + wall
     # Shared budget for the whole fallback chain (not per-model stacking).
     hard_sec = max(0.5, min(wall, float(deadline_mono) - started))
+    pctx = dict(progress_ctx or {})
 
     # Hedged compile: fire fallback concurrently if primary exceeds its slice.
     # Carbon/cost tradeoff: when hedge fires, up to ~2 concurrent compile NIM
@@ -1593,11 +1837,20 @@ def _call_compile_llm(
             intermediate=intermediate,
             deadline_mono=deadline_mono,
             hard_sec=hard_sec,
+            progress_ctx=pctx,
         )
 
     def _invoke() -> Tuple[str, Optional[str]]:
         remaining = float(deadline_mono) - time.monotonic()
         # No per-model retries — long compile prompts must fall through quickly.
+        meta = {
+            "phase": "compile",
+            "endpoint_role": "compile",
+            "job_id": pctx.get("job_id"),
+            "compile_kind": pctx.get("compile_kind"),
+            "progress": pctx.get("progress", 88.0),
+            "progress_gate": pctx.get("progress_gate"),
+        }
         return call_chat_with_fallback(
             chain,
             messages,
@@ -1606,7 +1859,7 @@ def _call_compile_llm(
             max_retries_per_model=1,
             timeout=_compile_timeout(remaining_sec=remaining),
             deadline_mono=deadline_mono,
-            call_meta={"phase": "compile", "endpoint_role": "compile"},
+            call_meta=meta,
         )
 
     import concurrent.futures
@@ -1632,6 +1885,7 @@ def _call_compile_llm_hedged(
     intermediate: bool,
     deadline_mono: float,
     hard_sec: float,
+    progress_ctx: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Optional[str]]:
     """
     Hedged compile fallback.
@@ -1666,6 +1920,27 @@ def _call_compile_llm_hedged(
     primary = ordered[0]
     primary_slice = float(slices[0])
     max_tokens = 1600 if intermediate else 2000
+    pctx = dict(progress_ctx or {})
+
+    import threading
+
+    progress_gate = pctx.get("progress_gate")
+    if progress_gate is None:
+        progress_gate = threading.Event()
+        pctx["progress_gate"] = progress_gate
+
+    def _progress_meta(model_id: str, **extra: Any) -> Dict[str, Any]:
+        meta = {
+            "phase": "compile",
+            "endpoint_role": "compile",
+            "job_id": pctx.get("job_id"),
+            "compile_kind": pctx.get("compile_kind"),
+            "progress": pctx.get("progress", 88.0),
+            "progress_gate": progress_gate,
+            "model_id": model_id,
+        }
+        meta.update(extra)
+        return meta
 
     def _one(model_id: str, model_deadline: float, call_meta: Dict[str, Any]):
         remaining = max(0.5, float(model_deadline) - time.monotonic())
@@ -1680,12 +1955,13 @@ def _call_compile_llm_hedged(
             call_meta=call_meta,
         )
 
-    primary_meta: Dict[str, Any] = {
-        "phase": "compile",
-        "endpoint_role": "compile",
-        "hedged": True,
-        "chain_position": 0,
-    }
+    primary_cancel = threading.Event()
+    primary_meta: Dict[str, Any] = _progress_meta(
+        primary,
+        hedged=True,
+        chain_position=0,
+        cancel_event=primary_cancel,
+    )
     primary_deadline = min(float(deadline_mono), time.monotonic() + primary_slice)
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     primary_fut = pool.submit(_one, primary, primary_deadline, primary_meta)
@@ -1693,6 +1969,37 @@ def _call_compile_llm_hedged(
     winner: Optional[Tuple[str, Optional[str]]] = None
     winner_model = None
     primary_failed_early = False
+    # fut -> (idx, model_id, cancel_event)
+    tracked: Dict[Any, Tuple[int, str, threading.Event]] = {
+        primary_fut: (0, primary, primary_cancel),
+    }
+
+    def _cancel_losers(winner_fut: Any) -> int:
+        """Signal cancel, cancel futures, free telemetry — return cancelled count."""
+        n = 0
+        used_i = time.monotonic() - t0
+        for fut, (oj, om, ev) in list(tracked.items()):
+            if fut is winner_fut:
+                continue
+            try:
+                ev.set()
+            except Exception:
+                pass
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+            if report.attempts[oj].outcome in ("pending", "timeout_slice"):
+                report.attempts[oj].outcome = "cancelled"
+                report.attempts[oj].used_sec = used_i
+                report.attempts[oj].error = "cancelled_hedge_loser"
+            n += 1
+            _exec_compile_lifecycle(
+                "hedge_loser_cancel_signaled",
+                model=om,
+                pos=oj,
+            )
+        return n
 
     try:
         try:
@@ -1747,14 +2054,25 @@ def _call_compile_llm_hedged(
                 if md - time.monotonic() < 0.75:
                     report.attempts[i].outcome = "skipped"
                     continue
-                meta = {
-                    "phase": "compile",
-                    "endpoint_role": "compile",
-                    "hedged": True,
-                    "chain_position": i,
-                }
+                ev = threading.Event()
+                meta = _progress_meta(
+                    mid,
+                    hedged=True,
+                    chain_position=i,
+                    cancel_event=ev,
+                )
+                # Surface hedge fallback immediately (HTTP_REQUEST_STARTED also updates).
+                _publish_compile_progress(
+                    pctx.get("job_id"),
+                    kind=pctx.get("compile_kind"),
+                    phase="Trying",
+                    model_id=mid,
+                    progress=float(pctx.get("progress") or 88.0),
+                    progress_gate=progress_gate,
+                )
                 f = pool.submit(_one, mid, md, meta)
                 futs[f] = (i, mid)
+                tracked[f] = (i, mid, ev)
 
             if not futs:
                 log_slice_report(report)
@@ -1762,60 +2080,125 @@ def _call_compile_llm_hedged(
                     f"Hedged compile: no runnable fallbacks within {hard_sec:.0f}s"
                 )
 
-            remaining_wall = max(0.5, float(deadline_mono) - time.monotonic())
-            done, _pending = concurrent.futures.wait(
-                list(futs.keys()),
-                timeout=remaining_wall,
-                return_when=concurrent.futures.FIRST_COMPLETED,
+            # Wait until wall expires for the *first successful* response.
+            # CRITICAL: FIRST_COMPLETED may fire on a failed primary while Gemma
+            # is still generating — must keep waiting on pending futures, not
+            # abort and convert a live success into all_executive_compile_failed.
+            pending = set(futs.keys())
+            wall_end = time.monotonic() + max(
+                0.5, float(deadline_mono) - time.monotonic()
             )
-            for fut in done:
-                idx, mid = futs[fut]
-                try:
-                    winner = fut.result(timeout=0)
-                    winner_model = mid
-                    used_i = time.monotonic() - t0
-                    report.attempts[idx].used_sec = used_i
-                    report.attempts[idx].outcome = "success"
-                    tracker.record(mid, ok=True)
-                    for other, (oj, om) in futs.items():
-                        if other is fut:
-                            continue
-                        if report.attempts[oj].outcome in ("pending", "timeout_slice"):
-                            report.attempts[oj].outcome = "cancelled"
-                            report.attempts[oj].used_sec = used_i
-                            report.attempts[oj].error = "cancelled_hedge_loser"
-                    log.info(
-                        "CHAIN_SLICE hedged_compile winner=%s pos=%s wall_used=%.1fs",
-                        mid,
-                        idx,
-                        used_i,
-                    )
+            while pending and winner is None and time.monotonic() < wall_end:
+                timeout = max(0.05, wall_end - time.monotonic())
+                done, pending = concurrent.futures.wait(
+                    pending,
+                    timeout=timeout,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                if not done:
                     break
-                except Exception as e:
-                    report.attempts[idx].outcome = "error"
-                    report.attempts[idx].error = f"{type(e).__name__}: {str(e)[:120]}"
-                    report.attempts[idx].used_sec = time.monotonic() - t0
-                    tracker.record(mid, ok=False, error=True)
-            if winner is None:
-                for fut, (idx, mid) in futs.items():
-                    if fut.done():
-                        try:
-                            winner = fut.result(timeout=0)
-                            winner_model = mid
-                            report.attempts[idx].outcome = "success"
-                            tracker.record(mid, ok=True)
-                            break
-                        except Exception:
+                for fut in done:
+                    idx, mid = futs[fut]
+                    try:
+                        result = fut.result(timeout=0)
+                        text = (
+                            result[0]
+                            if isinstance(result, tuple)
+                            else result
+                        )
+                        if not str(text or "").strip():
+                            report.attempts[idx].outcome = "error"
+                            report.attempts[idx].error = "empty_response"
+                            report.attempts[idx].used_sec = time.monotonic() - t0
+                            tracker.record(mid, ok=False, error=True)
+                            _exec_compile_lifecycle(
+                                "hedge_empty_response",
+                                model=mid,
+                                pos=idx,
+                            )
                             continue
-                if winner is None:
-                    log_slice_report(report)
-                    raise NimApiError(
-                        f"Hedged compile failed within {hard_sec:.0f}s "
-                        f"(models={ordered})"
-                    )
+                        winner = result
+                        winner_model = mid
+                        used_i = time.monotonic() - t0
+                        report.attempts[idx].used_sec = used_i
+                        report.attempts[idx].outcome = "success"
+                        tracker.record(mid, ok=True)
+                        cancelled_n = _cancel_losers(fut)
+                        pending.clear()
+                        try:
+                            progress_gate.set()
+                        except Exception:
+                            pass
+                        _exec_compile_lifecycle(
+                            "hedge_winner",
+                            model=mid,
+                            pos=idx,
+                            wall_used_sec=round(used_i, 2),
+                            chars=len(str(text)),
+                            losers_cancelled=cancelled_n,
+                        )
+                        log.info(
+                            "CHAIN_SLICE hedged_compile winner=%s pos=%s "
+                            "wall_used=%.1fs losers_cancelled=%s",
+                            mid,
+                            idx,
+                            used_i,
+                            cancelled_n,
+                        )
+                        break
+                    except HedgeCancelled:
+                        report.attempts[idx].outcome = "cancelled"
+                        report.attempts[idx].error = "cancelled_hedge_loser"
+                        report.attempts[idx].used_sec = time.monotonic() - t0
+                        continue
+                    except Exception as e:
+                        report.attempts[idx].outcome = "error"
+                        report.attempts[idx].error = (
+                            f"{type(e).__name__}: {str(e)[:120]}"
+                        )
+                        report.attempts[idx].used_sec = time.monotonic() - t0
+                        tracker.record(mid, ok=False, error=True)
+                        _exec_compile_lifecycle(
+                            "hedge_attempt_failed",
+                            model=mid,
+                            pos=idx,
+                            error=str(e)[:160],
+                            pending_left=len(pending),
+                        )
+                        log.warning(
+                            "CHAIN_SLICE hedged_compile attempt failed model=%s "
+                            "pending_left=%s: %s",
+                            mid,
+                            len(pending),
+                            e,
+                        )
+            if winner is None:
+                # Wall exhausted — cancel anything still running.
+                _cancel_losers(winner_fut=None)
+                _exec_compile_lifecycle(
+                    "hedge_all_failed",
+                    models=list(ordered),
+                    hard_sec=round(hard_sec, 1),
+                )
+                log_slice_report(report)
+                raise NimApiError(
+                    f"Hedged compile failed within {hard_sec:.0f}s "
+                    f"(models={ordered})"
+                )
         log_slice_report(report)
         return winner
     finally:
+        # Best-effort: signal every tracked attempt and drop the pool without joining.
+        for _fut, (_i, _m, ev) in list(tracked.items()):
+            try:
+                ev.set()
+            except Exception:
+                pass
+        for fut in list(tracked.keys()):
+            try:
+                fut.cancel()
+            except Exception:
+                pass
         _shutdown_executor_nowait(pool, primary_fut)
 
 
@@ -1871,18 +2254,19 @@ def _hierarchical_compile(
             return bi, batch_text, None, len(batch_text), NimApiError(
                 "Compile deadline exhausted before intermediate batch"
             )
+        batch_progress = min(90.0, 82.0 + (8.0 * bi / max(batch_total, 1)))
+        batch_kind = str(state.get("_compile_audit_kind") or "compile")
+        model_hint = (
+            batch_chains[0][0] if batch_chains and batch_chains[0] else None
+        )
         if job_id:
-            try:
-                from src.db import jobs as jobs_db
-
-                model_hint = (batch_chains[0][0] if batch_chains and batch_chains[0] else "?")
-                jobs_db.set_progress(
-                    job_id,
-                    min(90.0, 82.0 + (8.0 * bi / max(batch_total, 1))),
-                    f"Compiling summary batches... ({bi}/{batch_total}) · {model_hint}",
-                )
-            except Exception:
-                pass
+            _publish_compile_progress(
+                job_id,
+                kind=batch_kind,
+                phase="Planning",
+                model_id=model_hint,
+                progress=batch_progress,
+            )
         log.info(
             "Compile round %s batch %s/%s (~%s tokens) models=%s",
             round_idx,
@@ -1898,6 +2282,18 @@ def _hierarchical_compile(
                     chain,
                     intermediate=True,
                     deadline_mono=deadline_mono,
+                    progress_ctx={
+                        "job_id": job_id,
+                        "compile_kind": batch_kind,
+                        "progress": batch_progress,
+                    },
+                )
+                _publish_compile_progress(
+                    job_id,
+                    kind=batch_kind,
+                    phase="Completed",
+                    model_id=used or (chain[0] if chain else None),
+                    progress=batch_progress,
                 )
                 return bi, text, used, len(batch_text), None
             except Exception as e:
@@ -1972,42 +2368,88 @@ def _hierarchical_compile(
         if _deadline_left() <= 2.0:
             last_error = NimApiError("Compile deadline exhausted before final chain")
             break
+        kind = str((state or {}).get("_compile_audit_kind") or "executive")
+        import threading as _threading
+
+        progress_ctx = {
+            "job_id": job_id,
+            "compile_kind": kind,
+            "progress": 88.0,
+            "progress_gate": _threading.Event(),
+        }
         if job_id and chain:
             try:
-                from src.db import jobs as jobs_db
                 from src.perf.critical_path import dag_audit_record_compile_stamp
 
-                kind = str(state.get("_compile_audit_kind") or "executive")
                 nid = state.get("_compile_audit_nid")
-                # Truthful progress — never say "Executive" while compiling regional/chapter.
-                kind_label = {
-                    "regional": "Regional Summaries",
-                    "chapter": "Chapter Summaries",
-                    "executive": "Executive Summary",
-                    "final": "Executive Summary",
-                    "compile": "Compile",
-                    "chunk": "Chunk Summaries",
-                }.get(kind, "Summary")
-                msg = f"{kind_label}… · {chain[0]}"
+                planned = chain[0]
+                # Lifecycle step 1: planned / assigned head (not yet requested).
+                _publish_compile_progress(
+                    job_id,
+                    kind=kind,
+                    phase="Planning",
+                    model_id=planned,
+                    progress=88.0,
+                )
                 dag_audit_record_compile_stamp(
                     str(job_id),
                     kind=kind,
                     nid=str(nid) if nid else None,
-                    message=msg,
+                    message=(
+                        f"{_compile_kind_label(kind)} · Planning: "
+                        f"{_short_model_label(planned)}"
+                    ),
                 )
-                jobs_db.set_progress(
+                log.info(
+                    "EXEC_COMPILE_TRACE before_set_progress job_id=%s "
+                    "medium_models=%s heavy_models=%s assigned_model=%s "
+                    "chain=%s chain[0]=%s",
                     job_id,
-                    88.0,
-                    msg,
+                    list(settings.medium_models()),
+                    list(settings.heavy_models()),
+                    state.get("_compile_assigned_model")
+                    or state.get("assigned_model"),
+                    list(chain),
+                    planned,
                 )
             except Exception:
                 pass
         try:
+            log.info(
+                "EXEC_COMPILE_TRACE before_call_compile_llm job_id=%s "
+                "medium_models=%s heavy_models=%s assigned_model=%s "
+                "chain=%s chain[0]=%s",
+                job_id,
+                list(settings.medium_models()),
+                list(settings.heavy_models()),
+                (state or {}).get("_compile_assigned_model")
+                or (state or {}).get("assigned_model"),
+                list(chain),
+                chain[0] if chain else None,
+            )
             result, used = _call_compile_llm(
                 final_text,
                 chain,
                 intermediate=False,
                 deadline_mono=deadline_mono,
+                progress_ctx=progress_ctx,
+            )
+            log.info(
+                "EXEC_COMPILE_TRACE after_call_compile_llm job_id=%s "
+                "chain[0]=%s used=%s match=%s",
+                job_id,
+                chain[0] if chain else None,
+                used,
+                bool(chain and used and chain[0] == used),
+            )
+            # Lifecycle final: model that actually produced the summary.
+            _publish_compile_progress(
+                job_id,
+                kind=kind,
+                phase="Completed",
+                model_id=used or (chain[0] if chain else None),
+                progress=89.0,
+                progress_gate=progress_ctx.get("progress_gate"),
             )
             state.setdefault("model_usage_chars", {"light": 0, "medium": 0, "large": 0})
             state["model_usage_chars"]["large"] = (
@@ -2065,20 +2507,45 @@ def run_compile_with_models(
         [c[0] for c in chains if c],
         max(0.0, float(deadline_mono) - time.monotonic()),
     )
+    _exec_compile_lifecycle(
+        "compile_dispatch",
+        summaries=len(summaries),
+        primary_models=[c[0] for c in chains if c],
+        budget_sec=round(max(0.0, float(deadline_mono) - time.monotonic()), 1),
+        job_id=state.get("job_id"),
+    )
 
     try:
-        return strip_outer_markdown_fence(
-            _hierarchical_compile(
-                summaries, chains, state, deadline_mono=deadline_mono
-            )
+        raw = _hierarchical_compile(
+            summaries, chains, state, deadline_mono=deadline_mono
         )
+        out = strip_outer_markdown_fence(raw)
+        _exec_compile_lifecycle(
+            "compile_return_to_orchestrator",
+            chars=len(out or ""),
+            durable=is_executive_compile_success(out),
+            stitched=is_stitched_fallback(out),
+            job_id=state.get("job_id"),
+        )
+        return out
     except Exception as e:
         log.error(f"Error in compile: {e}")
+        _exec_compile_lifecycle(
+            "compile_exception_before_stitch",
+            error=str(e)[:200],
+            error_type=type(e).__name__,
+            job_id=state.get("job_id"),
+        )
         # Last-resort: stitch usable chunk summaries so the job still has content
         out = stitch_compile_fallback(summaries, reason=str(e)[:160])
         if out.startswith("Unable to generate"):
             return f"Final summary generation failed: {e}"
         log.warning("Returning stitched chunk-summary fallback after compile failure")
+        _exec_compile_lifecycle(
+            "compile_stitched_after_exception",
+            reason=str(e)[:160],
+            job_id=state.get("job_id"),
+        )
         return out
 
 

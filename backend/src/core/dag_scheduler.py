@@ -16,7 +16,7 @@ from src.agents import models, quality_validation
 from src.chunking.service import estimate_tokens
 from src.core import hierarchy as hierarchy_mod
 from src.core import pipeline_dag as pdag
-from src.core.config import settings
+from src.core.config import log_resolved_llm_model_config, settings
 from src.core.node_accounting import estimate_node_accounting
 from src.core.node_assigner import assign_model_for_node
 from src.core.priority_queue import priority_for_kind
@@ -251,7 +251,17 @@ def _compile_node_text(
             "chain_head": use_chain[0] if use_chain else None,
             "budget_sec": round(_remaining(), 2),
         }
+        models._exec_compile_lifecycle(
+            "try_compile_started",
+            phase=phase,
+            chain_head=attempt["chain_head"],
+            budget_sec=attempt["budget_sec"],
+        )
         try:
+            try:
+                state["_compile_assigned_model"] = assigned_model
+            except Exception:
+                pass
             out = models.run_compile_with_models(
                 [prompt],
                 state,
@@ -263,32 +273,83 @@ def _compile_node_text(
             if state.get("models_used"):
                 used = (state.get("models_used") or [None])[-1]
                 model_used = used or model_used
-            if models.is_executive_compile_success(out):
+            durable = models.is_executive_compile_success(out)
+            models._exec_compile_lifecycle(
+                "validation_checked",
+                phase=phase,
+                model=used,
+                chars=len(out or ""),
+                durable=durable,
+                stitched=models.is_stitched_fallback(out),
+            )
+            if durable:
                 attempt["result"] = "success"
                 attempt["model"] = used
+                attempt["chars"] = len(out or "")
                 status["compile_attempts"].append(attempt)
+                models._exec_compile_lifecycle(
+                    "validation_passed",
+                    phase=phase,
+                    model=used,
+                    chars=len(out or ""),
+                )
                 return out
+            # First discard point: inference returned stitch/error text — not adopted.
+            reason_snip = ""
+            low = (out or "").lower()
+            if "could not complete (" in low:
+                try:
+                    reason_snip = (out or "").split("could not complete (", 1)[1]
+                    reason_snip = reason_snip.split(")", 1)[0][:160]
+                except Exception:
+                    reason_snip = "stitched"
             attempt["result"] = "stitched_or_unusable"
             attempt["model"] = used
+            attempt["chars"] = len(out or "")
+            attempt["inner_reason"] = reason_snip or None
             status["compile_attempts"].append(attempt)
+            models._exec_compile_lifecycle(
+                "discarded_non_durable",
+                phase=phase,
+                model=used,
+                chars=len(out or ""),
+                inner_reason=reason_snip or "unusable",
+                discard_point="is_executive_compile_success",
+            )
             log.info(
-                "Compile %s produced non-durable output (stitch/unusable); not adopting",
+                "Compile %s produced non-durable output (stitch/unusable); not adopting "
+                "inner_reason=%s",
                 phase,
+                reason_snip or "unusable",
             )
             return None
         except Exception as e:
             attempt["result"] = "error"
             attempt["error"] = str(e)[:160]
             status["compile_attempts"].append(attempt)
+            models._exec_compile_lifecycle(
+                "try_compile_exception",
+                phase=phase,
+                error=str(e)[:200],
+                discard_point="exception",
+            )
             log.warning("Compile %s failed: %s", phase, e)
             return None
 
     def _adopt(summary: str, *, model: Optional[str], source: str) -> None:
         nonlocal best_summary, best_model
+        prev = best_summary
         best_summary = summary
         best_model = model or best_model
         status["best_compile_model"] = best_model
         status["summary_source"] = source
+        models._exec_compile_lifecycle(
+            "monotonic_merge_applied",
+            model=best_model,
+            source=source,
+            chars=len(summary or ""),
+            replaced_prior=bool(prev),
+        )
 
     # --- Primary compile (medium-first or heavy-only) ---
     primary_chain = medium_chain if medium_first else heavy_chain
@@ -354,6 +415,11 @@ def _compile_node_text(
 
     # Stitch only when no executive compile succeeded at all.
     if not best_summary:
+        models._exec_compile_lifecycle(
+            "all_executive_compile_failed",
+            attempts=status.get("compile_attempts"),
+            discard_point="no_durable_best_summary",
+        )
         best_summary = models.stitch_compile_fallback(
             [text], reason="all_executive_compile_failed"
         )
@@ -383,8 +449,17 @@ def _compile_node_text(
         grid_intensity=intensity,
         model_id=best_model or model_used,
     )
+    summary_out = models.strip_outer_markdown_fence(best_summary or "")
+    models._exec_compile_lifecycle(
+        "persisted_node_result",
+        model=best_model or model_used,
+        chars=len(summary_out),
+        compile_status=status.get("compile_status"),
+        summary_source=status.get("summary_source"),
+        durable=models.is_executive_compile_success(summary_out),
+    )
     return {
-        "summary": models.strip_outer_markdown_fence(best_summary or ""),
+        "summary": summary_out,
         "used_heavy": used_heavy,
         "confidence": float(verdict.confidence),
         "carbon_g": acct["carbon_g"],
@@ -874,6 +949,21 @@ def run_dag_compile(
             prefer_quality=n.kind in ("executive", "final"),
         )
         n.assigned_model = assignment.get("model_id")
+        if n.kind in ("executive", "final"):
+            # Actual process values immediately before executive compile starts.
+            log_resolved_llm_model_config(
+                settings,
+                phase="before_executive_compile",
+                extra={
+                    "job_id": job_id,
+                    "node_id": nid,
+                    "node_kind": n.kind,
+                    "assigned_model": n.assigned_model,
+                    "medium_chain_arg": list(medium_chain),
+                    "heavy_chain_arg": list(heavy_chain),
+                    "medium_first": bool(medium_first),
+                },
+            )
         try:
             from src.core.pipeline_executor import _run_with_hard_isolation
 

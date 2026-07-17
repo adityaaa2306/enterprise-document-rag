@@ -1,7 +1,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import logging
 import os
-from typing import Optional, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.core.env import normalize_app_env, is_production
 
@@ -18,6 +18,105 @@ log = logging.getLogger("config")
 # Insecure fallback ONLY for local development when JWT_SECRET_KEY is unset.
 # Never used when APP_ENV=production.
 _DEV_INSECURE_JWT = "dev-only-insecure-jwt-change-me"
+
+# Model fields we always dump at startup / before executive compile.
+_RESOLVED_MODEL_FIELDS: Tuple[str, ...] = (
+    "MEDIUM_MODEL_PRIMARY",
+    "MEDIUM_MODEL_FALLBACK",
+    "HEAVY_MODEL_PRIMARY",
+    "HEAVY_MODEL_FALLBACK_1",
+    "HEAVY_MODEL_FALLBACK_2",
+)
+
+
+def _env_file_defines(name: str) -> bool:
+    """True if backend/.env contains an assignment for ``name`` (uncommented)."""
+    path = ENV_PATH
+    if not path or not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                key, _, _val = line.partition("=")
+                if key.strip() == name:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def resolve_model_setting_source(settings_obj: "Settings", field: str) -> str:
+    """
+    Report where a Settings field's resolved value came from.
+
+    - process_environment: os.environ has the key (wins over .env for pydantic)
+    - env_file: key present in backend/.env (or marked set without os.environ)
+    - class_default: not provided by env; pydantic used the class Field default
+    """
+    if field in os.environ:
+        return "process_environment"
+    if _env_file_defines(field):
+        return "env_file"
+    # pydantic-settings marks non-default sources in model_fields_set
+    try:
+        if field in settings_obj.model_fields_set:
+            return "environment"
+    except Exception:
+        pass
+    return "class_default"
+
+
+def log_resolved_llm_model_config(
+    settings_obj: "Settings",
+    *,
+    phase: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Log fully resolved medium/heavy model ids + provenance for the running process.
+    Returns the payload for tests / callers. Does not invent values — reads settings_obj.
+    """
+    rows: Dict[str, Any] = {}
+    for field in _RESOLVED_MODEL_FIELDS:
+        value = getattr(settings_obj, field, None)
+        source = resolve_model_setting_source(settings_obj, field)
+        rows[field] = {"value": value, "source": source}
+        log.info(
+            "RESOLVED_LLM_MODEL_CONFIG phase=%s %s=%r source=%s",
+            phase,
+            field,
+            value,
+            source,
+        )
+    medium_chain = list(settings_obj.medium_models())
+    heavy_chain = list(settings_obj.heavy_models())
+    log.info(
+        "RESOLVED_LLM_MODEL_CONFIG phase=%s medium_models()=%s heavy_models()=%s env_file=%s",
+        phase,
+        medium_chain,
+        heavy_chain,
+        ENV_PATH,
+    )
+    if extra:
+        log.info(
+            "RESOLVED_LLM_MODEL_CONFIG phase=%s extra=%s",
+            phase,
+            extra,
+        )
+    payload = {
+        "phase": phase,
+        "fields": rows,
+        "medium_models": medium_chain,
+        "heavy_models": heavy_chain,
+        "env_file": ENV_PATH,
+        "extra": extra or {},
+    }
+    return payload
 
 
 class Settings(BaseSettings):
@@ -843,3 +942,5 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+# Actual resolved values for this process (env / .env / class defaults).
+log_resolved_llm_model_config(settings, phase="settings_constructed")

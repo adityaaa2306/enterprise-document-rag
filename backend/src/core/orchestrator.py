@@ -22,7 +22,7 @@ from src.memory import storage
 from src.memory.document_ids import align_chunks_to_document_id
 from src.chunking import ChunkingService
 from src.core import scheduler, cre, intelligent_router, chunk_router, hierarchy
-from src.core.config import settings
+from src.core.config import log_resolved_llm_model_config, settings
 from src.core import job_status as job_status_mod
 from src.monitoring import metrics, routing_telemetry
 from src.monitoring.ingestion_latency import (
@@ -1270,6 +1270,17 @@ def reduce_compile(state: AgentState) -> Dict[str, Any]:
         job_id,
         reduce_max,
         call_max,
+    )
+    # Actual process values immediately before executive / reduce compile begins.
+    log_resolved_llm_model_config(
+        settings,
+        phase="before_executive_compile",
+        extra={
+            "job_id": job_id,
+            "entry": "reduce_compile",
+            "compile_tier": (decision or {}).get("compile_tier"),
+            "selected_model": (decision or {}).get("selected_model"),
+        },
     )
     _set_progress(job_id, 82.0, "Building hierarchy & compiling summary...", force=True)
 
