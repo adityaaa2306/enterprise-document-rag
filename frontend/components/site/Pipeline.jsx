@@ -6,16 +6,16 @@ import { Plus, Minus } from "lucide-react";
 
 const STAGES = [
   { id: "parse", label: "Parse",              latency: "12 ms",  detail: "PDF / DOCX / plaintext extraction. Structural map returned as JSON — headers, tables, footnotes preserved for downstream capability analysis." },
-  { id: "capability", label: "Capability",   latency: "8 ms",   detail: "Zero-shot classifier assigns a complexity score (0–1) to each region. Signals: entity density, syntactic depth, cross-reference count, mean sentence length." },
-  { id: "chunk", label: "Chunking",          latency: "6 ms",   detail: "Semantic chunker with 512-token target, adaptive to detected sections. Overlap of 40 tokens preserves contextual continuity across boundaries." },
-  { id: "route", label: "Carbon route",      latency: "24 ms",  detail: "Route(chunk) → tier ∈ {light, medium, heavy} given complexity, current grid_intensity, and per-tier J/token. Ties broken by lowest expected CO₂." },
-  { id: "infer_l", label: "Light infer",     latency: "310 ms", detail: "DistilBART. 0.85 J/token. Handles boilerplate, extraction, TOC-like structures. Fastest tier — carbon-friendly default." },
-  { id: "infer_m", label: "Medium infer",    latency: "820 ms", detail: "Gemma 2B. 2.55 J/token. Handles moderate reasoning, summarisation, contained multi-hop." },
-  { id: "infer_h", label: "Heavy infer",     latency: "2.1 s",  detail: "Llama 3.1 8B. 6.5 J/token. Reserved for cross-document synthesis, long-form generation, and validation escalations." },
-  { id: "validate", label: "Validate",       latency: "34 ms",  detail: "Confidence scoring against a MiniLM embedding of the expected schema. Below-threshold outputs escalate one tier." },
-  { id: "escalate", label: "Escalation",     latency: "±1 tier", detail: "Bounded escalation: light → medium → heavy. Max one escalation per chunk. Cost is logged for the accounting layer." },
-  { id: "compile", label: "Compile",         latency: "18 ms",  detail: "Chunk outputs are reassembled in source order. Metadata (tier chosen, tokens, latency, CO₂) attached per chunk." },
-  { id: "carbon", label: "Carbon accounting", latency: "—",     detail: "Per-run ledger: baseline vs optimized CO₂, tokens by tier, region, and grid intensity at execution time." },
+  { id: "capability", label: "Capability",   latency: "8 ms",   detail: "Capability Requirement Engine (CRE) plus per-chunk features (complexity, importance, domain floors). Sets the minimum tier a chunk may use." },
+  { id: "chunk", label: "Chunking",          latency: "6 ms",   detail: "Adaptive semantic / section-aware chunking with overlap so context survives boundaries. Soft caps prevent pathological chunk counts." },
+  { id: "route", label: "Carbon route",      latency: "24 ms",  detail: "Route(chunk) → tier ∈ {light, medium, heavy} given CRE floors, chunk features, and utility weights (eco / balanced / performance). Carbon is an optimization weight — never below capability floors." },
+  { id: "infer_l", label: "Light infer",     latency: "310 ms", detail: "Llama 3.2 3B (NIM). ~0.85 J/token. Boilerplate, simple extraction, low-CRS chunks. Fastest carbon-friendly default when CRE allows." },
+  { id: "infer_m", label: "Medium infer",    latency: "820 ms", detail: "Ministral 14B (NIM). ~2.55 J/token. Typical narrative summarisation and moderate reasoning — often the compile-first tier." },
+  { id: "infer_h", label: "Heavy infer",     latency: "2.1 s",  detail: "Llama 3.3 70B (NIM). ~6.5 J/token. Hard chunks, domain floors, and QVA escalations. Also the naive baseline reference for Document Processing CO₂e." },
+  { id: "validate", label: "Validate",       latency: "34 ms",  detail: "Quality Validation Agent (QVA) with lexical / semantic proxies and local RoBERTa NLI. Below-threshold chunks escalate one tier (bounded)." },
+  { id: "escalate", label: "Escalation",     latency: "±1 tier", detail: "Bounded escalation: light → medium → heavy. Failed chunks only. Cost is attributed in Boundary-A accounting." },
+  { id: "compile", label: "Compile",         latency: "18 ms+", detail: "Frozen hierarchical DAG: regional → chapter → executive. Medium-first compile when safe; heavy only if quality requires it." },
+  { id: "carbon", label: "Carbon accounting", latency: "—",     detail: "Document Processing ledger: Optimized vs Baseline CO₂e (tokens × J/token × PUE × Electricity Maps intensity). Interactive RAG is accounted separately per chat query." },
 ];
 
 export default function Pipeline() {

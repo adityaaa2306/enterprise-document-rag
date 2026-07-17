@@ -3,9 +3,9 @@
 import { motion } from "framer-motion";
 
 const STATS = [
-  ["52.1%", "carbon reduction / last run"],
-  ["8.3 g", "CO₂ baseline / doc"],
-  ["24 ms", "avg routing latency"],
+  ["52.1%", "carbon reduction · featured run"],
+  ["8.3 g", "CO₂e baseline · Document Processing"],
+  ["3 tiers", "Llama 3.2 3B · Ministral 14B · Llama 3.3 70B"],
 ];
 
 /** Below-fold signal strip — kept out of the hero first viewport. */

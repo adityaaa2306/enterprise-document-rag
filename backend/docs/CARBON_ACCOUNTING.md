@@ -1,7 +1,9 @@
 # Operational Carbon Accounting (Boundary A)
 
-This document is the **single source of truth** for job results, the results
+This document is the **engineer single source of truth** for job results, the results
 dashboard, and downloadable methodology text in Green Agentic RAG.
+
+Reader-facing summary: [`../../docs/carbon-accounting.md`](../../docs/carbon-accounting.md).
 
 ## Comparison design
 

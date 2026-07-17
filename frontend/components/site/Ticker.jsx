@@ -3,14 +3,14 @@
 import Marquee from "react-fast-marquee";
 
 const ITEMS = [
-  ["52.1%", "carbon reduction · last run"],
-  ["480", "gCO₂/kWh · grid intensity"],
-  ["5", "chunks routed"],
-  ["3", "model tiers active"],
-  ["24 ms", "route decision latency"],
-  ["8.3 g", "CO₂ baseline per doc"],
-  ["3.97 g", "CO₂ optimized per doc"],
-  ["us-west-2", "current execution region"],
+  ["52.1%", "carbon reduction · featured run"],
+  ["NIM", "Llama 3.2 3B · Ministral 14B · Llama 3.3 70B"],
+  ["3", "model tiers · Light / Medium / Heavy"],
+  ["CRE + QVA", "capability floors · bounded escalation"],
+  ["8.3 g", "CO₂e baseline · Document Processing"],
+  ["3.97 g", "CO₂e optimized · Document Processing"],
+  ["India", "single-region live · Electricity Maps"],
+  ["RAG ≠ ingest", "Interactive RAG carbon tracked separately"],
 ];
 
 export default function Ticker() {

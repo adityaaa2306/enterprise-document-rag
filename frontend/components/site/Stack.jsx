@@ -3,11 +3,11 @@
 import { motion } from "framer-motion";
 
 const ROWS = [
-  { area: "Frontend",   items: "Next.js · Tailwind · Radix UI · shadcn/ui" },
-  { area: "Backend",    items: "FastAPI · LangGraph · SQLite · ChromaDB" },
-  { area: "Models",     items: "DistilBART · Gemma 2B · Llama 3.1 8B · MiniLM-L6-v2" },
-  { area: "Carbon data", items: "Electricity Maps API · region-resolved intensity" },
-  { area: "Infra",      items: "Docker · uvicorn · pluggable region scheduler" },
+  { area: "Frontend",   items: "Next.js · TypeScript · Tailwind · Radix UI" },
+  { area: "Backend",    items: "FastAPI · LangGraph · Postgres/SQLite · ChromaDB" },
+  { area: "Models",     items: "Llama 3.2 3B · Ministral 14B · Llama 3.3 70B · Nemotron Embed/Rerank 1B (NVIDIA NIM)" },
+  { area: "Carbon data", items: "Electricity Maps · Region Scheduler (single-region live)" },
+  { area: "Infra",      items: "Docker · uvicorn · Vercel + Render · pluggable region scheduler" },
 ];
 
 export default function Stack() {

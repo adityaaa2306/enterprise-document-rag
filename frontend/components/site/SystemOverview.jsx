@@ -30,17 +30,17 @@ const CARDS = [
   {
     icon: Radar,
     title: "Adaptive routing",
-    body: "Per-chunk complexity analysis selects the smallest sufficient model.",
+    body: "CRE floors plus per-chunk features select the smallest sufficient NIM tier (3B / 14B / 70B).",
   },
   {
     icon: Gauge,
     title: "Carbon-aware scheduling",
-    body: "Live grid intensity biases routing toward lighter tiers when carbon is high.",
+    body: "Region Scheduler supplies live Electricity Maps intensity for the configured region (India today).",
   },
   {
     icon: FileCheck2,
     title: "Transparent accounting",
-    body: "Every gram is derived from measured tokens · J/token · grid — never estimated.",
+    body: "Boundary-A estimates: tokens × J/token × PUE × grid — Document Processing and Interactive RAG kept separate.",
   },
 ];
 

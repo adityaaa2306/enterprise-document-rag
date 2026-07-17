@@ -4,10 +4,10 @@ import { motion } from "framer-motion";
 
 const TERMS = [
   { s: "CO₂", label: "grams CO₂-equivalent" },
-  { s: "T",   label: "total tokens processed" },
-  { s: "E",   label: "J/token for chosen tier" },
+  { s: "T",   label: "tokens × J/token (compute J)" },
+  { s: "PUE", label: "facility overhead (~1.15)" },
   { s: "G",   label: "grid intensity gCO₂/kWh" },
-  { s: "1e−6", label: "scale factor J → kWh · g" },
+  { s: "kWh", label: "facility J ÷ 3.6e6" },
 ];
 
 export default function Methodology() {
@@ -22,7 +22,7 @@ export default function Methodology() {
             </span>
           </div>
           <h2 className="font-display text-3xl md:text-5xl tracking-tight text-white leading-[1.05] max-w-3xl">
-            One equation.<br/>Measured, not <span className="italic font-serif font-light text-emerald-400">estimated.</span>
+            One equation.<br/>Estimated with <span className="italic font-serif font-light text-emerald-400">documented assumptions.</span>
           </h2>
         </div>
 
@@ -38,21 +38,16 @@ export default function Methodology() {
             eq. 01 — carbon accounting
           </div>
           {/* Mobile: stacked / wrapped so the equation never leaves the box */}
-          <div className="font-mono text-[clamp(1.05rem,4.2vw,1.5rem)] sm:text-2xl md:text-5xl text-white tracking-tight leading-snug md:leading-tight break-words">
-            <span className="text-neutral-500">CO₂</span>
+          <div className="font-mono text-[clamp(0.95rem,3.6vw,1.35rem)] sm:text-xl md:text-4xl text-white tracking-tight leading-snug md:leading-tight break-words">
+            <span className="text-neutral-500">CO₂e</span>
             <span className="text-neutral-600 mx-1.5 md:mx-2">=</span>
-            <span className="text-white whitespace-nowrap">
-              Σ<sub className="text-[0.55em] md:text-lg text-neutral-500">chunks</sub>
-            </span>
-            <span className="text-neutral-600 mx-0.5 md:mx-1">(</span>
-            <span className="text-white">T</span>
+            <span className="text-white">(Σ T·E)</span>
             <span className="text-neutral-600 mx-0.5 md:mx-1">·</span>
-            <span style={{ color: "#F59E0B" }}>E</span>
+            <span style={{ color: "#F59E0B" }}>PUE</span>
+            <span className="text-neutral-600 mx-0.5 md:mx-1">→</span>
+            <span className="text-white">kWh</span>
             <span className="text-neutral-600 mx-0.5 md:mx-1">·</span>
             <span className="text-emerald-400">G</span>
-            <span className="text-neutral-600 mx-0.5 md:mx-1">·</span>
-            <span className="text-neutral-500">10⁻⁶</span>
-            <span className="text-neutral-600 mx-0.5 md:mx-1">)</span>
           </div>
           <div className="mt-10 grid grid-cols-2 md:grid-cols-5 gap-6">
             {TERMS.map((t) => (
@@ -73,13 +68,13 @@ export default function Methodology() {
             transition={{ duration: 0.6 }}
             className="border border-white/10 bg-[#080808] p-8"
           >
-            <div className="font-mono text-[10px] uppercase tracking-[0.24em] text-rose-400/80 mb-4">Baseline · heavy only</div>
-            <div className="font-display text-4xl text-white">8.30 <span className="text-lg text-neutral-500">g CO₂ / doc</span></div>
+            <div className="font-mono text-[10px] uppercase tracking-[0.24em] text-rose-400/80 mb-4">Baseline · frontier / heavy</div>
+            <div className="font-display text-4xl text-white">8.30 <span className="text-lg text-neutral-500">g CO₂e / doc</span></div>
             <p className="mt-4 text-sm text-neutral-400 leading-relaxed">
-              Every chunk routes to Llama 3.1 8B regardless of complexity. E = 6.5 J/token, uniform.
+              Naive conventional path: same token mass, all map + compile charged at heavy / frontier J/token (~6.5 J/tok · Llama 3.3 70B class). No CRE routing.
             </p>
             <div className="mt-6 font-mono text-[11px] text-neutral-500">
-              T=3,250 · E=6.5 · G=480 · 10⁻⁶
+              Document Processing · Boundary A · illustrative featured run
             </div>
           </motion.div>
           <motion.div
@@ -88,18 +83,18 @@ export default function Methodology() {
             className="border border-emerald-500/30 bg-[#0a1310] p-8"
           >
             <div className="font-mono text-[10px] uppercase tracking-[0.24em] text-emerald-400 mb-4">Optimized · adaptive route</div>
-            <div className="font-display text-4xl text-white">3.97 <span className="text-lg text-neutral-500">g CO₂ / doc</span></div>
+            <div className="font-display text-4xl text-white">3.97 <span className="text-lg text-neutral-500">g CO₂e / doc</span></div>
             <p className="mt-4 text-sm text-neutral-400 leading-relaxed">
-              Per-chunk tier selection with grid-aware weighting. 52.1% reduction on the featured run.
+              Per-chunk Light / Medium / Heavy (NIM) with QVA escalation. Same shared stages × PUE × live grid intensity. Interactive RAG is accounted separately in chat.
             </p>
             <div className="mt-6 font-mono text-[11px] text-neutral-500">
-              Σ (Tᵢ · Eᵢ · G · 10⁻⁶) · G = 210–480
+              Σ (Tᵢ · Eᵢ) · PUE → kWh · G · illustrative 52% reduction
             </div>
           </motion.div>
         </div>
 
         <p className="mt-6 font-mono text-[10px] uppercase tracking-[0.18em] text-neutral-500 max-w-3xl leading-relaxed">
-          Excluded from calculation · model training emissions · hardware manufacturing · end-of-life LCA · datacenter PUE overhead.
+          Excluded · model training · hardware manufacturing · end-of-life LCA · Included · PUE facility overhead · live Electricity Maps intensity (single region)
         </p>
       </div>
     </section>

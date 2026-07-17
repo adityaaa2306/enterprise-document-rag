@@ -3,9 +3,9 @@
 import { motion } from "framer-motion";
 
 const TIERS = [
-  { tier: "light", model: "DistilBART", jpt: 0.85, co2: 0.34, color: "#14B8A6" },
-  { tier: "medium", model: "Gemma 2B", jpt: 2.55, co2: 1.02, color: "#F59E0B" },
-  { tier: "heavy", model: "Llama 3.1 8B", jpt: 6.5, co2: 2.6, color: "#F43F5E" },
+  { tier: "light", model: "Llama 3.2 3B", jpt: 0.85, co2: 0.34, color: "#14B8A6" },
+  { tier: "medium", model: "Ministral 14B", jpt: 2.55, co2: 1.02, color: "#F59E0B" },
+  { tier: "heavy", model: "Llama 3.3 70B", jpt: 6.5, co2: 2.6, color: "#F43F5E" },
 ];
 
 export default function Problem() {
@@ -83,16 +83,16 @@ export default function Problem() {
                   Baseline derivation
                 </div>
                 <div className="font-mono text-sm text-neutral-300 leading-relaxed">
-                  <span className="text-neutral-500">CO₂ =</span> tokens
+                  <span className="text-neutral-500">CO₂e ≈</span> tokens
                   <span className="text-neutral-600"> · </span>
                   <span className="text-amber-400">J/tok</span>
                   <span className="text-neutral-600"> · </span>
-                  <span className="text-emerald-400">grid_intensity</span>
-                  <span className="text-neutral-600"> · </span>
-                  <span className="text-neutral-500">10⁻⁶</span>
+                  <span className="text-white">PUE</span>
+                  <span className="text-neutral-600"> → kWh · </span>
+                  <span className="text-emerald-400">grid</span>
                 </div>
                 <div className="font-mono text-[11px] text-neutral-500 mt-2">
-                  {" = 3,250 · 6.5 · 480 · 10⁻⁶ ≈ 10.1 g / heavy-only run"}
+                  Baseline uses heavy / frontier J/token (~6.5) for all map + compile — Llama 3.3 70B class
                 </div>
               </div>
             </div>

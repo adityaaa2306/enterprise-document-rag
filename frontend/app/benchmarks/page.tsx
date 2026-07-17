@@ -7,9 +7,7 @@ import {
   Clock3,
   DollarSign,
   Gauge,
-  GitCompareArrows,
   Leaf,
-  LayoutDashboard,
   Zap,
 } from "lucide-react"
 import { Sidebar } from "@/components/sidebar"
@@ -32,7 +30,6 @@ import { BenchmarkAnalyticsSkeleton } from "@/components/benchmark/benchmark-ana
 import { BenchmarkInsights } from "@/components/benchmark/benchmark-insights"
 import { BenchmarkKpiPanel } from "@/components/benchmark/benchmark-kpi-panel"
 import { BenchmarkTradeoff } from "@/components/benchmark/benchmark-tradeoff"
-import { BenchmarkCompareView } from "@/components/benchmark/benchmark-compare-view"
 import { BenchmarkWorkloadCostCo2 } from "@/components/benchmark/benchmark-workload-cost-co2"
 import {
   campaignWorkload,
@@ -45,7 +42,6 @@ import {
   pickCrossWorkloadPair,
   pickDefaultCampaign,
 } from "@/lib/benchmark-campaigns"
-import { pickCompareDefaults } from "@/lib/benchmark-compare"
 import type {
   BenchmarkWorkload,
   CampaignBundle,
@@ -60,8 +56,6 @@ const BenchmarkCharts = dynamic(
     loading: () => <BenchmarkAnalyticsSkeleton />,
   },
 )
-
-type ViewMode = "single" | "compare"
 
 function MetaChip({ label, value }: { label: string; value: string }) {
   return (
@@ -114,24 +108,15 @@ function CampaignSelect({
 }
 
 export default function BenchmarkAnalyticsPage() {
-  const [mode, setMode] = useState<ViewMode>("single")
   const [workload, setWorkload] = useState<BenchmarkWorkload>("interactive_rag")
   const [campaigns, setCampaigns] = useState<CampaignIndexEntry[]>([])
   const [selectedId, setSelectedId] = useState<string>("")
-  const [baselineId, setBaselineId] = useState<string>("")
-  const [compareId, setCompareId] = useState<string>("")
   const [bundle, setBundle] = useState<CampaignBundle | null>(null)
-  const [baselineBundle, setBaselineBundle] = useState<CampaignBundle | null>(null)
-  const [compareBundle, setCompareBundle] = useState<CampaignBundle | null>(null)
-  const [timelineBundles, setTimelineBundles] = useState<
-    Record<string, CampaignBundle | undefined>
-  >({})
   const [ragPairBundle, setRagPairBundle] = useState<CampaignBundle | null>(null)
   const [sumPairBundle, setSumPairBundle] = useState<CampaignBundle | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loadingList, setLoadingList] = useState(true)
   const [loadingBundle, setLoadingBundle] = useState(false)
-  const [loadingCompare, setLoadingCompare] = useState(false)
   const [pending, startTransition] = useTransition()
 
   useEffect(() => {
@@ -161,21 +146,11 @@ export default function BenchmarkAnalyticsPage() {
   useEffect(() => {
     const preferred = pickDefaultCampaign(filteredCampaigns, workload)
     setSelectedId(preferred?.campaign_id || "")
-    const defaults = pickCompareDefaults(filteredCampaigns)
-    if (defaults) {
-      setBaselineId(defaults.baselineId)
-      setCompareId(defaults.comparisonId)
-    } else {
-      setBaselineId("")
-      setCompareId("")
-    }
     setBundle(null)
-    setBaselineBundle(null)
-    setCompareBundle(null)
   }, [workload, filteredCampaigns])
 
   useEffect(() => {
-    if (mode !== "single" || !selectedId) return
+    if (!selectedId) return
     let cancelled = false
     const hint = filteredCampaigns.find((c) => c.campaign_id === selectedId)
     startTransition(() => {
@@ -201,7 +176,7 @@ export default function BenchmarkAnalyticsPage() {
     return () => {
       cancelled = true
     }
-  }, [selectedId, filteredCampaigns, mode])
+  }, [selectedId, filteredCampaigns])
 
   useEffect(() => {
     if (!campaigns.length) return
@@ -249,58 +224,6 @@ export default function BenchmarkAnalyticsPage() {
     }
   }, [campaigns])
 
-  useEffect(() => {
-    if (mode !== "compare" || !baselineId || !compareId) return
-    let cancelled = false
-    startTransition(() => {
-      setLoadingCompare(true)
-      setError(null)
-    })
-    ;(async () => {
-      try {
-        const ids = Array.from(
-          new Set([
-            baselineId,
-            compareId,
-            ...filteredCampaigns.map((c) => c.campaign_id),
-          ]),
-        )
-        const loaded = await Promise.all(
-          ids.map(async (id) => {
-            const hint = filteredCampaigns.find((c) => c.campaign_id === id)
-            try {
-              const data = await loadCampaignBundle(id, hint)
-              return [id, data] as const
-            } catch {
-              return [id, undefined] as const
-            }
-          }),
-        )
-        if (cancelled) return
-        const map: Record<string, CampaignBundle | undefined> = {}
-        for (const [id, data] of loaded) map[id] = data
-        startTransition(() => {
-          setTimelineBundles(map)
-          setBaselineBundle(map[baselineId] || null)
-          setCompareBundle(map[compareId] || null)
-          setLoadingCompare(false)
-          if (!map[baselineId] || !map[compareId]) {
-            setError("Failed to load one or both comparison campaigns from artifacts.")
-          }
-        })
-      } catch (e) {
-        if (cancelled) return
-        startTransition(() => {
-          setError(e instanceof Error ? e.message : String(e))
-          setLoadingCompare(false)
-        })
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [mode, baselineId, compareId, filteredCampaigns])
-
   const selectedIndex = useMemo(
     () => filteredCampaigns.find((c) => c.campaign_id === selectedId) || null,
     [filteredCampaigns, selectedId],
@@ -309,10 +232,7 @@ export default function BenchmarkAnalyticsPage() {
 
   const dash = bundle?.dashboard
   const totals = dash?.totals
-  const showSkeleton =
-    mode === "single"
-      ? loadingList || (loadingBundle && !bundle) || pending
-      : loadingList || (loadingCompare && (!baselineBundle || !compareBundle))
+  const showSkeleton = loadingList || (loadingBundle && !bundle) || pending
 
   const totalRuns = useMemo(() => {
     if (!dash) return null
@@ -339,7 +259,7 @@ export default function BenchmarkAnalyticsPage() {
                 transition={{ duration: 0.4 }}
                 className="space-y-5"
               >
-                <div className="flex flex-col xl:flex-row xl:items-end xl:justify-between gap-4">
+                <div className="flex flex-col xl:flex-row xl:items-end xl:justify-between gap-5">
                   <div className="min-w-0">
                     <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-emerald-400/90 mb-2">
                       Offline evaluation
@@ -354,91 +274,44 @@ export default function BenchmarkAnalyticsPage() {
                     </p>
                   </div>
 
-                  <div className="flex flex-col sm:flex-row gap-2 shrink-0">
-                    <div className="inline-flex rounded-lg border border-border/60 bg-black/30 p-1">
-                      <button
-                        type="button"
-                        onClick={() => setWorkload("interactive_rag")}
-                        className={cn(
-                          "rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
-                          workload === "interactive_rag"
-                            ? "bg-card text-foreground shadow-sm"
-                            : "text-muted-foreground hover:text-foreground",
-                        )}
-                      >
-                        Interactive RAG
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setWorkload("document_summarization")}
-                        className={cn(
-                          "rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
-                          workload === "document_summarization"
-                            ? "bg-card text-foreground shadow-sm"
-                            : "text-muted-foreground hover:text-foreground",
-                        )}
-                      >
-                        Document Summarization
-                      </button>
-                    </div>
-                    <div className="inline-flex rounded-lg border border-border/60 bg-black/30 p-1">
-                      <button
-                        type="button"
-                        onClick={() => setMode("single")}
-                        className={cn(
-                          "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
-                          mode === "single"
-                            ? "bg-card text-foreground shadow-sm"
-                            : "text-muted-foreground hover:text-foreground",
-                        )}
-                      >
-                        <LayoutDashboard className="w-3.5 h-3.5" />
-                        Single campaign
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setMode("compare")}
-                        className={cn(
-                          "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
-                          mode === "compare"
-                            ? "bg-card text-foreground shadow-sm"
-                            : "text-muted-foreground hover:text-foreground",
-                        )}
-                      >
-                        <GitCompareArrows className="w-3.5 h-3.5" />
-                        Compare campaigns
-                      </button>
-                    </div>
+                  <div className="inline-flex rounded-xl border border-emerald-500/35 bg-black/40 p-1.5 shadow-[0_0_0_1px_rgba(16,185,129,0.08)] shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setWorkload("interactive_rag")}
+                      className={cn(
+                        "rounded-lg px-5 py-2.5 text-sm font-semibold tracking-tight transition-all",
+                        workload === "interactive_rag"
+                          ? "bg-emerald-500/20 text-emerald-100 shadow-sm ring-1 ring-emerald-400/40"
+                          : "text-neutral-400 hover:text-foreground hover:bg-white/5",
+                      )}
+                    >
+                      Interactive RAG
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setWorkload("document_summarization")}
+                      className={cn(
+                        "rounded-lg px-5 py-2.5 text-sm font-semibold tracking-tight transition-all",
+                        workload === "document_summarization"
+                          ? "bg-emerald-500/20 text-emerald-100 shadow-sm ring-1 ring-emerald-400/40"
+                          : "text-neutral-400 hover:text-foreground hover:bg-white/5",
+                      )}
+                    >
+                      Document Summarization
+                    </button>
                   </div>
                 </div>
 
-                {mode === "single" ? (
-                  <div className="w-full lg:w-[360px]">
-                    <CampaignSelect
-                      label="Campaign"
-                      value={selectedId}
-                      onChange={setSelectedId}
-                      campaigns={filteredCampaigns}
-                    />
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <CampaignSelect
-                      label="Baseline campaign (A)"
-                      value={baselineId}
-                      onChange={setBaselineId}
-                      campaigns={filteredCampaigns}
-                    />
-                    <CampaignSelect
-                      label="Comparison campaign (B)"
-                      value={compareId}
-                      onChange={setCompareId}
-                      campaigns={filteredCampaigns}
-                    />
-                  </div>
-                )}
+                <div className="w-full lg:w-[360px]">
+                  <CampaignSelect
+                    label="Campaign"
+                    value={selectedId}
+                    onChange={setSelectedId}
+                    campaigns={filteredCampaigns}
+                  />
+                </div>
 
-                {mode === "single" && (bundle || selectedIndex) ? (
+                {bundle || selectedIndex ? (
                   <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-8 gap-2.5">
                     <MetaChip
                       label="Workload"
@@ -526,19 +399,7 @@ export default function BenchmarkAnalyticsPage() {
                 </section>
               ) : null}
 
-              {mode === "compare" ? (
-                showSkeleton && (!baselineBundle || !compareBundle) ? (
-                  <BenchmarkAnalyticsSkeleton />
-                ) : (
-                  <BenchmarkCompareView
-                    baseline={baselineBundle}
-                    comparison={compareBundle}
-                    campaigns={filteredCampaigns}
-                    timelineBundles={timelineBundles}
-                    loading={loadingCompare}
-                  />
-                )
-              ) : showSkeleton && !bundle ? (
+              {showSkeleton && !bundle ? (
                 <BenchmarkAnalyticsSkeleton />
               ) : bundle && dash ? (
                 <>

@@ -179,10 +179,10 @@ export default function Hero() {
                 className="text-neutral-400 landing-hero-sub"
               >
                 Three pillars —
-                <span className="text-white"> adaptive routing</span>,
-                <span className="text-white"> carbon-aware scheduling</span>, and
-                <span className="text-white"> transparent accounting</span> —
-                working chunk by chunk against a live grid signal.
+                <span className="text-white"> capability-first routing</span>,
+                <span className="text-white"> Boundary-A carbon accounting</span>, and
+                <span className="text-white"> Interactive RAG</span> —
+                with live grid intensity for the configured region.
               </motion.p>
 
               <motion.div

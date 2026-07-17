@@ -4,23 +4,26 @@ import { motion, useScroll, useTransform } from "framer-motion";
 import { useRef } from "react";
 
 const REGIONS = [
-  { id: "us-west-2",  name: "us-west-2",  x: 130, y: 210, grid: 210, tier: "primary", city: "Oregon" },
+  { id: "india",      name: "india",      x: 760, y: 270, grid: 640, tier: "primary", city: "India · IN-WE" },
+  { id: "us-west-2",  name: "us-west-2",  x: 130, y: 210, grid: 210, tier: "reference", city: "Oregon" },
   { id: "us-east-1",  name: "us-east-1",  x: 320, y: 230, grid: 420, tier: "reference", city: "Virginia" },
   { id: "eu-north-1", name: "eu-north-1", x: 560, y: 140, grid: 45,  tier: "reference", city: "Stockholm" },
   { id: "eu-west-1",  name: "eu-west-1",  x: 500, y: 200, grid: 290, tier: "reference", city: "Ireland" },
-  { id: "ap-south-1", name: "ap-south-1", x: 760, y: 270, grid: 710, tier: "reference", city: "Mumbai" },
   { id: "ap-ne-1",    name: "ap-ne-1",    x: 880, y: 210, grid: 480, tier: "reference", city: "Tokyo" },
 ];
 
 /** Compact mobile map positions — 2 rows × 3, all markers readable */
 const MOBILE_REGIONS = [
-  { id: "us-west-2",  name: "us-west-2",  x: 90,  y: 90,  grid: 210, tier: "primary", city: "Oregon" },
+  { id: "india",      name: "india",      x: 250, y: 230, grid: 640, tier: "primary", city: "India · IN-WE" },
+  { id: "us-west-2",  name: "us-west-2",  x: 90,  y: 90,  grid: 210, tier: "reference", city: "Oregon" },
   { id: "us-east-1",  name: "us-east-1",  x: 250, y: 100, grid: 420, tier: "reference", city: "Virginia" },
   { id: "eu-north-1", name: "eu-north-1", x: 410, y: 70,  grid: 45,  tier: "reference", city: "Stockholm" },
   { id: "eu-west-1",  name: "eu-west-1",  x: 90,  y: 210, grid: 290, tier: "reference", city: "Ireland" },
-  { id: "ap-south-1", name: "ap-south-1", x: 250, y: 230, grid: 710, tier: "reference", city: "Mumbai" },
   { id: "ap-ne-1",    name: "ap-ne-1",    x: 410, y: 200, grid: 480, tier: "reference", city: "Tokyo" },
 ];
+
+const PRIMARY = REGIONS.find((r) => r.tier === "primary") || REGIONS[0];
+const PRIMARY_MOBILE = MOBILE_REGIONS.find((r) => r.tier === "primary") || MOBILE_REGIONS[0];
 
 function RegionCard({ r }) {
   const isPrimary = r.tier === "primary";
@@ -65,8 +68,8 @@ export default function RegionScheduling() {
           </div>
           <div className="lg:col-span-5 flex items-end">
             <p className="text-neutral-400 text-[14px] sm:text-[15px] leading-relaxed">
-              Multi-region execution: architecture-ready, not yet active. Candidate regions
-              ranked by real-time carbon intensity from Electricity Maps.
+              Live execution is single-region (default India) with Electricity Maps intensity for
+              accounting. Multi-region carbon-optimal placement is architecture-ready — not pretended live.
             </p>
           </div>
         </div>
@@ -74,7 +77,7 @@ export default function RegionScheduling() {
         <div ref={ref} className="border border-white/10 bg-[#080808]">
           <div className="hairline-b px-4 sm:px-5 py-3 flex items-center justify-between gap-3 font-mono text-[10px] uppercase tracking-[0.2em] text-neutral-500">
             <span>fig. 04 — candidate regions</span>
-            <span className="text-amber-400/80 shrink-0">status · architecture-ready</span>
+            <span className="text-amber-400/80 shrink-0">status · single-region live</span>
           </div>
 
           {/* Mobile: compact 2×3 map so every region is visible */}
@@ -93,7 +96,7 @@ export default function RegionScheduling() {
               {MOBILE_REGIONS.filter((r) => r.tier === "reference").map((r) => (
                 <line
                   key={"c" + r.id}
-                  x1={90} y1={90} x2={r.x} y2={r.y}
+                  x1={PRIMARY_MOBILE.x} y1={PRIMARY_MOBILE.y} x2={r.x} y2={r.y}
                   stroke="rgba(255,255,255,0.1)"
                   strokeDasharray="3 4"
                 />
@@ -166,7 +169,7 @@ export default function RegionScheduling() {
               {REGIONS.filter((r) => r.tier === "reference").map((r) => (
                 <line
                   key={"c" + r.id}
-                  x1={130} y1={210} x2={r.x} y2={r.y}
+                  x1={PRIMARY.x} y1={PRIMARY.y} x2={r.x} y2={r.y}
                   stroke="rgba(255,255,255,0.06)"
                   strokeDasharray="3 4"
                 />
@@ -231,7 +234,7 @@ export default function RegionScheduling() {
           </div>
         </div>
         <p className="mt-4 font-mono text-[10px] uppercase tracking-[0.2em] text-neutral-500">
-          caption · multi-region execution is architecture-ready, not yet active.
+          caption · primary = configured live region · dashed nodes = future multi-region candidates
         </p>
       </div>
     </section>

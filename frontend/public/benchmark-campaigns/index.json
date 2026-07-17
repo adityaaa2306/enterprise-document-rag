@@ -1,25 +1,5 @@
 [
   {
-    "campaign_id": "campaign_20260717T104756Z_v1.4.0_lhas-summarization-standard",
-    "label": "lhas-summarization-standard",
-    "benchmark_version": "1.4.0",
-    "workload": "document_summarization",
-    "suite": "summarization-standard",
-    "document_id": "f3bbda03-2ac2-4e4b-bd01-7b6be7f81895",
-    "document_name": "LHAS_Blueprint.pdf",
-    "timestamp_utc": "2026-07-17T10:48:14.995293+00:00",
-    "models": [
-      "intelligent-router",
-      "gpt-5-nano",
-      "gpt-5-mini",
-      "gpt-5.5"
-    ],
-    "dry_run": false,
-    "total_api_cost_usd": 0.07247226,
-    "total_runtime_sec": 109.711,
-    "status": "ok"
-  },
-  {
     "campaign_id": "campaign_20260717T093705Z_v1.4.0_rag-standard",
     "label": "rag-standard",
     "benchmark_version": "1.4.0",

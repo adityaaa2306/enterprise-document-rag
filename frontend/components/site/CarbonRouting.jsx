@@ -26,9 +26,9 @@ const tierFor = (c, high) => {
 };
 
 const tierMeta = {
-  light:  { color: "#14B8A6", label: "Light",  model: "DistilBART",  jpt: 0.85 },
-  medium: { color: "#F59E0B", label: "Medium", model: "Gemma 2B",    jpt: 2.55 },
-  heavy:  { color: "#F43F5E", label: "Heavy",  model: "Llama 3.1 8B", jpt: 6.5 },
+  light:  { color: "#14B8A6", label: "Light",  model: "Llama 3.2 3B",   jpt: 0.85 },
+  medium: { color: "#F59E0B", label: "Medium", model: "Ministral 14B",  jpt: 2.55 },
+  heavy:  { color: "#F43F5E", label: "Heavy",  model: "Llama 3.3 70B",  jpt: 6.5 },
 };
 
 export default function CarbonRouting() {
@@ -62,8 +62,9 @@ export default function CarbonRouting() {
           </div>
           <div className="lg:col-span-5 flex items-end">
             <p className="text-neutral-400 leading-relaxed text-[15px]">
-              Toggle the grid signal. Watch the router re-assign chunks to lighter tiers when
-              carbon-per-kWh rises — and re-optimize when the grid cleans up.
+              Illustrative demo: toggle grid intensity and watch expected CO₂e change as Light /
+              Medium / Heavy (Llama 3.2 3B · Ministral 14B · Llama 3.3 70B) assignments shift.
+              Live routing still respects CRE capability floors before carbon weights.
             </p>
           </div>
         </div>

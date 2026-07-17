@@ -41,11 +41,17 @@ const TOTAL_COLOR = CHART_CORAL
 type Point = {
   key: string
   model: string
+  shortLabel: string
   workload: "RAG" | "Summarization"
   cost: number
   co2e: number
+  /** Plot coordinates (may be lightly jittered for overlaps). */
+  plotCost: number
+  plotCo2e: number
   fill: string
   isTotal: boolean
+  labelDx: number
+  labelDy: number
 }
 
 function Tip({
@@ -80,7 +86,50 @@ function Tip({
   )
 }
 
-/** Circle for models, diamond for campaign totals (always coral/red). */
+function shortModelLabel(model: string, isTotal: boolean, workload: string): string {
+  if (isTotal) return workload === "RAG" ? "RAG Σ" : "Sum Σ"
+  const m = model.trim()
+  if (/intelligent\s*router/i.test(m)) return "Router"
+  if (/nano/i.test(m)) return "nano"
+  if (/mini/i.test(m)) return "mini"
+  if (/5\.5|gpt-5\.5/i.test(m)) return "5.5"
+  return m.length > 8 ? `${m.slice(0, 7)}…` : m
+}
+
+/**
+ * Separate near-identical points so markers/labels do not stack.
+ * Applies a small relative offset in value-space (works with log axes).
+ */
+function separateOverlaps(points: Point[]): Point[] {
+  const out = points.map((p) => ({ ...p }))
+  const n = out.length
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const a = out[i]
+      const b = out[j]
+      const costRatio =
+        Math.max(a.plotCost, b.plotCost) / Math.max(Math.min(a.plotCost, b.plotCost), 1e-9)
+      const co2Ratio =
+        Math.max(a.plotCo2e, b.plotCo2e) / Math.max(Math.min(a.plotCo2e, b.plotCo2e), 1e-9)
+      // Treat as overlapping when within ~12% on both log-ish axes.
+      if (costRatio < 1.12 && co2Ratio < 1.12) {
+        const bump = 1.08 + ((j + i) % 3) * 0.03
+        // Push the later point up/right; nudge earlier one down/left slightly.
+        b.plotCost *= bump
+        b.plotCo2e *= bump
+        a.plotCost /= Math.sqrt(bump)
+        a.plotCo2e /= Math.sqrt(bump)
+        a.labelDx = -10
+        a.labelDy = -10
+        b.labelDx = 10
+        b.labelDy = 12
+      }
+    }
+  }
+  return out
+}
+
+/** Circle/square for models, diamond for campaign totals — with short labels. */
 function PointShape(props: {
   cx?: number
   cy?: number
@@ -89,27 +138,87 @@ function PointShape(props: {
   const { cx = 0, cy = 0, payload } = props
   if (!payload) return null
 
+  const label = payload.shortLabel
+  const lx = cx + (payload.labelDx || 8)
+  const ly = cy + (payload.labelDy || -8)
+
   if (payload.isTotal) {
-    const s = 9
+    const s = 8
     return (
-      <polygon
-        points={`${cx},${cy - s} ${cx + s},${cy} ${cx},${cy + s} ${cx - s},${cy}`}
-        fill={TOTAL_COLOR}
-        stroke="#fff"
-        strokeWidth={1.75}
-      />
+      <g>
+        <polygon
+          points={`${cx},${cy - s} ${cx + s},${cy} ${cx},${cy + s} ${cx - s},${cy}`}
+          fill={TOTAL_COLOR}
+          fillOpacity={0.95}
+          stroke="#fff"
+          strokeWidth={1.75}
+        />
+        <text
+          x={lx}
+          y={ly}
+          fill="#fda4af"
+          fontSize={10}
+          fontWeight={600}
+          style={{ paintOrder: "stroke", stroke: "rgba(0,0,0,0.75)", strokeWidth: 3 }}
+        >
+          {label}
+        </text>
+      </g>
+    )
+  }
+
+  // Distinct shapes per workload so overlaps remain readable.
+  if (payload.workload === "Summarization") {
+    const half = 5.5
+    return (
+      <g>
+        <rect
+          x={cx - half}
+          y={cy - half}
+          width={half * 2}
+          height={half * 2}
+          rx={1.5}
+          fill={payload.fill}
+          fillOpacity={0.82}
+          stroke="#fff"
+          strokeWidth={1.25}
+        />
+        <text
+          x={lx}
+          y={ly}
+          fill="#fcd34d"
+          fontSize={10}
+          fontWeight={600}
+          style={{ paintOrder: "stroke", stroke: "rgba(0,0,0,0.75)", strokeWidth: 3 }}
+        >
+          {label}
+        </text>
+      </g>
     )
   }
 
   return (
-    <circle
-      cx={cx}
-      cy={cy}
-      r={6}
-      fill={payload.fill}
-      stroke="rgba(255,255,255,0.35)"
-      strokeWidth={1}
-    />
+    <g>
+      <circle
+        cx={cx}
+        cy={cy}
+        r={6}
+        fill={payload.fill}
+        fillOpacity={0.82}
+        stroke="#fff"
+        strokeWidth={1.25}
+      />
+      <text
+        x={lx}
+        y={ly}
+        fill="#5eead4"
+        fontSize={10}
+        fontWeight={600}
+        style={{ paintOrder: "stroke", stroke: "rgba(0,0,0,0.75)", strokeWidth: 3 }}
+      >
+        {label}
+      </text>
+    </g>
   )
 }
 
@@ -147,27 +256,42 @@ export function BenchmarkWorkloadCostCo2({ rag, summarization }: Props) {
     { cost: number; co2e: number; label: string }
   >()
 
+  const pushPoint = (
+    partial: Omit<Point, "shortLabel" | "plotCost" | "plotCo2e" | "labelDx" | "labelDy">,
+  ) => {
+    const cost = Math.max(partial.cost, 1e-6)
+    const co2e = Math.max(partial.co2e, 1e-6)
+    points.push({
+      ...partial,
+      cost,
+      co2e,
+      plotCost: cost,
+      plotCo2e: co2e,
+      shortLabel: shortModelLabel(partial.model, partial.isTotal, partial.workload),
+      labelDx: partial.workload === "RAG" ? 8 : -28,
+      labelDy: partial.isTotal ? -12 : partial.workload === "RAG" ? -9 : 14,
+    })
+  }
+
   if (rag) {
     const cost = totalEstimatedCostUsd(rag)
     const co2e = totalEstimatedCo2eG(rag)
     for (const r of rag.dashboard.table?.per_model || []) {
       const label = displayParticipantName(r.model)
-      ragByModel.set(r.model, {
-        label,
-        cost: Number(r.total_estimated_api_cost_usd || 0),
-        co2e: modelTotalCo2eG(r),
-      })
-      points.push({
+      const modelCost = Number(r.total_estimated_api_cost_usd || 0)
+      const modelCo2e = modelTotalCo2eG(r)
+      ragByModel.set(r.model, { label, cost: modelCost, co2e: modelCo2e })
+      pushPoint({
         key: `rag-${r.model}`,
         model: label,
         workload: "RAG",
-        cost: Number(r.total_estimated_api_cost_usd || 0),
-        co2e: modelTotalCo2eG(r),
+        cost: modelCost,
+        co2e: modelCo2e,
         fill: RAG_COLOR,
         isTotal: false,
       })
     }
-    points.push({
+    pushPoint({
       key: "rag-total",
       model: "RAG — campaign total",
       workload: "RAG",
@@ -183,22 +307,20 @@ export function BenchmarkWorkloadCostCo2({ rag, summarization }: Props) {
     const co2e = totalEstimatedCo2eG(summarization)
     for (const r of summarization.dashboard.table?.per_model || []) {
       const label = displayParticipantName(r.model)
-      sumByModel.set(r.model, {
-        label,
-        cost: Number(r.total_estimated_api_cost_usd || 0),
-        co2e: modelTotalCo2eG(r),
-      })
-      points.push({
+      const modelCost = Number(r.total_estimated_api_cost_usd || 0)
+      const modelCo2e = modelTotalCo2eG(r)
+      sumByModel.set(r.model, { label, cost: modelCost, co2e: modelCo2e })
+      pushPoint({
         key: `sum-${r.model}`,
         model: label,
         workload: "Summarization",
-        cost: Number(r.total_estimated_api_cost_usd || 0),
-        co2e: modelTotalCo2eG(r),
+        cost: modelCost,
+        co2e: modelCo2e,
         fill: SUM_COLOR,
         isTotal: false,
       })
     }
-    points.push({
+    pushPoint({
       key: "sum-total",
       model: "Summarization — campaign total",
       workload: "Summarization",
@@ -224,11 +346,11 @@ export function BenchmarkWorkloadCostCo2({ rag, summarization }: Props) {
     }
   })
 
-  // Draw totals last so diamonds sit above overlapping model points.
-  const plotPoints = [
+  // Draw totals last; separate near-duplicates so the cheap cluster is readable.
+  const plotPoints = separateOverlaps([
     ...points.filter((p) => !p.isTotal),
     ...points.filter((p) => p.isTotal),
-  ]
+  ])
 
   const ragLabel = rag?.index.label || "RAG"
   const sumLabel = summarization?.index.label || "Summarization"
@@ -238,8 +360,12 @@ export function BenchmarkWorkloadCostCo2({ rag, summarization }: Props) {
     rag?.config.filename ||
     summarization?.config.filename
 
-  const maxCost = Math.max(...plotPoints.map((p) => p.cost), 0.001)
-  const maxCo2 = Math.max(...plotPoints.map((p) => p.co2e), 0.001)
+  const minCost = Math.min(...plotPoints.map((p) => p.plotCost))
+  const maxCost = Math.max(...plotPoints.map((p) => p.plotCost))
+  const minCo2 = Math.min(...plotPoints.map((p) => p.plotCo2e))
+  const maxCo2 = Math.max(...plotPoints.map((p) => p.plotCo2e))
+  const xDomain: [number, number] = [minCost / 1.35, maxCost * 1.35]
+  const yDomain: [number, number] = [minCo2 / 1.35, maxCo2 * 1.35]
 
   return (
     <div className="space-y-4">
@@ -248,9 +374,9 @@ export function BenchmarkWorkloadCostCo2({ rag, summarization }: Props) {
           Cost vs CO₂e — RAG &amp; Summarization
         </h2>
         <p className="mt-1 max-w-3xl text-sm leading-relaxed text-neutral-300">
-          Campaign totals (red diamonds) and per-model totals plotted against estimated
-          CO₂e. Prefer lower-left (cheaper &amp; greener). Comparing{" "}
-          <span className="text-teal-300">{ragLabel}</span>
+          Campaign totals (red diamonds) and per-model totals on a log scale so cheap,
+          low-CO₂e models stay readable. Prefer lower-left (cheaper &amp; greener).
+          Comparing <span className="text-teal-300">{ragLabel}</span>
           {summarization ? (
             <>
               {" "}
@@ -262,16 +388,18 @@ export function BenchmarkWorkloadCostCo2({ rag, summarization }: Props) {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <ChartCard title="Total cost vs total CO₂e" delay={0.05}>
+        <ChartCard title="Total cost vs total CO₂e (log scale)" delay={0.05}>
           <div className="h-80">
             <ResponsiveContainer width="100%" height={320} minWidth={0}>
-              <ScatterChart margin={{ top: 12, right: 16, bottom: 28, left: 8 }}>
+              <ScatterChart margin={{ top: 18, right: 28, bottom: 28, left: 8 }}>
                 <CartesianGrid stroke={CHART_GRID} strokeDasharray="3 3" />
                 <XAxis
                   type="number"
-                  dataKey="cost"
+                  dataKey="plotCost"
                   name="Cost"
-                  domain={[0, maxCost * 1.08]}
+                  scale="log"
+                  domain={xDomain}
+                  allowDataOverflow
                   tick={AXIS}
                   axisLine={false}
                   tickLine={false}
@@ -279,9 +407,11 @@ export function BenchmarkWorkloadCostCo2({ rag, summarization }: Props) {
                 />
                 <YAxis
                   type="number"
-                  dataKey="co2e"
+                  dataKey="plotCo2e"
                   name="CO₂e"
-                  domain={[0, maxCo2 * 1.08]}
+                  scale="log"
+                  domain={yDomain}
+                  allowDataOverflow
                   tick={AXIS}
                   width={56}
                   axisLine={false}
@@ -310,10 +440,14 @@ export function BenchmarkWorkloadCostCo2({ rag, summarization }: Props) {
           </div>
           <div className="mt-1 flex flex-wrap items-center justify-center gap-x-5 gap-y-2 text-[11px] text-neutral-300">
             <span className="inline-flex items-center gap-1.5">
-              <LegendDot color={RAG_COLOR} /> RAG (per model)
+              <LegendDot color={RAG_COLOR} /> RAG (circle)
             </span>
             <span className="inline-flex items-center gap-1.5">
-              <LegendDot color={SUM_COLOR} /> Summarization (per model)
+              <span
+                className="inline-block h-2.5 w-2.5 rounded-[2px]"
+                style={{ backgroundColor: SUM_COLOR }}
+              />{" "}
+              Summarization (square)
             </span>
             <span className="inline-flex items-center gap-1.5">
               <LegendDot color={TOTAL_COLOR} diamond /> Campaign total

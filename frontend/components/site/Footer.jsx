@@ -49,7 +49,7 @@ export default function Footer() {
             <span>·</span>
             <span className="flex items-center gap-2">
               <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse" />
-              live @ us-west-2
+              live · India (single-region)
             </span>
           </div>
         </div>

@@ -5,15 +5,15 @@ import { motion } from "framer-motion";
 const CARDS = [
   {
     tag: "What's novel",
-    body: "Per-chunk routing decisions are conditioned on live grid intensity — not just chunk complexity. The optimizer targets carbon, not latency alone.",
+    body: "Capability-first routing (CRE + QVA) with carbon as an optimization weight — plus separate Document Processing and Interactive RAG Boundary-A ledgers.",
   },
   {
     tag: "Simulated vs live",
-    body: "Model inference and validation are live. Region scheduling is simulated against Electricity Maps data. Fine-tuning of the router is offline.",
+    body: "NIM inference, retrieval, and QVA are live. Grid intensity is live for the configured single region via Electricity Maps. Multi-region execution is designed, not yet active.",
   },
   {
     tag: "Known limitations",
-    body: "No training-time accounting. Grid signal lags by ~5 minutes. Escalation is bounded to one step. Multi-tenant queue effects are out of scope.",
+    body: "Operational Boundary A only (no training / embodied LCA). Values are estimates, not metered facility joules. Escalation is bounded. Providers do not expose per-request power.",
   },
 ];
 

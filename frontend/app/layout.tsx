@@ -9,12 +9,12 @@ const _mono = JetBrains_Mono({ subsets: ["latin"], variable: "--font-mono", disp
 export const metadata: Metadata = {
   title: "Green Agentic | Carbon-Aware Document Intelligence",
   description:
-    "A document processing pipeline that decides, per chunk, which model to run — and where — for transparent carbon accounting.",
+    "Capability-first Light/Medium/Heavy routing on NVIDIA NIM, Boundary-A carbon accounting, and Interactive RAG — with Document Processing CO₂e tracked separately.",
   metadataBase: new URL("https://enterprise-document-rag.vercel.app"),
   openGraph: {
     title: "Green Agentic | Carbon-Aware Document Intelligence",
     description:
-      "Adaptive routing, carbon-aware scheduling, and transparent accounting — chunk by chunk.",
+      "CRE + QVA routing, Document Processing vs Interactive RAG carbon, single-region Electricity Maps intensity.",
     url: "https://enterprise-document-rag.vercel.app",
     siteName: "Green Agentic",
     type: "website",
@@ -23,7 +23,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Green Agentic | Carbon-Aware Document Intelligence",
     description:
-      "Adaptive routing, carbon-aware scheduling, and transparent accounting — chunk by chunk.",
+      "CRE + QVA routing, Document Processing vs Interactive RAG carbon, single-region Electricity Maps intensity.",
   },
   icons: {
     icon: [{ url: "/icon.svg", type: "image/svg+xml" }],
