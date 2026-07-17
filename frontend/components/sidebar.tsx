@@ -6,6 +6,7 @@ import Link from "next/link"
 import {
   BarChart3,
   FileText,
+  FlaskConical,
   HelpCircle,
   Home,
   LayoutDashboard,
@@ -130,7 +131,14 @@ export function Sidebar() {
 
   // Prefetch app shell routes so sidebar navigation feels native.
   useEffect(() => {
-    const routes = ["/dashboard", "/new-job", "/results", "/settings", "/login"]
+    const routes = [
+      "/dashboard",
+      "/new-job",
+      "/results",
+      "/benchmarks",
+      "/settings",
+      "/login",
+    ]
     for (const r of routes) {
       try {
         router.prefetch(r)
@@ -169,6 +177,12 @@ export function Sidebar() {
     { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard, match: "/dashboard" },
     { href: "/new-job", label: "New Job", icon: FileText, match: "/new-job" },
     { href: resultsHref, label: "Results", icon: BarChart3, match: "/results" },
+    {
+      href: "/benchmarks",
+      label: "Benchmarks",
+      icon: FlaskConical,
+      match: "/benchmarks",
+    },
   ]
 
   const handleLogout = async () => {

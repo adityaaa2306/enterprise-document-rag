@@ -19,8 +19,8 @@ export function ChartCard({ title, children, delay = 0 }: ChartCardProps) {
       whileHover={{ y: -4 }}
     >
       <Card className="p-6 bg-gradient-to-br from-card to-card/50 border-border/50 hover:border-primary/30 transition-colors">
-        <h3 className="text-lg font-semibold mb-4">{title}</h3>
-        <div className="w-full overflow-auto">{children}</div>
+        <h3 className="mb-4 text-lg font-semibold text-neutral-100">{title}</h3>
+        <div className="w-full min-w-0 overflow-auto text-neutral-200">{children}</div>
       </Card>
     </motion.div>
   )

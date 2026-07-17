@@ -5,11 +5,11 @@ import {
   Bar,
   BarChart,
   Cell,
-  ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
 } from "recharts"
+import { ChartFrame } from "@/components/chart-frame"
 import {
   ChevronDown,
   Gauge,
@@ -69,6 +69,7 @@ function HeroTile({
   icon: Icon,
   valueClassName,
   loading,
+  tip,
 }: {
   label: string
   value: string
@@ -76,9 +77,10 @@ function HeroTile({
   icon: ComponentType<{ className?: string }>
   valueClassName?: string
   loading?: boolean
+  tip?: string
 }) {
   return (
-    <div className="rounded-lg bg-muted/30 border border-border/40 px-3 py-3 min-w-0">
+    <div className="rounded-lg bg-muted/30 border border-border/40 px-3 py-3 min-w-0" title={tip}>
       <div className="flex items-center gap-1.5 text-muted-foreground mb-1">
         <Icon className="w-3.5 h-3.5 shrink-0" />
         <span className="text-[11px] uppercase tracking-wide truncate">{label}</span>
@@ -392,52 +394,50 @@ function ModelComparisonTab({ m }: { m: CompactJobMetrics }) {
     )
   }
   return (
-    <div className="h-[320px] w-full">
-      <ResponsiveContainer width="100%" height="100%">
-        <BarChart data={data} layout="vertical" margin={{ left: 8, right: 16, top: 8, bottom: 8 }}>
-          <XAxis
-            type="number"
-            tick={{ fontSize: 11, fill: COLOR_MUTED_TICK }}
-            stroke={COLOR_CHART_AXIS}
-          />
-          <YAxis
-            type="category"
-            dataKey="label"
-            width={132}
-            tick={{ fontSize: 11, fill: COLOR_MUTED_TICK }}
-            stroke={COLOR_CHART_AXIS}
-          />
-          <Tooltip
-            contentStyle={{
-              background: "#18181B",
-              border: "1px solid #27272A",
-              borderRadius: 8,
-              fontSize: 12,
-              color: "#FAFAFA",
-            }}
-            formatter={(value: number) => [`${Number(value).toFixed(1)} g`, "CO₂e"]}
-            labelFormatter={(_, payload) => {
-              const row = payload?.[0]?.payload as { model?: string } | undefined
-              return row?.model || ""
-            }}
-          />
-          <Bar dataKey="estimated_gco2e" radius={[0, 4, 4, 0]} barSize={16}>
-            {data.map((entry) => {
-              const isOurs =
-                Boolean(entry.is_ours) ||
-                /green\s*agentic|ours \(green/i.test(String(entry.model || ""))
-              return (
-                <Cell
-                  key={entry.model}
-                  fill={isOurs ? COLOR_OURS : COLOR_PEER_BAR}
-                  fillOpacity={isOurs ? 0.95 : 0.85}
-                />
-              )
-            })}
-          </Bar>
-        </BarChart>
-      </ResponsiveContainer>
-    </div>
+    <ChartFrame height={320}>
+      <BarChart data={data} layout="vertical" margin={{ left: 8, right: 16, top: 8, bottom: 8 }}>
+        <XAxis
+          type="number"
+          tick={{ fontSize: 11, fill: COLOR_MUTED_TICK }}
+          stroke={COLOR_CHART_AXIS}
+        />
+        <YAxis
+          type="category"
+          dataKey="label"
+          width={132}
+          tick={{ fontSize: 11, fill: COLOR_MUTED_TICK }}
+          stroke={COLOR_CHART_AXIS}
+        />
+        <Tooltip
+          contentStyle={{
+            background: "#18181B",
+            border: "1px solid #27272A",
+            borderRadius: 8,
+            fontSize: 12,
+            color: "#FAFAFA",
+          }}
+          formatter={(value: number) => [`${Number(value).toFixed(1)} g`, "CO₂e"]}
+          labelFormatter={(_, payload) => {
+            const row = payload?.[0]?.payload as { model?: string } | undefined
+            return row?.model || ""
+          }}
+        />
+        <Bar dataKey="estimated_gco2e" radius={[0, 4, 4, 0]} barSize={16}>
+          {data.map((entry) => {
+            const isOurs =
+              Boolean(entry.is_ours) ||
+              /green\s*agentic|ours \(green/i.test(String(entry.model || ""))
+            return (
+              <Cell
+                key={entry.model}
+                fill={isOurs ? COLOR_OURS : COLOR_PEER_BAR}
+                fillOpacity={isOurs ? 0.95 : 0.85}
+              />
+            )
+          })}
+        </Bar>
+      </BarChart>
+    </ChartFrame>
   )
 }
 
@@ -626,25 +626,40 @@ export function JobResultsPanel({ result, metricsPending = false, jobId }: Props
 
   return (
     <div className="space-y-5">
+      <div>
+        <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-1">
+          Document Processing CO₂e
+        </p>
+        <p className="text-[11px] text-muted-foreground mb-3">
+          One-time ingestion cost — parsing, chunking, embeddings, routed summarization, and
+          compilation. Interactive RAG chat emissions are accounted separately in the chat panel.
+        </p>
+      </div>
       <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-3">
         <HeroTile
           label="Optimized CO₂e"
           value={fmtG(metrics.optimizedG)}
+          subtext="One-time ingestion"
           icon={Leaf}
           loading={pending && metrics.optimizedG <= 0}
+          tip="Document Processing: parse, chunk, embed, routed map/compile. Not Interactive RAG."
         />
         <HeroTile
           label="Baseline CO₂e"
           value={fmtG(metrics.baselineG)}
+          subtext="Naive frontier pipeline"
           icon={Scale}
           loading={pending && metrics.baselineG <= 0}
+          tip="Same document tokens charged as if every stage used a heavy frontier model."
         />
         <HeroTile
           label={metrics.emissionsIncreased ? "Emissions Δ" : "Carbon saved"}
           value={fmtG(Math.abs(metrics.savedG))}
+          subtext="vs baseline"
           icon={TrendingDown}
           valueClassName={metrics.emissionsIncreased ? "text-rose-400" : undefined}
           loading={pending && metrics.savedG === 0 && metrics.baselineG <= 0}
+          tip="Baseline Document Processing CO₂e minus Optimized Document Processing CO₂e."
         />
         <HeroTile
           label="Reduction"

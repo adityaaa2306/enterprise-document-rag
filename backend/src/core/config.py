@@ -172,6 +172,9 @@ class Settings(BaseSettings):
     REGION_SCHEDULER_PROVIDER: str = "electricity_maps"
     # Soft TTFT: if no first token by this deadline, cancel and try another endpoint.
     NIM_SOFT_TTFT_TIMEOUT_SEC: float = 45.0
+    # Interactive RAG stream path — fail over faster than map/compile so Chat
+    # does not sit on "Thinking…" for a full NIM_HTTP_TIMEOUT on a hung primary.
+    NIM_RAG_SOFT_TTFT_TIMEOUT_SEC: float = 18.0
     # Hard per-call HTTP read — MUST be strictly below MAP_CHUNK_HARD_TIMEOUT_SEC
     # so hung NIM sockets abort before the node wrapper wall.
     NIM_HARD_TIMEOUT_SEC: float = 75.0

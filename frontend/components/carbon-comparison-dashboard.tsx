@@ -5,11 +5,11 @@ import {
   Bar,
   BarChart,
   Cell,
-  ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
 } from "recharts"
+import { ChartFrame } from "@/components/chart-frame"
 import { Leaf, Gauge, Scale, TrendingDown, Info } from "lucide-react"
 import { Card } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
@@ -446,55 +446,53 @@ export function CarbonComparisonDashboard({
               Sorted highest to lowest. Our system highlighted in green.
             </p>
           </div>
-          <div className="h-[360px] w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart
-                data={chartData}
-                layout="vertical"
-                margin={{ top: 8, right: 28, left: 4, bottom: 8 }}
-              >
-                <XAxis
-                  type="number"
-                  stroke={CHART_AXIS}
-                  tick={{ fill: CHART_TICK, fontSize: 12 }}
-                  tickLine={false}
-                  axisLine={false}
-                  unit=" g"
-                />
-                <YAxis
-                  type="category"
-                  dataKey="label"
-                  width={128}
-                  stroke={CHART_AXIS}
-                  tick={{ fill: CHART_TICK, fontSize: 12 }}
-                  tickLine={false}
-                  axisLine={false}
-                />
-                <Tooltip
-                  cursor={{ fill: "rgba(255,255,255,0.04)" }}
-                  contentStyle={{
-                    background: "hsl(var(--card))",
-                    border: "1px solid hsl(var(--border))",
-                    borderRadius: 8,
-                    color: CHART_TICK,
-                  }}
-                  labelStyle={{ color: "#f4f4f5" }}
-                  itemStyle={{ color: CHART_TICK }}
-                  formatter={(value: number) => [`${fmtG(value)} g CO₂e`, "Estimated"]}
-                  labelFormatter={(label) => String(label)}
-                />
-                <Bar dataKey="estimated_gco2e" radius={[0, 6, 6, 0]} barSize={18}>
-                  {chartData.map((entry) => (
-                    <Cell
-                      key={entry.model}
-                      fill={entry.is_ours ? "#22c55e" : "#94a3b8"}
-                      fillOpacity={entry.is_ours ? 0.95 : 0.75}
-                    />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
+          <ChartFrame height={360}>
+            <BarChart
+              data={chartData}
+              layout="vertical"
+              margin={{ top: 8, right: 28, left: 4, bottom: 8 }}
+            >
+              <XAxis
+                type="number"
+                stroke={CHART_AXIS}
+                tick={{ fill: CHART_TICK, fontSize: 12 }}
+                tickLine={false}
+                axisLine={false}
+                unit=" g"
+              />
+              <YAxis
+                type="category"
+                dataKey="label"
+                width={128}
+                stroke={CHART_AXIS}
+                tick={{ fill: CHART_TICK, fontSize: 12 }}
+                tickLine={false}
+                axisLine={false}
+              />
+              <Tooltip
+                cursor={{ fill: "rgba(255,255,255,0.04)" }}
+                contentStyle={{
+                  background: "hsl(var(--card))",
+                  border: "1px solid hsl(var(--border))",
+                  borderRadius: 8,
+                  color: CHART_TICK,
+                }}
+                labelStyle={{ color: "#f4f4f5" }}
+                itemStyle={{ color: CHART_TICK }}
+                formatter={(value: number) => [`${fmtG(value)} g CO₂e`, "Estimated"]}
+                labelFormatter={(label) => String(label)}
+              />
+              <Bar dataKey="estimated_gco2e" radius={[0, 6, 6, 0]} barSize={18}>
+                {chartData.map((entry) => (
+                  <Cell
+                    key={entry.model}
+                    fill={entry.is_ours ? "#22c55e" : "#94a3b8"}
+                    fillOpacity={entry.is_ours ? 0.95 : 0.75}
+                  />
+                ))}
+              </Bar>
+            </BarChart>
+          </ChartFrame>
         </Card>
 
         {breakdown ? (
@@ -510,7 +508,7 @@ export function CarbonComparisonDashboard({
 
             {breakdown.uncertainty?.enabled && breakdown.uncertainty.optimized ? (
               <div className="rounded-lg border border-border/40 px-4 py-3 space-y-1">
-                <p className="text-sm font-medium">Estimated Optimized CO₂e — Typical</p>
+                <p className="text-sm font-medium">Document Processing · Optimized CO₂e — Typical</p>
                 <p className="text-2xl font-bold tabular-nums">
                   {fmtG(breakdown.uncertainty.optimized.typical_gco2e, 1)} g
                 </p>

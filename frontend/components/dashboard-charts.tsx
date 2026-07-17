@@ -4,7 +4,6 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
-  Cell,
   Legend,
   Line,
   LineChart,
@@ -32,12 +31,6 @@ type EnergyPoint = {
   energy_consumed_kwh?: number
   estimated_co2e?: number
   docs_processed?: number
-}
-
-type ModelBar = {
-  model: string
-  estimated_gco2e: number
-  is_ours: boolean
 }
 
 function fmt(value: number | undefined | null, digits = 2) {
@@ -72,22 +65,9 @@ function EnergyTooltip({ active, payload, label }: any) {
   )
 }
 
-function ModelTooltip({ active, payload }: any) {
-  if (!active || !payload?.length) return null
-  const row = payload[0]?.payload as ModelBar
-  return (
-    <div className="rounded-lg border border-border bg-card px-3 py-2 text-xs shadow-xl">
-      <p className="font-semibold mb-1">{row.model}</p>
-      <p>Estimated CO₂e: {fmt(row.estimated_gco2e)} g</p>
-      {row.is_ours ? <p className="text-emerald-400">Our system</p> : null}
-    </div>
-  )
-}
-
 type Props = {
   carbonTrend: TrendPoint[]
   energyTrend: EnergyPoint[]
-  modelBars?: ModelBar[]
   sparse: boolean
   emptyMessage: string
 }
@@ -95,20 +75,25 @@ type Props = {
 export default function DashboardCharts({
   carbonTrend,
   energyTrend,
-  modelBars = [],
   sparse,
   emptyMessage,
 }: Props) {
-  const showModels = modelBars.length > 0
+  const showEnergy = energyTrend.length > 0 || !sparse
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+    <div
+      className={
+        showEnergy
+          ? "grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6"
+          : "grid grid-cols-1 gap-6 mb-6"
+      }
+    >
       <ChartCard title="Daily Carbon Savings vs Baseline" delay={0.2}>
         {sparse ? (
           <div className="space-y-4">
             <p className="text-sm text-muted-foreground">{emptyMessage}</p>
             {carbonTrend.length > 0 ? (
-              <ResponsiveContainer width="100%" height={260}>
+              <ResponsiveContainer width="100%" height={260} minWidth={0}>
                 <BarChart data={carbonTrend}>
                   <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" />
                   <XAxis dataKey="date" stroke="rgba(255,255,255,0.45)" />
@@ -127,7 +112,7 @@ export default function DashboardCharts({
             )}
           </div>
         ) : (
-          <ResponsiveContainer width="100%" height={300}>
+          <ResponsiveContainer width="100%" height={300} minWidth={0}>
             <LineChart data={carbonTrend}>
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" />
               <XAxis dataKey="date" stroke="rgba(255,255,255,0.45)" />
@@ -163,87 +148,66 @@ export default function DashboardCharts({
         )}
       </ChartCard>
 
-      <ChartCard
-        title={showModels ? "Model CO₂e (same as Results)" : "Energy & Processing Trends"}
-        delay={0.25}
-      >
-        {showModels ? (
-          <ResponsiveContainer width="100%" height={sparse ? 260 : 300}>
-            <BarChart data={modelBars} layout="vertical" margin={{ left: 8, right: 12 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" />
-              <XAxis type="number" stroke="rgba(255,255,255,0.45)" />
-              <YAxis
-                type="category"
-                dataKey="model"
-                width={110}
-                stroke="rgba(255,255,255,0.45)"
-                tick={{ fontSize: 11 }}
-              />
-              <Tooltip content={<ModelTooltip />} />
-              <Bar dataKey="estimated_gco2e" name="g CO₂e" radius={4}>
-                {modelBars.map((b, i) => (
-                  <Cell key={`${b.model}-${i}`} fill={b.is_ours ? "#22c55e" : "#64748b"} />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        ) : sparse ? (
-          <div className="space-y-4">
-            <p className="text-sm text-muted-foreground">{emptyMessage}</p>
-            {energyTrend.length > 0 ? (
-              <ResponsiveContainer width="100%" height={260}>
-                <BarChart data={energyTrend}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" />
-                  <XAxis dataKey="date" stroke="rgba(255,255,255,0.45)" />
-                  <YAxis stroke="rgba(255,255,255,0.45)" />
-                  <Tooltip content={<EnergyTooltip />} />
-                  <Legend />
-                  <Bar dataKey="estimated_co2e" name="Estimated CO₂" fill="#22c55e" radius={6} />
-                  <Bar dataKey="docs_processed" name="Documents" fill="#64748b" radius={6} />
-                </BarChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className="h-[260px] flex items-center justify-center text-sm text-muted-foreground">
-                No finalized job metrics yet.
-              </div>
-            )}
-          </div>
-        ) : (
-          <ResponsiveContainer width="100%" height={300}>
-            <LineChart data={energyTrend}>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" />
-              <XAxis dataKey="date" stroke="rgba(255,255,255,0.45)" />
-              <YAxis stroke="rgba(255,255,255,0.45)" />
-              <Tooltip content={<EnergyTooltip />} />
-              <Legend />
-              <Line
-                type="monotone"
-                dataKey="energy_consumed_kwh"
-                name="Energy (kWh)"
-                stroke="#f59e0b"
-                strokeWidth={2}
-                dot={{ r: 3 }}
-              />
-              <Line
-                type="monotone"
-                dataKey="estimated_co2e"
-                name="Estimated CO₂"
-                stroke="#22c55e"
-                strokeWidth={2}
-                dot={{ r: 3 }}
-              />
-              <Line
-                type="monotone"
-                dataKey="docs_processed"
-                name="Documents"
-                stroke="#64748b"
-                strokeWidth={2}
-                dot={{ r: 3 }}
-              />
-            </LineChart>
-          </ResponsiveContainer>
-        )}
-      </ChartCard>
+      {showEnergy ? (
+        <ChartCard title="Energy & Processing Trends" delay={0.25}>
+          {sparse ? (
+            <div className="space-y-4">
+              <p className="text-sm text-muted-foreground">{emptyMessage}</p>
+              {energyTrend.length > 0 ? (
+                <ResponsiveContainer width="100%" height={260} minWidth={0}>
+                  <BarChart data={energyTrend}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" />
+                    <XAxis dataKey="date" stroke="rgba(255,255,255,0.45)" />
+                    <YAxis stroke="rgba(255,255,255,0.45)" />
+                    <Tooltip content={<EnergyTooltip />} />
+                    <Legend />
+                    <Bar dataKey="estimated_co2e" name="Estimated CO₂" fill="#22c55e" radius={6} />
+                    <Bar dataKey="docs_processed" name="Documents" fill="#64748b" radius={6} />
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="h-[260px] flex items-center justify-center text-sm text-muted-foreground">
+                  No finalized job metrics yet.
+                </div>
+              )}
+            </div>
+          ) : (
+            <ResponsiveContainer width="100%" height={300} minWidth={0}>
+              <LineChart data={energyTrend}>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" />
+                <XAxis dataKey="date" stroke="rgba(255,255,255,0.45)" />
+                <YAxis stroke="rgba(255,255,255,0.45)" />
+                <Tooltip content={<EnergyTooltip />} />
+                <Legend />
+                <Line
+                  type="monotone"
+                  dataKey="energy_consumed_kwh"
+                  name="Energy (kWh)"
+                  stroke="#f59e0b"
+                  strokeWidth={2}
+                  dot={{ r: 3 }}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="estimated_co2e"
+                  name="Estimated CO₂"
+                  stroke="#22c55e"
+                  strokeWidth={2}
+                  dot={{ r: 3 }}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="docs_processed"
+                  name="Documents"
+                  stroke="#64748b"
+                  strokeWidth={2}
+                  dot={{ r: 3 }}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          )}
+        </ChartCard>
+      ) : null}
     </div>
   )
 }

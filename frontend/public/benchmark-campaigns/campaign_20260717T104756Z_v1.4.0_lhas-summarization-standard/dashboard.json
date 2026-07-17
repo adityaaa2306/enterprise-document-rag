@@ -1,0 +1,465 @@
+{
+  "schema_version": "1.2.0",
+  "campaign_id": "campaign_20260717T104756Z_v1.4.0_lhas-summarization-standard",
+  "generated_at_utc": "2026-07-17T10:50:04.818579+00:00",
+  "workload": "document_summarization",
+  "models": [
+    "intelligent-router",
+    "gpt-5-nano",
+    "gpt-5-mini",
+    "gpt-5.5"
+  ],
+  "charts": {
+    "latency_comparison": {
+      "unit": "ms",
+      "labels": [
+        "intelligent-router",
+        "gpt-5-nano",
+        "gpt-5-mini",
+        "gpt-5.5"
+      ],
+      "series": [
+        {
+          "model": "intelligent-router",
+          "avg_latency_ms": 75526.951,
+          "p50_latency_ms": 75526.951,
+          "p95_latency_ms": 75526.951
+        },
+        {
+          "model": "gpt-5-nano",
+          "avg_latency_ms": 6205.153,
+          "p50_latency_ms": 6205.153,
+          "p95_latency_ms": 6205.153
+        },
+        {
+          "model": "gpt-5-mini",
+          "avg_latency_ms": 9365.087,
+          "p50_latency_ms": 9365.087,
+          "p95_latency_ms": 9365.087
+        },
+        {
+          "model": "gpt-5.5",
+          "avg_latency_ms": 10951.051,
+          "p50_latency_ms": 10951.051,
+          "p95_latency_ms": 10951.051
+        }
+      ]
+    },
+    "ttft_comparison": {
+      "unit": "ms",
+      "labels": [
+        "intelligent-router",
+        "gpt-5-nano",
+        "gpt-5-mini",
+        "gpt-5.5"
+      ],
+      "series": [
+        {
+          "model": "intelligent-router",
+          "avg_ttft_ms": 557.833
+        },
+        {
+          "model": "gpt-5-nano",
+          "avg_ttft_ms": null
+        },
+        {
+          "model": "gpt-5-mini",
+          "avg_ttft_ms": 4585.477
+        },
+        {
+          "model": "gpt-5.5",
+          "avg_ttft_ms": 2052.174
+        }
+      ]
+    },
+    "tokens_per_sec": {
+      "unit": "tokens/s",
+      "labels": [
+        "intelligent-router",
+        "gpt-5-nano",
+        "gpt-5-mini",
+        "gpt-5.5"
+      ],
+      "series": [
+        {
+          "model": "intelligent-router",
+          "avg_tokens_per_sec": 12.7769
+        },
+        {
+          "model": "gpt-5-nano",
+          "avg_tokens_per_sec": 128.9251
+        },
+        {
+          "model": "gpt-5-mini",
+          "avg_tokens_per_sec": 85.4237
+        },
+        {
+          "model": "gpt-5.5",
+          "avg_tokens_per_sec": 73.0523
+        }
+      ]
+    },
+    "prompt_vs_completion_tokens": {
+      "unit": "tokens",
+      "labels": [
+        "intelligent-router",
+        "gpt-5-nano",
+        "gpt-5-mini",
+        "gpt-5.5"
+      ],
+      "series": [
+        {
+          "model": "intelligent-router",
+          "avg_prompt_tokens": 10116.0,
+          "avg_completion_tokens": 965.0
+        },
+        {
+          "model": "gpt-5-nano",
+          "avg_prompt_tokens": 8658.0,
+          "avg_completion_tokens": 800.0
+        },
+        {
+          "model": "gpt-5-mini",
+          "avg_prompt_tokens": 8658.0,
+          "avg_completion_tokens": 800.0
+        },
+        {
+          "model": "gpt-5.5",
+          "avg_prompt_tokens": 8658.0,
+          "avg_completion_tokens": 800.0
+        }
+      ]
+    },
+    "estimated_cost": {
+      "unit": "usd",
+      "labels": [
+        "intelligent-router",
+        "gpt-5-nano",
+        "gpt-5-mini",
+        "gpt-5.5"
+      ],
+      "series": [
+        {
+          "model": "intelligent-router",
+          "avg_estimated_api_cost_usd": 0.000665,
+          "total_estimated_api_cost_usd": 0.00066486
+        },
+        {
+          "model": "gpt-5-nano",
+          "avg_estimated_api_cost_usd": 0.000753,
+          "total_estimated_api_cost_usd": 0.0007529
+        },
+        {
+          "model": "gpt-5-mini",
+          "avg_estimated_api_cost_usd": 0.003765,
+          "total_estimated_api_cost_usd": 0.0037645
+        },
+        {
+          "model": "gpt-5.5",
+          "avg_estimated_api_cost_usd": 0.06729,
+          "total_estimated_api_cost_usd": 0.06729
+        }
+      ]
+    },
+    "estimated_energy": {
+      "unit": "Wh",
+      "labels": [
+        "intelligent-router",
+        "gpt-5-nano",
+        "gpt-5-mini",
+        "gpt-5.5"
+      ],
+      "series": [
+        {
+          "model": "intelligent-router",
+          "avg_estimated_energy_wh": 3.038795
+        },
+        {
+          "model": "gpt-5-nano",
+          "avg_estimated_energy_wh": 2.598106
+        },
+        {
+          "model": "gpt-5-mini",
+          "avg_estimated_energy_wh": 7.741576
+        },
+        {
+          "model": "gpt-5.5",
+          "avg_estimated_energy_wh": 19.668482
+        }
+      ]
+    },
+    "estimated_co2e": {
+      "unit": "gCO2e",
+      "labels": [
+        "intelligent-router",
+        "gpt-5-nano",
+        "gpt-5-mini",
+        "gpt-5.5"
+      ],
+      "series": [
+        {
+          "model": "intelligent-router",
+          "avg_estimated_co2e_g": 1.650066
+        },
+        {
+          "model": "gpt-5-nano",
+          "avg_estimated_co2e_g": 1.410771
+        },
+        {
+          "model": "gpt-5-mini",
+          "avg_estimated_co2e_g": 4.203676
+        },
+        {
+          "model": "gpt-5.5",
+          "avg_estimated_co2e_g": 10.679986
+        }
+      ]
+    },
+    "quality_overview": {
+      "unit": "score_0_100",
+      "labels": [
+        "intelligent-router",
+        "gpt-5-nano",
+        "gpt-5-mini",
+        "gpt-5.5"
+      ],
+      "series": [
+        {
+          "model": "intelligent-router",
+          "avg_quality_score": null,
+          "median_quality_score": null,
+          "avg_correctness": null,
+          "avg_completeness": null,
+          "avg_groundedness": null,
+          "avg_conciseness": null
+        },
+        {
+          "model": "gpt-5-nano",
+          "avg_quality_score": null,
+          "median_quality_score": null,
+          "avg_correctness": null,
+          "avg_completeness": null,
+          "avg_groundedness": null,
+          "avg_conciseness": null
+        },
+        {
+          "model": "gpt-5-mini",
+          "avg_quality_score": null,
+          "median_quality_score": null,
+          "avg_correctness": null,
+          "avg_completeness": null,
+          "avg_groundedness": null,
+          "avg_conciseness": null
+        },
+        {
+          "model": "gpt-5.5",
+          "avg_quality_score": null,
+          "median_quality_score": null,
+          "avg_correctness": null,
+          "avg_completeness": null,
+          "avg_groundedness": null,
+          "avg_conciseness": null
+        }
+      ]
+    },
+    "quality_distribution": {
+      "min": null,
+      "p25": null,
+      "p50": null,
+      "p75": null,
+      "max": null
+    },
+    "quality_vs_latency": {
+      "unit": "mixed",
+      "points": []
+    },
+    "quality_vs_cost": {
+      "unit": "mixed",
+      "points": []
+    },
+    "quality_vs_co2e": {
+      "unit": "mixed",
+      "points": []
+    },
+    "quality_vs_throughput": {
+      "unit": "mixed",
+      "points": []
+    }
+  },
+  "table": {
+    "per_model": [
+      {
+        "model": "intelligent-router",
+        "n_runs": 1,
+        "n_ok": 1,
+        "n_failed": 0,
+        "avg_latency_ms": 75526.951,
+        "p50_latency_ms": 75526.951,
+        "p95_latency_ms": 75526.951,
+        "avg_ttft_ms": 557.833,
+        "avg_tokens_per_sec": 12.7769,
+        "avg_prompt_tokens": 10116.0,
+        "avg_completion_tokens": 965.0,
+        "avg_estimated_api_cost_usd": 0.000665,
+        "total_estimated_api_cost_usd": 0.00066486,
+        "avg_estimated_energy_wh": 3.038795,
+        "avg_estimated_co2e_g": 1.650066,
+        "avg_quality_score": null,
+        "median_quality_score": null,
+        "avg_correctness": null,
+        "avg_completeness": null,
+        "avg_groundedness": null,
+        "avg_conciseness": null,
+        "n_quality_scored": 0,
+        "avg_summary_length": 3863.0
+      },
+      {
+        "model": "gpt-5-nano",
+        "n_runs": 1,
+        "n_ok": 1,
+        "n_failed": 0,
+        "avg_latency_ms": 6205.153,
+        "p50_latency_ms": 6205.153,
+        "p95_latency_ms": 6205.153,
+        "avg_ttft_ms": null,
+        "avg_tokens_per_sec": 128.9251,
+        "avg_prompt_tokens": 8658.0,
+        "avg_completion_tokens": 800.0,
+        "avg_estimated_api_cost_usd": 0.000753,
+        "total_estimated_api_cost_usd": 0.0007529,
+        "avg_estimated_energy_wh": 2.598106,
+        "avg_estimated_co2e_g": 1.410771,
+        "avg_quality_score": null,
+        "median_quality_score": null,
+        "avg_correctness": null,
+        "avg_completeness": null,
+        "avg_groundedness": null,
+        "avg_conciseness": null,
+        "n_quality_scored": 0,
+        "avg_summary_length": 0.0
+      },
+      {
+        "model": "gpt-5-mini",
+        "n_runs": 1,
+        "n_ok": 1,
+        "n_failed": 0,
+        "avg_latency_ms": 9365.087,
+        "p50_latency_ms": 9365.087,
+        "p95_latency_ms": 9365.087,
+        "avg_ttft_ms": 4585.477,
+        "avg_tokens_per_sec": 85.4237,
+        "avg_prompt_tokens": 8658.0,
+        "avg_completion_tokens": 800.0,
+        "avg_estimated_api_cost_usd": 0.003765,
+        "total_estimated_api_cost_usd": 0.0037645,
+        "avg_estimated_energy_wh": 7.741576,
+        "avg_estimated_co2e_g": 4.203676,
+        "avg_quality_score": null,
+        "median_quality_score": null,
+        "avg_correctness": null,
+        "avg_completeness": null,
+        "avg_groundedness": null,
+        "avg_conciseness": null,
+        "n_quality_scored": 0,
+        "avg_summary_length": 2143.0
+      },
+      {
+        "model": "gpt-5.5",
+        "n_runs": 1,
+        "n_ok": 1,
+        "n_failed": 0,
+        "avg_latency_ms": 10951.051,
+        "p50_latency_ms": 10951.051,
+        "p95_latency_ms": 10951.051,
+        "avg_ttft_ms": 2052.174,
+        "avg_tokens_per_sec": 73.0523,
+        "avg_prompt_tokens": 8658.0,
+        "avg_completion_tokens": 800.0,
+        "avg_estimated_api_cost_usd": 0.06729,
+        "total_estimated_api_cost_usd": 0.06729,
+        "avg_estimated_energy_wh": 19.668482,
+        "avg_estimated_co2e_g": 10.679986,
+        "avg_quality_score": null,
+        "median_quality_score": null,
+        "avg_correctness": null,
+        "avg_completeness": null,
+        "avg_groundedness": null,
+        "avg_conciseness": null,
+        "n_quality_scored": 0,
+        "avg_summary_length": 3649.0
+      }
+    ]
+  },
+  "highlights": {
+    "fastest_model": {
+      "model": "gpt-5-nano",
+      "value": 6205.153,
+      "metric": "avg_latency_ms"
+    },
+    "highest_tokens_per_sec": {
+      "model": "gpt-5-nano",
+      "value": 128.9251,
+      "metric": "avg_tokens_per_sec"
+    },
+    "lowest_estimated_cost": {
+      "model": "intelligent-router",
+      "value": 0.00066486,
+      "metric": "total_estimated_api_cost_usd"
+    },
+    "lowest_estimated_co2e": {
+      "model": "gpt-5-nano",
+      "value": 1.410771,
+      "metric": "avg_estimated_co2e_g"
+    },
+    "best_quality_model": null
+  },
+  "quality": {
+    "avg_quality_score": null,
+    "median_quality_score": null,
+    "best_quality_model": null,
+    "n_scored": 0,
+    "distribution": {
+      "min": null,
+      "p25": null,
+      "p50": null,
+      "p75": null,
+      "max": null
+    },
+    "insights": [
+      "Quality scores were unavailable for this campaign (no reference answers or all evaluations skipped)."
+    ],
+    "evaluator": "default_composite_v1"
+  },
+  "totals": {
+    "total_api_cost_usd": 0.07247226,
+    "total_runtime_sec": 109.711,
+    "total_prompt_tokens": 36090,
+    "total_completion_tokens": 3365,
+    "total_tokens": 39455,
+    "questions": 1,
+    "avg_quality_score": null,
+    "median_quality_score": null
+  },
+  "reproducibility": {
+    "benchmark_version": "1.4.0",
+    "workload": "document_summarization",
+    "retrieval_version": null,
+    "document_freeze_version": "chunks-ordered-v1",
+    "prompt_version": "summarize-frozen-v1",
+    "document_id": "f3bbda03-2ac2-4e4b-bd01-7b6be7f81895",
+    "timestamp_utc": "2026-07-17T10:48:14.995293+00:00",
+    "suite": "summarization-standard",
+    "questions": [
+      {
+        "question": "Generate a document summary",
+        "document_id": "f3bbda03-2ac2-4e4b-bd01-7b6be7f81895",
+        "context_hash": "586736d7d23a402f63c8130666311f5d936f197035df63bec4d38374c93422be",
+        "prompt_hash": "2517fe4d6640926a69e9c155e5f363c4e5606f40659f5c5865f9f4f1f48a15bc",
+        "chunk_count": 12,
+        "prompt_version": "summarize-frozen-v1",
+        "retrieval_version": null
+      }
+    ],
+    "quality_evaluator": "default_composite_v1"
+  }
+}

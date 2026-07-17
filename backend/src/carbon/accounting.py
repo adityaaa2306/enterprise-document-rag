@@ -780,3 +780,215 @@ def estimate_workflow_carbon(
             "global_recompile_ms": compile_meta.get("global_recompile_ms"),
         },
     }
+
+
+RAG_QUERY_METHODOLOGY_TEXT = (
+    "Interactive RAG CO₂e (Reporting Boundary A) for a single query: "
+    "query embedding + retrieval + LLM prompt/completion inference. "
+    f"Facility energy = compute joules × PUE ({A.PUE}) × infrastructure factor "
+    f"({A.INFRASTRUCTURE_FACTOR}). Same energy model constants as Document Processing; "
+    "this estimate is independent of job map/compile carbon and is not added to "
+    "document Optimized/Baseline CO₂e."
+)
+
+
+def _resolve_grid_for_query(
+    grid: Optional[Mapping[str, Any]] = None,
+    *,
+    estimated_tokens: int = 0,
+) -> Dict[str, Any]:
+    """Grid intensity via Region Scheduler (never call Electricity Maps here)."""
+    if grid is not None:
+        return dict(grid)
+    from src.carbon.scheduler import WorkloadEstimate, schedule_region
+
+    decision = schedule_region(
+        WorkloadEstimate(
+            estimated_tokens=max(0, int(estimated_tokens or 0)),
+            estimated_chunks=0,
+            meta={"workload": "interactive_rag_query"},
+        )
+    )
+    return decision.grid.to_legacy_dict()
+
+
+def estimate_rag_query_carbon(
+    *,
+    query_tokens: int = 0,
+    retrieved_context_tokens: int = 0,
+    prompt_tokens: int = 0,
+    output_tokens: int = 0,
+    inference_tier: str = "heavy",
+    retrieval_hits: Optional[int] = None,
+    include_query_embedding: bool = True,
+    grid: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Per-query Interactive RAG carbon estimate (Boundary A).
+
+    Independent of ``estimate_workflow_carbon`` (document processing). Reuses the
+    same J/token, PUE, and grid-intensity helpers.
+    """
+    q_tok = max(0, int(query_tokens or 0))
+    ctx_tok = max(0, int(retrieved_context_tokens or 0))
+    prompt_tok = max(0, int(prompt_tokens or 0))
+    out_tok = max(0, int(output_tokens or 0))
+    tier = str(inference_tier or "heavy").lower()
+    if tier not in ("light", "medium", "heavy"):
+        tier = "heavy"
+
+    hits = retrieval_hits
+    if hits is None:
+        # Approximate hits from packed context (same 350-tok chunk heuristic as energy_model).
+        hits = max(1, int(math.ceil(ctx_tok / 350.0))) if ctx_tok > 0 else 0
+    hits = max(0, int(hits))
+
+    embedding_j = (
+        float(q_tok) * float(A.EMBEDDING_J_PER_TOKEN) if include_query_embedding else 0.0
+    )
+    retrieval_j = (
+        float(A.RETRIEVAL_BASE_J) + float(hits) * float(A.RETRIEVAL_J_PER_HIT)
+        if hits > 0 or ctx_tok > 0
+        else 0.0
+    )
+    prompt_j = inference_joules(prompt_tok, tier=tier)
+    completion_j = inference_joules(out_tok, tier=tier)
+    llm_j = prompt_j + completion_j
+
+    stages_j = {
+        "query_embedding_j": embedding_j,
+        "retrieval_j": retrieval_j,
+        "prompt_inference_j": prompt_j,
+        "completion_inference_j": completion_j,
+        "llm_inference_j": llm_j,
+    }
+    compute_j = sum(
+        stages_j[k]
+        for k in (
+            "query_embedding_j",
+            "retrieval_j",
+            "prompt_inference_j",
+            "completion_inference_j",
+        )
+    )
+    facility_j = apply_facility_overhead(compute_j)
+    energy_kwh = joules_to_kwh(facility_j)
+
+    grid_info = _resolve_grid_for_query(
+        grid, estimated_tokens=prompt_tok + out_tok + q_tok + ctx_tok
+    )
+    intensity = float(grid_info.get("intensity_gco2_kwh") or 0.0)
+    co2e_g = energy_to_co2e_g(energy_kwh, intensity)
+
+    def _stage_co2(stage_j: float) -> float:
+        return energy_to_co2e_g(joules_to_kwh(apply_facility_overhead(stage_j)), intensity)
+
+    stages_gco2e = {
+        "query_embedding_gco2e": round(_stage_co2(embedding_j), 6),
+        "retrieval_gco2e": round(_stage_co2(retrieval_j), 6),
+        "prompt_inference_gco2e": round(_stage_co2(prompt_j), 6),
+        "completion_inference_gco2e": round(_stage_co2(completion_j), 6),
+        "llm_inference_gco2e": round(_stage_co2(llm_j), 6),
+    }
+    stages_wh = {
+        "query_embedding_wh": round(
+            joules_to_kwh(apply_facility_overhead(embedding_j)) * 1000.0, 6
+        ),
+        "retrieval_wh": round(
+            joules_to_kwh(apply_facility_overhead(retrieval_j)) * 1000.0, 6
+        ),
+        "prompt_inference_wh": round(
+            joules_to_kwh(apply_facility_overhead(prompt_j)) * 1000.0, 6
+        ),
+        "completion_inference_wh": round(
+            joules_to_kwh(apply_facility_overhead(completion_j)) * 1000.0, 6
+        ),
+        "llm_inference_wh": round(
+            joules_to_kwh(apply_facility_overhead(llm_j)) * 1000.0, 6
+        ),
+    }
+
+    return {
+        "workload": "interactive_rag",
+        "label": "Interactive RAG CO₂e",
+        "estimated_gco2e": round(float(co2e_g), 6),
+        "estimated_energy_kwh": round(float(energy_kwh), 9),
+        "estimated_energy_wh": round(float(energy_kwh) * 1000.0, 6),
+        "grid_intensity_gco2_kwh": round(float(intensity), 2),
+        "grid_zone": grid_info.get("zone"),
+        "grid_source": grid_info.get("source"),
+        "inference_tier": tier,
+        "tokens": {
+            "query_tokens": q_tok,
+            "retrieved_context_tokens": ctx_tok,
+            "prompt_tokens": prompt_tok,
+            "output_tokens": out_tok,
+            "retrieval_hits": hits,
+        },
+        "stages_gco2e": stages_gco2e,
+        "stages_wh": stages_wh,
+        "stages_j": {k: round(float(v), 4) for k, v in stages_j.items()},
+        "pue": A.PUE,
+        "infrastructure_factor": A.INFRASTRUCTURE_FACTOR,
+        "reporting_boundary": "A_operational",
+        "methodology": RAG_QUERY_METHODOLOGY_TEXT,
+        "independent_of_document_processing": True,
+    }
+
+
+def estimate_rag_query_carbon_from_latency(
+    latency: Optional[Mapping[str, Any]] = None,
+    *,
+    query: str = "",
+    answer: str = "",
+    sources: Optional[List[Any]] = None,
+    inference_tier: str = "heavy",
+    pack_tokens_used: Optional[int] = None,
+    grid: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Convenience: build a RAG carbon estimate from ResponseAgent latency.meta.prompt
+    (or fall back to token estimates from query/answer/sources).
+    """
+    meta = {}
+    if isinstance(latency, Mapping):
+        meta = dict(latency.get("meta") or {})
+    prompt = meta.get("prompt") if isinstance(meta.get("prompt"), Mapping) else {}
+
+    query_tokens = int(prompt.get("user_query_tokens") or 0)
+    if query_tokens <= 0 and query:
+        query_tokens = estimate_tokens(query)
+
+    ctx_tokens = int(prompt.get("retrieved_context_tokens") or 0)
+    if ctx_tokens <= 0 and pack_tokens_used is not None:
+        ctx_tokens = int(pack_tokens_used)
+    if ctx_tokens <= 0 and sources:
+        joined = "\n".join(str(s or "") for s in sources[:40])
+        ctx_tokens = estimate_tokens(joined)
+
+    prompt_tokens = int(prompt.get("final_prompt_tokens") or 0)
+    if prompt_tokens <= 0:
+        prompt_tokens = max(
+            query_tokens + ctx_tokens,
+            int(prompt.get("system_tokens") or 0) + query_tokens + ctx_tokens,
+        )
+
+    output_tokens = int(prompt.get("output_tokens") or 0)
+    if output_tokens <= 0 and answer:
+        output_tokens = estimate_tokens(answer)
+
+    tier = str(inference_tier or "heavy")
+    # Prefer routing tier from latency meta when present
+    if isinstance(meta.get("nim"), Mapping) and meta["nim"].get("tier"):
+        tier = str(meta["nim"].get("tier"))
+
+    return estimate_rag_query_carbon(
+        query_tokens=query_tokens,
+        retrieved_context_tokens=ctx_tokens,
+        prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens,
+        inference_tier=tier,
+        retrieval_hits=len(sources) if sources else None,
+        include_query_embedding=True,
+        grid=grid,
+    )

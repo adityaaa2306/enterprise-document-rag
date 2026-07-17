@@ -7,7 +7,7 @@ import { TopBar } from "@/components/top-bar"
 import { GuestOwnerGate } from "@/components/guest-owner-gate"
 import { KPICard } from "@/components/kpi-card"
 import { DocumentHistory } from "@/components/document-history"
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useState } from "react"
 import { Leaf, Scale, TrendingDown, Gauge } from "lucide-react"
 import { Card } from "@/components/ui/card"
 import { Label } from "@/components/ui/label"
@@ -24,7 +24,6 @@ import { DashboardChartsSkeleton } from "@/components/loading-skeletons"
 import { useFinalizedMetrics } from "@/hooks/use-finalized-metrics"
 import { useHistoricalAnalytics } from "@/hooks/use-historical-analytics"
 import type { RangeKey } from "@/lib/historical-analytics-store"
-import { chartsFromFinalizedMetrics } from "@/lib/finalized-metrics-store"
 import { fmtG, fmtIntensity, fmtPct } from "@/lib/job-results-metrics"
 import { isGuestMode } from "@/lib/guest-session"
 
@@ -98,16 +97,6 @@ export default function Dashboard() {
   useEffect(() => {
     if (personaReady && isGuest && view !== "latest") setView("latest")
   }, [personaReady, isGuest, view])
-
-  const latestCharts = useMemo(() => {
-    if (!metrics) {
-      return { modelBars: [] as ReturnType<typeof chartsFromFinalizedMetrics>["modelBars"] }
-    }
-    return chartsFromFinalizedMetrics(
-      metrics,
-      jobId ? `Job ${jobId.slice(0, 8)}` : "Latest job",
-    )
-  }, [metrics, jobId])
 
   const histSparse = (stats?.point_count ?? stats?.carbon_trend?.length ?? 0) < 2
   const histEmpty =
@@ -338,7 +327,7 @@ export default function Dashboard() {
                   sparse={histSparse}
                   emptyMessage={histEmpty}
                 />
-              ) : metrics && latestCharts.modelBars.length > 0 ? (
+              ) : metrics ? (
                 <DashboardCharts
                   carbonTrend={[
                     {
@@ -351,7 +340,6 @@ export default function Dashboard() {
                     },
                   ]}
                   energyTrend={[]}
-                  modelBars={latestCharts.modelBars}
                   sparse
                   emptyMessage="Latest job — identical metrics object fields as Results."
                 />

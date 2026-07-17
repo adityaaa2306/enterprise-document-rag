@@ -1,0 +1,31 @@
+{
+  "campaign_id": "campaign_20260717T082403Z_v1.1.0_attendance-smoke-v1",
+  "benchmark_version": "1.1.0",
+  "retrieval_version": "hybrid-rrf-rerank-v1",
+  "prompt_version": "qa-frozen-v1",
+  "suite": "smoke",
+  "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+  "filename": null,
+  "models": [
+    "gpt-5-nano",
+    "gpt-5-mini",
+    "gpt-5.5"
+  ],
+  "questions": [
+    "What is the main purpose of this application?",
+    "Who are the primary users or stakeholders?",
+    "List the key features described in the document.",
+    "How does attendance tracking work according to the document?",
+    "What technologies or stack components are mentioned?"
+  ],
+  "question_count": 5,
+  "max_tokens": 500,
+  "temperature": 0.2,
+  "dry_run": false,
+  "assemble_tier": "heavy",
+  "protocol": {
+    "retrieve_once_per_question": true,
+    "consistency_gate_before_each_model": true,
+    "shared_frozen_prompt_across_models": true
+  }
+}

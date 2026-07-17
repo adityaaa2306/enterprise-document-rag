@@ -1,0 +1,138 @@
+{
+  "campaign_id": "campaign_20260717T093705Z_v1.4.0_rag-standard",
+  "benchmark_version": "1.4.0",
+  "workload": "interactive_rag",
+  "retrieval_version": "hybrid-rrf-rerank-v1",
+  "document_freeze_version": null,
+  "prompt_version": "qa-frozen-v1",
+  "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+  "timestamp_utc": "2026-07-17T09:37:17.295847+00:00",
+  "finished_utc": "2026-07-17T09:52:33.842112+00:00",
+  "suite": "full",
+  "models": [
+    "intelligent-router",
+    "gpt-5-nano",
+    "gpt-5-mini",
+    "gpt-5.5"
+  ],
+  "dry_run": false,
+  "total_runtime_sec": 916.545,
+  "total_api_cost_usd": 0.2900423,
+  "context_and_prompt_hashes": [
+    {
+      "question": "What is the main purpose of this application?",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "e5fc749e4ba37096ec8a0e5a588d701ef54974fa4494d0fcfecfc95b68b881a6",
+      "prompt_hash": "d135b8ab507ac0b645b68542170dfaa80c6db08d462c338439b2892b76954941",
+      "chunk_count": 2
+    },
+    {
+      "question": "Who are the primary users or stakeholders?",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "5fd57b98c9eafc78b1818e58c712870cb38252bc0946843bf6a24a83793bcb20",
+      "prompt_hash": "b0ad639cf500d0d7982a21058a99a697e67a9c87c9eccbeae4cb5183223320e7",
+      "chunk_count": 3
+    },
+    {
+      "question": "List the key features described in the document.",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "fa3a41079bc5a4d20152998c23e597a4694fe64bf95c9249aea08b9f5c89c47a",
+      "prompt_hash": "723d2ce37497caefbe2a944c2460d03ad2903d358019b75b094bdc8e8351e189",
+      "chunk_count": 4
+    },
+    {
+      "question": "How does attendance tracking work according to the document?",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "4f4c8607da265d64ee343db460a6639bc86fff18b0d5d58be6d28115d54bff21",
+      "prompt_hash": "9b102438efaf8ae86aad918b0bde77866448bf42c5ea340c5480d0937fffc999",
+      "chunk_count": 4
+    },
+    {
+      "question": "What technologies or stack components are mentioned?",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "e5fc749e4ba37096ec8a0e5a588d701ef54974fa4494d0fcfecfc95b68b881a6",
+      "prompt_hash": "7a2d3d4a95aca209157e6c9c269d3319f005644bab87cdb1b50a826acf05a4b3",
+      "chunk_count": 2
+    },
+    {
+      "question": "Summarize the system architecture in one paragraph.",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "59d1e0b3c9c06edf9d2f9fb470f762dc3d3976335e84b18a8612a2956e9191c3",
+      "prompt_hash": "a5b0005c668d8945f70d45f6a1f212891a6630e0a3999b8de7e942148401e9a8",
+      "chunk_count": 2
+    },
+    {
+      "question": "What problems does this application aim to solve?",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "5fd57b98c9eafc78b1818e58c712870cb38252bc0946843bf6a24a83793bcb20",
+      "prompt_hash": "1048498f8a2796191b04840c6ac645f9919ec5eed8c6aa3a78592c383fc11887",
+      "chunk_count": 3
+    },
+    {
+      "question": "Describe any authentication or role-based access mentioned.",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "b32f356526a45f061591257e538925e31a856c9be0e50f04f4db30ffca5e812c",
+      "prompt_hash": "dbb3af36c3b713a2b7544908600639704b7c312120c0182c9558b9c2aab0b7ba",
+      "chunk_count": 3
+    },
+    {
+      "question": "What reports or analytics does the system provide?",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "12b39e41475b07db87596f35c84ac24df8119bf5a5e02c816197d7f003bca2d8",
+      "prompt_hash": "d8119885e9cb86914a5ff66f50761c706a4db3d24add4e061ddba862b720f1bf",
+      "chunk_count": 3
+    },
+    {
+      "question": "List any limitations, risks, or future work mentioned.",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "26d029f6e110cc718a406b136423d9977ca735f191d9bac1c37a3ab8c7ba49b3",
+      "prompt_hash": "6a0feac2c292c03a92cec4b99500d2a0783b3e23adfe6f7a3bbceb80353ab769",
+      "chunk_count": 3
+    },
+    {
+      "question": "How is data stored or persisted?",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "b32f356526a45f061591257e538925e31a856c9be0e50f04f4db30ffca5e812c",
+      "prompt_hash": "7ae9407350caf5a0917135f85213e1fbe72d3bc28bcec915bd818ae7a427f732",
+      "chunk_count": 3
+    },
+    {
+      "question": "Explain the student registration or enrollment flow.",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "48d939e21d2a1e605377e430f3ffa4646656385677451127f7bfc2d6b103b5e9",
+      "prompt_hash": "78887d86d4533a0adfdf4dfe56c8d68d34d274b1728ab92ee69ddb79e9de4f28",
+      "chunk_count": 2
+    },
+    {
+      "question": "What UI screens or modules are described?",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "e5fc749e4ba37096ec8a0e5a588d701ef54974fa4494d0fcfecfc95b68b881a6",
+      "prompt_hash": "27f7a85606b615ca211d3622a8c85df9c25b4a7421d914e41d36eb8972dd2b40",
+      "chunk_count": 2
+    },
+    {
+      "question": "How are absences or late arrivals handled?",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "5fd57b98c9eafc78b1818e58c712870cb38252bc0946843bf6a24a83793bcb20",
+      "prompt_hash": "800284a832af72795a463fb2ac7b5790061a25100689487907a4da5b48c123eb",
+      "chunk_count": 3
+    },
+    {
+      "question": "Provide a concise executive summary of the document.",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "60220595acc1be1b319f7d27bd3d0a83bf6bdb4650cb1662fdecad4a62d88c36",
+      "prompt_hash": "740e87cc4430873cb7536c32639d08f45e3475427eaacfed81b00d61d8c272ff",
+      "chunk_count": 4
+    }
+  ],
+  "artifacts": {
+    "config": "config.json",
+    "metadata": "metadata.json",
+    "results": "results.json",
+    "summary": "summary.json",
+    "dashboard": "dashboard.json",
+    "report": "REPORT.md",
+    "execution_log": "execution.log"
+  },
+  "campaign_root": "D:\\green-agentic-rag-main\\benchmark_results\\campaigns\\campaign_20260717T093705Z_v1.4.0_rag-standard"
+}

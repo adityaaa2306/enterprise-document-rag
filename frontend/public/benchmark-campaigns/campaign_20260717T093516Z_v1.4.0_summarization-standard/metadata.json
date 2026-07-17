@@ -1,0 +1,40 @@
+{
+  "campaign_id": "campaign_20260717T093516Z_v1.4.0_summarization-standard",
+  "benchmark_version": "1.4.0",
+  "workload": "document_summarization",
+  "retrieval_version": null,
+  "document_freeze_version": "chunks-ordered-v1",
+  "prompt_version": "summarize-frozen-v1",
+  "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+  "timestamp_utc": "2026-07-17T09:35:24.800839+00:00",
+  "finished_utc": "2026-07-17T09:36:51.981400+00:00",
+  "suite": "summarization-standard",
+  "models": [
+    "intelligent-router",
+    "gpt-5-nano",
+    "gpt-5-mini",
+    "gpt-5.5"
+  ],
+  "dry_run": false,
+  "total_runtime_sec": 87.182,
+  "total_api_cost_usd": 0.0653692,
+  "context_and_prompt_hashes": [
+    {
+      "question": "Generate a document summary",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "624fd7aebd30c829e831bcd073f8ea68d4f986746c92c5ed8b3bdb85b25cdf2c",
+      "prompt_hash": "55190f47fe890ee77325b443fdd8e08dbcb86900636c4ee6e88b8f4f5a307011",
+      "chunk_count": 11
+    }
+  ],
+  "artifacts": {
+    "config": "config.json",
+    "metadata": "metadata.json",
+    "results": "results.json",
+    "summary": "summary.json",
+    "dashboard": "dashboard.json",
+    "report": "REPORT.md",
+    "execution_log": "execution.log"
+  },
+  "campaign_root": "D:\\green-agentic-rag-main\\benchmark_results\\campaigns\\campaign_20260717T093516Z_v1.4.0_summarization-standard"
+}

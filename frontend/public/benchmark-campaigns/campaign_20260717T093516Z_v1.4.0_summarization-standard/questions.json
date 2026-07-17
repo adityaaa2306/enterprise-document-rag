@@ -1,0 +1,302 @@
+{
+  "workload": "document_summarization",
+  "questions": [
+    {
+      "question": "Generate a document summary",
+      "task": "document_summarization",
+      "ok": true,
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "624fd7aebd30c829e831bcd073f8ea68d4f986746c92c5ed8b3bdb85b25cdf2c",
+      "prompt_hash": "55190f47fe890ee77325b443fdd8e08dbcb86900636c4ee6e88b8f4f5a307011",
+      "chunk_count": 11,
+      "reference_answer": "The Student Attendance App helps students track class attendance, mark present or absent status, monitor attendance percentages, and understand remaining allowable absences. Primary users are students, with instructors or administrators typically managing records. Key features include attendance marking, percentage calculation, and student-facing status views.",
+      "reference_summary": "The Student Attendance App helps students track class attendance, mark present or absent status, monitor attendance percentages, and understand remaining allowable absences. Primary users are students, with instructors or administrators typically managing records. Key features include attendance marking, percentage calculation, and student-facing status views.",
+      "model_runs": [
+        {
+          "model": "intelligent-router",
+          "model_returned": "meta/llama-3.1-8b-instruct",
+          "ok": true,
+          "error": null,
+          "answer": "# Product Overview\n\n## Core Value Proposition\n\n* Automatic attendance tracking and calculation\n* Predictive forecasting of semester outcomes\n* Smart skip recommendations based on real-time data\n* Peace of mind through intelligent alerts\n\n## Target Users\n\n* Primary: College and university students (16-25 years old)\n* Secondary: Coaching institute students, high school students with flexible schedules\n* Tertiary: Parents wanting to monitor their child's attendance\n\n## Key Differentiators\n\n* Skip Calculator: Shows exactly how many classes can be missed without dropping below requirements\n* Timetable OCR Upload: Zero-friction onboarding via photo/PDF upload\n* AI Attendance Assistant: Proactive agent that recommends actions before problems occur\n* Multi-mode Support: Works with fixed timetables, flexible schedules, or minimal data\n\n# Onboarding Flow\n\n## High-Level Onboarding Architecture\n\n* Layer 1: Authentication\n* Layer 2: Timetable Setup\n* Layer 3: Semester Context\n* Layer 4: Mid-Semester Attendance Status\n* Layer 5: Final Review\n* Layer 6: Dashboard\n\n## Onboarding Options\n\n* Option A: Upload Timetable (OCR)\n* Option B: Manual Setup\n* Option C: Minimal Mode\n\n## Timetable Setup\n\n* Option A: Upload Timetable (OCR)\n\t+ User uploads photo or PDF of their timetable\n\t+ OCR extracts subject names, days of the week, times, and period numbers\n\t+ User edits and confirms subjects, days, and times\n* Option B: Manual Setup\n\t+ User adds subjects one by one\n\t+ User sets up daily structure and custom schedule\n* Option C: Minimal Mode\n\t+ User adds subject names only\n\t+ User skips all day/time questions\n\t+ User proceeds directly to semester setup\n\n# Core Features\n\n## 1. Daily Attendance Marking\n\n* Location: Dashboard\n* Design: One-tap, beautiful, dopamine-driven\n* Features:\n\t+ Mark attendance as it happens (in real-time)\n\t+ Retroactively mark past classes\n\t+ Mark multiple days at once\n\n## 2. Skip Calculator\n\n* Location: Dashboard, card format\n* Answers the critical question: \"How many classes can I skip?\"\n* Data shown:\n\t+ Total classes held this semester\n\t+ Total classes you've attended\n\t+ Current attendance %\n\t+ Target attendance %\n\t+ Classes you can safely skip\n\t+ Classes you must attend\n\n## 3. Attendance Streaks\n\n* Location: Dashboard, gamified cards\n* Creates obsession through social proof and achievement:\n\t+ Daily Streak: Days in a row attended\n\t+ Subject Streaks: Consecutive attendances per subject\n\t+ Weekly Confidence Streaks: Perfect attendance weeks\n\t+ Monthly Badges: Special achievements (e.g., \"Perfect Month,\" \"Never Late\")\n\n## 4. Timetable Management\n\n* Features:\n\t+ Add/Edit Subjects: Quick forms to add or modify subject details\n\t+ Drag-and-Drop Reordering: For fixed daily mode, drag periods to reorder\n\t+ Day-by-Day Custom Schedule: For flex days mode, set different orders each day\n\t+ Copy-to-Week Button: Quickly replicate one day's schedule to others\n\t+ Auto-Generate: Create default schedule based on inputs, then refine\n\n## 5. Smart Predictions & Alerts\n\n* AI-Powered Assistant Insights:\n\t+ Continuously analyzes current attendance vs. requirement\n\t+ Days/weeks remaining\n\t+ Attendance trends\n\t+ Upcoming classes\n* Proactive Alerts:\n\t+ Danger Alert: \"Your Subject is at risk. You must attend 3 of the next 4 classes.\"\n\t+ Safe Alert: \"Your overall attendance is safe this week. You can skip one class guilt-free.\"\n\t+ Recovery Alert: \"To recover to 75% by semester end, attend",
+          "summary": "# Product Overview\n\n## Core Value Proposition\n\n* Automatic attendance tracking and calculation\n* Predictive forecasting of semester outcomes\n* Smart skip recommendations based on real-time data\n* Peace of mind through intelligent alerts\n\n## Target Users\n\n* Primary: College and university students (16-25 years old)\n* Secondary: Coaching institute students, high school students with flexible schedules\n* Tertiary: Parents wanting to monitor their child's attendance\n\n## Key Differentiators\n\n* Skip Calculator: Shows exactly how many classes can be missed without dropping below requirements\n* Timetable OCR Upload: Zero-friction onboarding via photo/PDF upload\n* AI Attendance Assistant: Proactive agent that recommends actions before problems occur\n* Multi-mode Support: Works with fixed timetables, flexible schedules, or minimal data\n\n# Onboarding Flow\n\n## High-Level Onboarding Architecture\n\n* Layer 1: Authentication\n* Layer 2: Timetable Setup\n* Layer 3: Semester Context\n* Layer 4: Mid-Semester Attendance Status\n* Layer 5: Final Review\n* Layer 6: Dashboard\n\n## Onboarding Options\n\n* Option A: Upload Timetable (OCR)\n* Option B: Manual Setup\n* Option C: Minimal Mode\n\n## Timetable Setup\n\n* Option A: Upload Timetable (OCR)\n\t+ User uploads photo or PDF of their timetable\n\t+ OCR extracts subject names, days of the week, times, and period numbers\n\t+ User edits and confirms subjects, days, and times\n* Option B: Manual Setup\n\t+ User adds subjects one by one\n\t+ User sets up daily structure and custom schedule\n* Option C: Minimal Mode\n\t+ User adds subject names only\n\t+ User skips all day/time questions\n\t+ User proceeds directly to semester setup\n\n# Core Features\n\n## 1. Daily Attendance Marking\n\n* Location: Dashboard\n* Design: One-tap, beautiful, dopamine-driven\n* Features:\n\t+ Mark attendance as it happens (in real-time)\n\t+ Retroactively mark past classes\n\t+ Mark multiple days at once\n\n## 2. Skip Calculator\n\n* Location: Dashboard, card format\n* Answers the critical question: \"How many classes can I skip?\"\n* Data shown:\n\t+ Total classes held this semester\n\t+ Total classes you've attended\n\t+ Current attendance %\n\t+ Target attendance %\n\t+ Classes you can safely skip\n\t+ Classes you must attend\n\n## 3. Attendance Streaks\n\n* Location: Dashboard, gamified cards\n* Creates obsession through social proof and achievement:\n\t+ Daily Streak: Days in a row attended\n\t+ Subject Streaks: Consecutive attendances per subject\n\t+ Weekly Confidence Streaks: Perfect attendance weeks\n\t+ Monthly Badges: Special achievements (e.g., \"Perfect Month,\" \"Never Late\")\n\n## 4. Timetable Management\n\n* Features:\n\t+ Add/Edit Subjects: Quick forms to add or modify subject details\n\t+ Drag-and-Drop Reordering: For fixed daily mode, drag periods to reorder\n\t+ Day-by-Day Custom Schedule: For flex days mode, set different orders each day\n\t+ Copy-to-Week Button: Quickly replicate one day's schedule to others\n\t+ Auto-Generate: Create default schedule based on inputs, then refine\n\n## 5. Smart Predictions & Alerts\n\n* AI-Powered Assistant Insights:\n\t+ Continuously analyzes current attendance vs. requirement\n\t+ Days/weeks remaining\n\t+ Attendance trends\n\t+ Upcoming classes\n* Proactive Alerts:\n\t+ Danger Alert: \"Your Subject is at risk. You must attend 3 of the next 4 classes.\"\n\t+ Safe Alert: \"Your overall attendance is safe this week. You can skip one class guilt-free.\"\n\t+ Recovery Alert: \"To recover to 75% by semester end, attend",
+          "summary_length": 3420,
+          "summary_chars": 3420,
+          "summary_words": 530,
+          "latency_ms": 44031.421,
+          "ttft_ms": 1751.697,
+          "tokens_per_sec": 19.418,
+          "prompt_tokens": 7735,
+          "completion_tokens": 855,
+          "total_tokens": 8590,
+          "estimated_api_cost_usd": 0.0005154,
+          "estimated_energy_wh": 2.361844,
+          "estimated_co2e_g": 1.235245,
+          "finish_reason": null,
+          "participant_kind": "system_router",
+          "routing": {
+            "participant": "intelligent-router",
+            "display_name": "Intelligent Router",
+            "execution_path": "in_process_nim_summarization_via_routing_decision",
+            "http_bypassed": true,
+            "selected_model": "meta/llama-3.1-8b-instruct",
+            "model_used": "meta/llama-3.1-8b-instruct",
+            "model_chain": [
+              "mistralai/ministral-14b-instruct-2512",
+              "meta/llama-3.1-8b-instruct",
+              "meta/llama-3.1-70b-instruct"
+            ],
+            "tier": "medium",
+            "compile_tier": "medium",
+            "mode": "automatic",
+            "fallbacks": [
+              "meta/llama-3.1-8b-instruct",
+              "mistralai/mistral-nemotron"
+            ],
+            "compile_fallbacks": [
+              "mistralai/ministral-14b-instruct-2512",
+              "meta/llama-3.1-8b-instruct"
+            ],
+            "reason_summary": "Document Type = technical_documentation; Reasoning = 0.1775; Retrieval Confidence = 0.5156; OCR Confidence = 0.85; Carbon = 700.0 gCO2/kWh; Routing Preference = automatic; Selected = meta/llama-3.1-8b-instruct (light)",
+            "policy_version": "cre-v1.0",
+            "utility": 0.5672,
+            "crs": 0.2939,
+            "document_type": "technical_documentation",
+            "signals": {
+              "coherence": 0.4295,
+              "reasoning": 0.1775,
+              "structural": 0.1239,
+              "ocr_confidence": 0.85,
+              "carbon_gco2_kwh": 700.0,
+              "latency_budget_ms": 8000,
+              "retrieval_confidence": 0.5156
+            },
+            "routing_decision_present": true,
+            "call_meta": {
+              "chain_slices": {
+                "role": "map",
+                "wall_sec": 90.0,
+                "fractions": [
+                  0.45,
+                  0.35,
+                  0.2
+                ],
+                "attempts": [
+                  {
+                    "model_id": "mistralai/ministral-14b-instruct-2512",
+                    "position": 0,
+                    "allocated_sec": 37.7,
+                    "used_sec": 37.719,
+                    "outcome": "timeout_slice",
+                    "error": "slice_timeout after 37.7s (alloc=37.7s)"
+                  },
+                  {
+                    "model_id": "meta/llama-3.1-8b-instruct",
+                    "position": 1,
+                    "allocated_sec": 31.1,
+                    "used_sec": 6.312,
+                    "outcome": "success",
+                    "error": null
+                  },
+                  {
+                    "model_id": "meta/llama-3.1-70b-instruct",
+                    "position": 2,
+                    "allocated_sec": 21.2,
+                    "used_sec": 0.0,
+                    "outcome": "pending",
+                    "error": null
+                  }
+                ]
+              },
+              "chain_slice_plan": [
+                {
+                  "model_id": "mistralai/ministral-14b-instruct-2512",
+                  "allocated_sec": 37.7
+                },
+                {
+                  "model_id": "meta/llama-3.1-8b-instruct",
+                  "allocated_sec": 31.1
+                },
+                {
+                  "model_id": "meta/llama-3.1-70b-instruct",
+                  "allocated_sec": 21.2
+                }
+              ],
+              "endpoint_role": "map",
+              "fallback_used": false
+            },
+            "workload": "document_summarization"
+          },
+          "quality": {
+            "quality_score": 35.35,
+            "correctness": 4.62,
+            "completeness": 45.95,
+            "groundedness": 100.0,
+            "conciseness": 13.43,
+            "notes": [
+              "Low lexical overlap \u2014 review for factual drift.",
+              "Lexical similarity uses stdlib SequenceMatcher + token F1 (not embedding cosine). Swap in a SemanticSimilarityEvaluator via the registry when embeddings are desired."
+            ],
+            "evaluator_id": "default_composite_v1",
+            "components": {
+              "exact_match": 0.0,
+              "lexical_similarity": 7.11,
+              "token_recall": 45.95,
+              "length_ratio_score": 13.43,
+              "grounding_overlap": 100.0
+            },
+            "skipped": false,
+            "skip_reason": null
+          },
+          "quality_score": 35.35,
+          "correctness": 4.62,
+          "completeness": 45.95,
+          "groundedness": 100.0,
+          "conciseness": 13.43
+        },
+        {
+          "model": "gpt-5-nano",
+          "model_returned": "gpt-5-nano-2025-08-07",
+          "ok": true,
+          "error": null,
+          "answer": "",
+          "summary": "",
+          "summary_length": 0,
+          "summary_chars": 0,
+          "summary_words": 0,
+          "latency_ms": 5340.091,
+          "ttft_ms": null,
+          "tokens_per_sec": 149.8102,
+          "prompt_tokens": 7346,
+          "completion_tokens": 800,
+          "total_tokens": 8146,
+          "estimated_api_cost_usd": 0.0006873,
+          "estimated_energy_wh": 2.241286,
+          "estimated_co2e_g": 1.172193,
+          "finish_reason": "length",
+          "participant_kind": "openai",
+          "routing": {},
+          "quality": {
+            "quality_score": 0.0,
+            "correctness": 0.0,
+            "completeness": 0.0,
+            "groundedness": 0.0,
+            "conciseness": 0.0,
+            "notes": [
+              "Empty candidate answer."
+            ],
+            "evaluator_id": "default_composite_v1",
+            "components": {
+              "exact_match": 0.0,
+              "lexical_similarity": 0.0
+            },
+            "skipped": false,
+            "skip_reason": null
+          },
+          "quality_score": 0.0,
+          "correctness": 0.0,
+          "completeness": 0.0,
+          "groundedness": 0.0,
+          "conciseness": 0.0
+        },
+        {
+          "model": "gpt-5-mini",
+          "model_returned": "gpt-5-mini-2025-08-07",
+          "ok": true,
+          "error": null,
+          "answer": "# Student Attendance App \u2014 Product Summary\n\n## Executive summary\n- Mobile-first app to track student attendance, forecast semester outcomes, and answer: **\u201cHow many classes can I skip?\u201d**\n- Key outcomes: reduce attendance anxiety, remove manual calculations, provide skip strategy and alerts.\n\n## Target users\n- **Primary:** College/university students (16\u201325).  \n- **Secondary:** Coaching institutes, flexible-schedule high school students.  \n- **Tertiary:** Parents (monitoring, premium).\n\n## Key differentiators\n- **Skip Calculator** (per-semester & per-subject optimization).  \n- **Timetable OCR upload** for rapid onboarding.  \n- **AI Attendance Assistant** (proactive recommendations, recovery plans).  \n- **Multi-mode support:** FIXED_DAILY, FLEX_DAYS, MINIMAL.\n\n---\n\n## Onboarding (layered)\nLayers: **Auth \u2192 Timetable Setup \u2192 Semester Context \u2192 Mid\u2011Semester Status \u2192 Final Review \u2192 Dashboard**.\n\nCore steps:\n- **Authentication:** Google / Apple / Email / optional guest.\n- **Timetable Setup:**  \n  - *OCR Upload* (photo/PDF \u2192 auto-extract subjects, days, times).  \n  - *Manual Setup* (add subjects \u2192 FIXED_DAILY or FLEX_DAYS \u2192 optional timings).  \n  - *Minimal Mode* (subjects only; manual daily marking).\n- **Semester timing:** optional date pickers for start/end (improves forecasts).\n- **Mid\u2011semester status:** three input modes (exact counts, percentage + weeks, or start fresh).\n- **Attendance requirement:** global or per-subject percentage (default 75%).\n- **Final review** \u2192 Dashboard with quick Present/Absent, skip calculator.\n\n---\n\n## Core features\n- **Daily attendance marking:** one\u2011tap present/absent, retroactive and batch edits.\n- **Skip Calculator:** shows classes can skip, must-attend counts, interactive sliders and recovery plans.\n- **Attendance streaks & gamification:** daily/subject/weekly streaks, badges, animations.\n- **Timetable management:** add/edit, drag\u2011and\u2011drop, copy-to-week, edit history.\n- **Smart predictions & alerts:** risk tiers, proactive danger/safe/recovery warnings, tone selection.\n- **Weekly/Monthly/Semester analytics:** per-sub",
+          "summary": "# Student Attendance App \u2014 Product Summary\n\n## Executive summary\n- Mobile-first app to track student attendance, forecast semester outcomes, and answer: **\u201cHow many classes can I skip?\u201d**\n- Key outcomes: reduce attendance anxiety, remove manual calculations, provide skip strategy and alerts.\n\n## Target users\n- **Primary:** College/university students (16\u201325).  \n- **Secondary:** Coaching institutes, flexible-schedule high school students.  \n- **Tertiary:** Parents (monitoring, premium).\n\n## Key differentiators\n- **Skip Calculator** (per-semester & per-subject optimization).  \n- **Timetable OCR upload** for rapid onboarding.  \n- **AI Attendance Assistant** (proactive recommendations, recovery plans).  \n- **Multi-mode support:** FIXED_DAILY, FLEX_DAYS, MINIMAL.\n\n---\n\n## Onboarding (layered)\nLayers: **Auth \u2192 Timetable Setup \u2192 Semester Context \u2192 Mid\u2011Semester Status \u2192 Final Review \u2192 Dashboard**.\n\nCore steps:\n- **Authentication:** Google / Apple / Email / optional guest.\n- **Timetable Setup:**  \n  - *OCR Upload* (photo/PDF \u2192 auto-extract subjects, days, times).  \n  - *Manual Setup* (add subjects \u2192 FIXED_DAILY or FLEX_DAYS \u2192 optional timings).  \n  - *Minimal Mode* (subjects only; manual daily marking).\n- **Semester timing:** optional date pickers for start/end (improves forecasts).\n- **Mid\u2011semester status:** three input modes (exact counts, percentage + weeks, or start fresh).\n- **Attendance requirement:** global or per-subject percentage (default 75%).\n- **Final review** \u2192 Dashboard with quick Present/Absent, skip calculator.\n\n---\n\n## Core features\n- **Daily attendance marking:** one\u2011tap present/absent, retroactive and batch edits.\n- **Skip Calculator:** shows classes can skip, must-attend counts, interactive sliders and recovery plans.\n- **Attendance streaks & gamification:** daily/subject/weekly streaks, badges, animations.\n- **Timetable management:** add/edit, drag\u2011and\u2011drop, copy-to-week, edit history.\n- **Smart predictions & alerts:** risk tiers, proactive danger/safe/recovery warnings, tone selection.\n- **Weekly/Monthly/Semester analytics:** per-sub",
+          "summary_length": 2083,
+          "summary_chars": 2083,
+          "summary_words": 262,
+          "latency_ms": 16184.86,
+          "ttft_ms": 6697.876,
+          "tokens_per_sec": 49.4289,
+          "prompt_tokens": 7346,
+          "completion_tokens": 800,
+          "total_tokens": 8146,
+          "estimated_api_cost_usd": 0.0034365,
+          "estimated_energy_wh": 6.671262,
+          "estimated_co2e_g": 3.48907,
+          "finish_reason": "length",
+          "participant_kind": "openai",
+          "routing": {},
+          "quality": {
+            "quality_score": 38.18,
+            "correctness": 7.13,
+            "completeness": 45.95,
+            "groundedness": 100.0,
+            "conciseness": 25.61,
+            "notes": [
+              "Low lexical overlap \u2014 review for factual drift.",
+              "Lexical similarity uses stdlib SequenceMatcher + token F1 (not embedding cosine). Swap in a SemanticSimilarityEvaluator via the registry when embeddings are desired."
+            ],
+            "evaluator_id": "default_composite_v1",
+            "components": {
+              "exact_match": 0.0,
+              "lexical_similarity": 10.97,
+              "token_recall": 45.95,
+              "length_ratio_score": 25.61,
+              "grounding_overlap": 100.0
+            },
+            "skipped": false,
+            "skip_reason": null
+          },
+          "quality_score": 38.18,
+          "correctness": 7.13,
+          "completeness": 45.95,
+          "groundedness": 100.0,
+          "conciseness": 25.61
+        },
+        {
+          "model": "gpt-5.5",
+          "model_returned": "gpt-5.5-2026-04-23",
+          "ok": true,
+          "error": null,
+          "answer": "# Student Attendance App \u2014 Product Specification Summary\n\n## Core Concept\n\nAn attendance tracking app for students that answers: **\u201cHow many classes can I safely skip?\u201d**\n\nThe app helps students:\n\n- Track attendance automatically or manually\n- Calculate attendance percentages\n- Forecast semester outcomes\n- Get skip recommendations\n- Stay above eligibility requirements through alerts and recovery plans\n\n## Target Users\n\n- **Primary:** College and university students aged 16\u201325\n- **Secondary:** Coaching institute and high school students with flexible schedules\n- **Tertiary:** Parents monitoring student attendance\n\n## Key Differentiators\n\n- **Skip Calculator:** Shows safe skips and required attendance\n- **Timetable OCR Upload:** Photo/PDF timetable import for fast setup\n- **AI Attendance Assistant:** Proactive recommendations and warnings\n- **Multi-mode Support:** Fixed daily schedules, flexible day-wise schedules, or minimal manual tracking\n\n## Onboarding Flow\n\n### 1. Authentication\n\nOptions:\n\n- Google\n- Apple\n- Email OTP\n- Continue without login\n\nCollects basic identity data such as name, email, and profile picture.\n\n### 2. Timetable Setup\n\nUsers choose one of three setup paths:\n\n#### Upload Timetable\n\n- Upload photo/PDF\n- OCR extracts subjects, days, times, periods, and optional teacher/type data\n- User reviews and edits extracted timetable\n\n#### Manual Setup\n\n- Add subjects manually\n- Choose timetable type:\n  - **Fixed Daily:** Same subjects daily, possibly different order\n  - **Flexible Days:** Different subjects on different weekdays\n- Optional timing or period-based configuration\n\n#### Minimal Mode\n\n- Add subject names only\n- No timetable required\n- Attendance is marked manually each day\n\n### 3. Semester Timing\n\nOptional semester start and end dates help improve forecasting and summaries.\n\n### 4. Mid-Semester Status\n\nIf joining mid-semester, users can provide:\n\n- Exact classes held and attended\n- Current attendance percentages\n- No historical data, starting from today\n\nThe app estimates attendance where possible and allows later correction.\n\n### 5. Attendance Requirements\n\n- Default target: **75%**\n- Adjustable range: **50\u2013100%**\n- Can apply globally or per subject\n\n### 6. Final Review\n\nUsers review timetable mode, subjects, attendance requirements, and semester dates before entering the dashboard.\n\n## Dashboard\n\nShows:\n\n- Today\u2019s classes\n- One-tap **Present / Absent** buttons\n- Overall attendance percentage\n- Skip calculator\n- Upcoming class reminders\n- Weekly overview\n\n## Core Features\n\n### Daily Attendance Marking\n\n- Mark attendance in real time, retroactively, or in batch\n- Supports present, absent, and holiday statuses\n- Designed for fast daily use\n\n### Skip Calculator\n\nDisplays:\n\n- Classes held\n- Classes attended\n- Current percentage\n- Target percentage\n- Safe skips\n- Required future attendance if behind\n\nIncludes simulations such as:\n\n- \u201cIf I skip today, what happens?\u201d\n- \u201cWhat if I attend the next 3?\u201d\n- Recovery plans\n\n### Attendance Streaks\n\nGamified attendance tracking with:\n\n- Daily streaks\n- Subject streaks\n- Weekly confidence streaks\n- Monthly badges\n- Streak-risk notifications\n\n### Timetable Management\n\nIncludes:\n\n- Add/edit subjects\n- Drag-and-drop period ordering\n- Day-wise custom schedules\n- Copy-to-week tools\n- Timetable version history\n\n### Smart Predictions and Alerts\n\nAlerts include:\n\n- Danger warnings\n- Safe-to-skip notifications\n- Recovery plans\n- Streak warnings\n- End-of-semester alerts\n\nTone options:\n\n- Friendly\n- Brutal\n- Sarcastic\n- Panic\n\n### Analytics\n\nIncludes weekly, monthly, and semester-level insights:\n\n- Overall and per-subject attendance\n",
+          "summary": "# Student Attendance App \u2014 Product Specification Summary\n\n## Core Concept\n\nAn attendance tracking app for students that answers: **\u201cHow many classes can I safely skip?\u201d**\n\nThe app helps students:\n\n- Track attendance automatically or manually\n- Calculate attendance percentages\n- Forecast semester outcomes\n- Get skip recommendations\n- Stay above eligibility requirements through alerts and recovery plans\n\n## Target Users\n\n- **Primary:** College and university students aged 16\u201325\n- **Secondary:** Coaching institute and high school students with flexible schedules\n- **Tertiary:** Parents monitoring student attendance\n\n## Key Differentiators\n\n- **Skip Calculator:** Shows safe skips and required attendance\n- **Timetable OCR Upload:** Photo/PDF timetable import for fast setup\n- **AI Attendance Assistant:** Proactive recommendations and warnings\n- **Multi-mode Support:** Fixed daily schedules, flexible day-wise schedules, or minimal manual tracking\n\n## Onboarding Flow\n\n### 1. Authentication\n\nOptions:\n\n- Google\n- Apple\n- Email OTP\n- Continue without login\n\nCollects basic identity data such as name, email, and profile picture.\n\n### 2. Timetable Setup\n\nUsers choose one of three setup paths:\n\n#### Upload Timetable\n\n- Upload photo/PDF\n- OCR extracts subjects, days, times, periods, and optional teacher/type data\n- User reviews and edits extracted timetable\n\n#### Manual Setup\n\n- Add subjects manually\n- Choose timetable type:\n  - **Fixed Daily:** Same subjects daily, possibly different order\n  - **Flexible Days:** Different subjects on different weekdays\n- Optional timing or period-based configuration\n\n#### Minimal Mode\n\n- Add subject names only\n- No timetable required\n- Attendance is marked manually each day\n\n### 3. Semester Timing\n\nOptional semester start and end dates help improve forecasting and summaries.\n\n### 4. Mid-Semester Status\n\nIf joining mid-semester, users can provide:\n\n- Exact classes held and attended\n- Current attendance percentages\n- No historical data, starting from today\n\nThe app estimates attendance where possible and allows later correction.\n\n### 5. Attendance Requirements\n\n- Default target: **75%**\n- Adjustable range: **50\u2013100%**\n- Can apply globally or per subject\n\n### 6. Final Review\n\nUsers review timetable mode, subjects, attendance requirements, and semester dates before entering the dashboard.\n\n## Dashboard\n\nShows:\n\n- Today\u2019s classes\n- One-tap **Present / Absent** buttons\n- Overall attendance percentage\n- Skip calculator\n- Upcoming class reminders\n- Weekly overview\n\n## Core Features\n\n### Daily Attendance Marking\n\n- Mark attendance in real time, retroactively, or in batch\n- Supports present, absent, and holiday statuses\n- Designed for fast daily use\n\n### Skip Calculator\n\nDisplays:\n\n- Classes held\n- Classes attended\n- Current percentage\n- Target percentage\n- Safe skips\n- Required future attendance if behind\n\nIncludes simulations such as:\n\n- \u201cIf I skip today, what happens?\u201d\n- \u201cWhat if I attend the next 3?\u201d\n- Recovery plans\n\n### Attendance Streaks\n\nGamified attendance tracking with:\n\n- Daily streaks\n- Subject streaks\n- Weekly confidence streaks\n- Monthly badges\n- Streak-risk notifications\n\n### Timetable Management\n\nIncludes:\n\n- Add/edit subjects\n- Drag-and-drop period ordering\n- Day-wise custom schedules\n- Copy-to-week tools\n- Timetable version history\n\n### Smart Predictions and Alerts\n\nAlerts include:\n\n- Danger warnings\n- Safe-to-skip notifications\n- Recovery plans\n- Streak warnings\n- End-of-semester alerts\n\nTone options:\n\n- Friendly\n- Brutal\n- Sarcastic\n- Panic\n\n### Analytics\n\nIncludes weekly, monthly, and semester-level insights:\n\n- Overall and per-subject attendance\n",
+          "summary_length": 3643,
+          "summary_chars": 3643,
+          "summary_words": 528,
+          "latency_ms": 14498.891,
+          "ttft_ms": 2785.098,
+          "tokens_per_sec": 55.1766,
+          "prompt_tokens": 7346,
+          "completion_tokens": 800,
+          "total_tokens": 8146,
+          "estimated_api_cost_usd": 0.06073,
+          "estimated_energy_wh": 16.943685,
+          "estimated_co2e_g": 8.861547,
+          "finish_reason": "length",
+          "participant_kind": "openai",
+          "routing": {},
+          "quality": {
+            "quality_score": 40.04,
+            "correctness": 6.08,
+            "completeness": 62.16,
+            "groundedness": 100.0,
+            "conciseness": 13.76,
+            "notes": [
+              "Low lexical overlap \u2014 review for factual drift.",
+              "Lexical similarity uses stdlib SequenceMatcher + token F1 (not embedding cosine). Swap in a SemanticSimilarityEvaluator via the registry when embeddings are desired."
+            ],
+            "evaluator_id": "default_composite_v1",
+            "components": {
+              "exact_match": 0.0,
+              "lexical_similarity": 9.36,
+              "token_recall": 62.16,
+              "length_ratio_score": 13.76,
+              "grounding_overlap": 100.0
+            },
+            "skipped": false,
+            "skip_reason": null
+          },
+          "quality_score": 40.04,
+          "correctness": 6.08,
+          "completeness": 62.16,
+          "groundedness": 100.0,
+          "conciseness": 13.76
+        }
+      ]
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 "use client"
 
 import dynamic from "next/dynamic"
+import Link from "next/link"
 import { motion } from "framer-motion"
 import { useState, useEffect, Suspense, useCallback, useRef } from "react"
 import { useSearchParams, useRouter } from "next/navigation"
@@ -946,7 +947,11 @@ function ResultsContent() {
                 {!jobId && !showLiveFeed && !showFailure && !isComplete ? (
                   <Card className="p-6 bg-card/50 border-border/50">
                     <p className="text-sm text-muted-foreground">
-                      Loading your latest job…
+                      No job selected. Open a completed job from the sidebar, or{" "}
+                      <Link href="/new-job" className="text-foreground underline-offset-2 hover:underline">
+                        start a new job
+                      </Link>
+                      .
                     </p>
                   </Card>
                 ) : null}

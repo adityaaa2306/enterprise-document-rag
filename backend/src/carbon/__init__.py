@@ -13,6 +13,9 @@ from __future__ import annotations
 from src.carbon.accounting import (
     ASSUMPTIONS_PANEL_TEXT,
     METHODOLOGY_TEXT,
+    RAG_QUERY_METHODOLOGY_TEXT,
+    estimate_rag_query_carbon,
+    estimate_rag_query_carbon_from_latency,
     estimate_workflow_carbon,
 )
 from src.carbon.assumptions import (
@@ -34,11 +37,14 @@ def fetch_grid_carbon_intensity(*args, **kwargs):
 
 __all__ = [
     "estimate_workflow_carbon",
+    "estimate_rag_query_carbon",
+    "estimate_rag_query_carbon_from_latency",
     "fetch_grid_carbon_intensity",
     "schedule_region",
     "estimate_tokens",
     "METHODOLOGY_TEXT",
     "ASSUMPTIONS_PANEL_TEXT",
+    "RAG_QUERY_METHODOLOGY_TEXT",
     "PUE",
     "ReportingBoundary",
     "DEFAULT_REPORTING_BOUNDARY",

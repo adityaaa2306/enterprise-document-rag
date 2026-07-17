@@ -88,6 +88,13 @@ graphify-out-docs-smoke/
 # Generated / ephemeral evaluation fixtures
 eval_docs/
 
+# Offline GPT benchmark run outputs (credits / answers — local only)
+benchmark_results/**
+!benchmark_results/.gitkeep
+# Publishable campaign datasets (versioned, reproducible)
+!benchmark_results/campaigns/
+!benchmark_results/campaigns/**/
+
 # IDE / editor
 .vscode/
 .idea/

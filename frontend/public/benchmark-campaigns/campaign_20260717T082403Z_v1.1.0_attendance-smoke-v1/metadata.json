@@ -1,0 +1,65 @@
+{
+  "campaign_id": "campaign_20260717T082403Z_v1.1.0_attendance-smoke-v1",
+  "benchmark_version": "1.1.0",
+  "retrieval_version": "hybrid-rrf-rerank-v1",
+  "prompt_version": "qa-frozen-v1",
+  "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+  "timestamp_utc": "2026-07-17T08:24:18.780788+00:00",
+  "finished_utc": "2026-07-17T08:25:52.663042+00:00",
+  "suite": "smoke",
+  "models": [
+    "gpt-5-nano",
+    "gpt-5-mini",
+    "gpt-5.5"
+  ],
+  "dry_run": false,
+  "total_runtime_sec": 93.882,
+  "total_api_cost_usd": 0.0912601,
+  "context_and_prompt_hashes": [
+    {
+      "question": "What is the main purpose of this application?",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "e5fc749e4ba37096ec8a0e5a588d701ef54974fa4494d0fcfecfc95b68b881a6",
+      "prompt_hash": "d135b8ab507ac0b645b68542170dfaa80c6db08d462c338439b2892b76954941",
+      "chunk_count": 2
+    },
+    {
+      "question": "Who are the primary users or stakeholders?",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "5fd57b98c9eafc78b1818e58c712870cb38252bc0946843bf6a24a83793bcb20",
+      "prompt_hash": "b0ad639cf500d0d7982a21058a99a697e67a9c87c9eccbeae4cb5183223320e7",
+      "chunk_count": 3
+    },
+    {
+      "question": "List the key features described in the document.",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "fa3a41079bc5a4d20152998c23e597a4694fe64bf95c9249aea08b9f5c89c47a",
+      "prompt_hash": "723d2ce37497caefbe2a944c2460d03ad2903d358019b75b094bdc8e8351e189",
+      "chunk_count": 4
+    },
+    {
+      "question": "How does attendance tracking work according to the document?",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "4f4c8607da265d64ee343db460a6639bc86fff18b0d5d58be6d28115d54bff21",
+      "prompt_hash": "9b102438efaf8ae86aad918b0bde77866448bf42c5ea340c5480d0937fffc999",
+      "chunk_count": 4
+    },
+    {
+      "question": "What technologies or stack components are mentioned?",
+      "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+      "context_hash": "e5fc749e4ba37096ec8a0e5a588d701ef54974fa4494d0fcfecfc95b68b881a6",
+      "prompt_hash": "7a2d3d4a95aca209157e6c9c269d3319f005644bab87cdb1b50a826acf05a4b3",
+      "chunk_count": 2
+    }
+  ],
+  "artifacts": {
+    "config": "config.json",
+    "metadata": "metadata.json",
+    "results": "results.json",
+    "summary": "summary.json",
+    "dashboard": "dashboard.json",
+    "report": "REPORT.md",
+    "execution_log": "execution.log"
+  },
+  "campaign_root": "D:\\green-agentic-rag-main\\benchmark_results\\campaigns\\campaign_20260717T082403Z_v1.1.0_attendance-smoke-v1"
+}

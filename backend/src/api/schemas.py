@@ -286,6 +286,9 @@ class RagQueryResponse(BaseModel):
     # Query-path stage timing (ms). Present when instrumentation is enabled.
     # Shape: {"stages_ms": {...}, "meta": {...}}
     latency: Optional[dict] = None
+    # Interactive RAG per-query carbon (Boundary A). Independent of job document-processing carbon.
+    # Omitted/null on older clients; never mutates job carbon_data.
+    carbon: Optional[dict] = None
 
 
 class ChatRequest(BaseModel):

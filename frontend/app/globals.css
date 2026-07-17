@@ -770,3 +770,22 @@
 .landing-root *::-webkit-scrollbar-thumb:hover {
   background: #333;
 }
+
+/* Recharts: force readable ticks/legend on dark cards (invalid hsl(oklch()) fallbacks) */
+.recharts-cartesian-axis-tick-value,
+.recharts-cartesian-axis-tick-value tspan,
+.recharts-polar-angle-axis-tick-value,
+.recharts-polar-angle-axis-tick-value tspan,
+.recharts-polar-radius-axis-tick-value,
+.recharts-polar-radius-axis-tick-value tspan {
+  fill: #e5e5e5 !important;
+}
+
+.recharts-legend-item-text {
+  color: #e5e5e5 !important;
+  fill: #e5e5e5 !important;
+}
+
+.recharts-text {
+  fill: #e5e5e5;
+}

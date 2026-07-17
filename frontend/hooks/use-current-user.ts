@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useLayoutEffect, useState } from "react"
 import { apiFetch, getAccessToken } from "@/lib/api"
 import {
   fetchCurrentUserCached,
@@ -23,36 +23,40 @@ export type AuthPersona =
   | { kind: "guest"; guest: GuestSessionInfo }
   | { kind: "anonymous" }
 
-function initialUser(): CurrentUser | null {
-  if (typeof window === "undefined") return null
-  if (!getAccessToken()) return null
-  return peekCurrentUserCache()
-}
-
-function initialGuest(): GuestSessionInfo | null {
-  if (typeof window === "undefined") return null
-  if (getAccessToken()) return null
-  if (!(isGuestMode() || getGuestSessionId())) return null
-  const id = getGuestSessionId()
-  if (!id) return null
-  return getGuestMeta() || { guest_session_id: id }
-}
-
 /**
  * Resolves Authenticated vs Guest vs Anonymous.
  * Guests never call /auth/me (JWT-only endpoint → 401).
- * Hydrates from cache synchronously to avoid TopBar flash / blocking loads.
+ *
+ * Initial state is always SSR-safe (null / loading). Reading localStorage during
+ * useState init caused hydration mismatches (server: Platform Dashboard,
+ * client: Guest Session). Cache is applied in useEffect after mount.
  */
 export function useCurrentUser() {
-  const [user, setUser] = useState<CurrentUser | null>(initialUser)
-  const [guest, setGuest] = useState<GuestSessionInfo | null>(initialGuest)
-  const [loading, setLoading] = useState(() => {
-    if (typeof window === "undefined") return true
-    if (peekCurrentUserCache() && getAccessToken()) return false
-    if (getGuestSessionId() && !getAccessToken()) return false
-    return Boolean(getAccessToken())
-  })
+  const [user, setUser] = useState<CurrentUser | null>(null)
+  const [guest, setGuest] = useState<GuestSessionInfo | null>(null)
+  const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+
+  // After hydration, apply localStorage cache before paint to limit chrome flash.
+  useLayoutEffect(() => {
+    const token = getAccessToken()
+    if (token) {
+      const cached = peekCurrentUserCache()
+      if (cached) {
+        setUser(cached)
+        setGuest(null)
+        setLoading(false)
+      }
+      return
+    }
+    if (isGuestMode() || getGuestSessionId()) {
+      const id = getGuestSessionId()
+      if (!id) return
+      setUser(null)
+      setGuest(getGuestMeta() || { guest_session_id: id })
+      setLoading(false)
+    }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -60,12 +64,6 @@ export function useCurrentUser() {
       try {
         const token = getAccessToken()
         if (token) {
-          const cached = peekCurrentUserCache()
-          if (cached) {
-            setUser(cached)
-            setGuest(null)
-            setLoading(false)
-          }
           const data = await fetchCurrentUserCached(() => apiFetch("/auth/me"))
           if (cancelled) return
           if (!data) {

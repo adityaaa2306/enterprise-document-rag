@@ -1,0 +1,96 @@
+[
+  {
+    "campaign_id": "campaign_20260717T104756Z_v1.4.0_lhas-summarization-standard",
+    "label": "lhas-summarization-standard",
+    "benchmark_version": "1.4.0",
+    "workload": "document_summarization",
+    "suite": "summarization-standard",
+    "document_id": "f3bbda03-2ac2-4e4b-bd01-7b6be7f81895",
+    "document_name": "LHAS_Blueprint.pdf",
+    "timestamp_utc": "2026-07-17T10:48:14.995293+00:00",
+    "models": [
+      "intelligent-router",
+      "gpt-5-nano",
+      "gpt-5-mini",
+      "gpt-5.5"
+    ],
+    "dry_run": false,
+    "total_api_cost_usd": 0.07247226,
+    "total_runtime_sec": 109.711,
+    "status": "ok"
+  },
+  {
+    "campaign_id": "campaign_20260717T093705Z_v1.4.0_rag-standard",
+    "label": "rag-standard",
+    "benchmark_version": "1.4.0",
+    "workload": "interactive_rag",
+    "suite": "full",
+    "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+    "document_name": "Student Attendance App.pdf",
+    "timestamp_utc": "2026-07-17T09:37:17.295847+00:00",
+    "models": [
+      "intelligent-router",
+      "gpt-5-nano",
+      "gpt-5-mini",
+      "gpt-5.5"
+    ],
+    "dry_run": false,
+    "total_api_cost_usd": 0.2900423,
+    "total_runtime_sec": 916.545,
+    "status": "ok"
+  },
+  {
+    "campaign_id": "campaign_20260717T093516Z_v1.4.0_summarization-standard",
+    "label": "summarization-standard",
+    "benchmark_version": "1.4.0",
+    "workload": "document_summarization",
+    "suite": "summarization-standard",
+    "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+    "document_name": "Student Attendance App.pdf",
+    "timestamp_utc": "2026-07-17T09:35:24.800839+00:00",
+    "models": [
+      "intelligent-router",
+      "gpt-5-nano",
+      "gpt-5-mini",
+      "gpt-5.5"
+    ],
+    "dry_run": false,
+    "total_api_cost_usd": 0.0653692,
+    "total_runtime_sec": 87.182,
+    "status": "ok"
+  },
+  {
+    "campaign_id": "campaign_20260717T082403Z_v1.1.0_attendance-smoke-v1",
+    "label": "attendance-smoke-v1",
+    "benchmark_version": "1.1.0",
+    "workload": "interactive_rag",
+    "suite": "smoke",
+    "document_id": "ef0f2f66-92cc-4bdc-bee2-e228132329ae",
+    "document_name": "Student Attendance App.pdf",
+    "timestamp_utc": "2026-07-17T08:24:18.780788+00:00",
+    "models": [
+      "gpt-5-nano",
+      "gpt-5-mini",
+      "gpt-5.5"
+    ],
+    "dry_run": false,
+    "total_api_cost_usd": 0.0912601,
+    "total_runtime_sec": 93.882,
+    "status": "ok"
+  },
+  {
+    "campaign_id": "campaign_20260717T093319Z_v1.4.0_summarization-standard",
+    "label": "summarization-standard",
+    "benchmark_version": null,
+    "workload": "document_summarization",
+    "suite": null,
+    "document_id": null,
+    "document_name": "Student Attendance App.pdf",
+    "timestamp_utc": null,
+    "models": null,
+    "dry_run": null,
+    "total_api_cost_usd": null,
+    "total_runtime_sec": null,
+    "status": "ok"
+  }
+]

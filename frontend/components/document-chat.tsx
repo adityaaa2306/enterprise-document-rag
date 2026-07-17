@@ -14,6 +14,7 @@ import {
   CheckCircle2,
   Copy,
   FileText,
+  Leaf,
   Layers,
   Loader2,
   MessageSquarePlus,
@@ -42,9 +43,13 @@ import {
 import {
   extractCompactMetrics,
   fmtG,
-  fmtPct,
   type CompactJobMetrics,
 } from "@/lib/job-results-metrics"
+import {
+  CarbonAccountingPanel,
+  InteractiveRagQueryCarbon,
+  type CarbonTimelineEntry,
+} from "@/components/carbon-accounting-panel"
 import { useFinalizedMetrics } from "@/hooks/use-finalized-metrics"
 import {
   revisionOf,
@@ -91,6 +96,26 @@ const PIPELINE_STEPS = [
 
 type ChatRole = "user" | "assistant"
 
+/** Per-query Interactive RAG carbon (independent of document-processing job carbon). */
+export type InteractiveRagCarbon = {
+  workload?: string
+  label?: string
+  estimated_gco2e?: number | null
+  estimated_energy_kwh?: number | null
+  estimated_energy_wh?: number | null
+  grid_intensity_gco2_kwh?: number | null
+  grid_zone?: string | null
+  stages_gco2e?: {
+    query_embedding_gco2e?: number
+    retrieval_gco2e?: number
+    prompt_inference_gco2e?: number
+    completion_inference_gco2e?: number
+    llm_inference_gco2e?: number
+  } | null
+  methodology?: string | null
+  independent_of_document_processing?: boolean
+}
+
 type ChatMessage = {
   id: string
   role: ChatRole
@@ -111,7 +136,23 @@ type ChatMessage = {
     latency_ms?: number | null
     latency?: LatencyPayload | null
     frontend_timing?: FrontendTiming | null
+    carbon?: InteractiveRagCarbon | null
   }
+}
+
+function fmtQueryG(n: number | undefined | null): string {
+  if (n == null || !Number.isFinite(Number(n))) return "—"
+  const v = Number(n)
+  if (v > 0 && v < 0.01) return `${v.toFixed(4)} g`
+  if (v < 1) return `${v.toFixed(3)} g`
+  return fmtG(v)
+}
+
+function parseRagCarbon(raw: unknown): InteractiveRagCarbon | null {
+  if (!raw || typeof raw !== "object") return null
+  const c = raw as InteractiveRagCarbon
+  if (c.estimated_gco2e == null && !c.stages_gco2e) return null
+  return c
 }
 
 type JobLike = {
@@ -127,7 +168,7 @@ type JobLike = {
   methodology?: string | null
 }
 
-const CHAT_STORAGE_VERSION = 1
+const CHAT_STORAGE_VERSION = 2
 
 function chatStorageKey(documentId: string) {
   return `green-rag-chat:v${CHAT_STORAGE_VERSION}:${documentId}`
@@ -330,13 +371,6 @@ function EmptyState({
               "Est. quality",
               quality != null ? `${Math.round(quality)}%` : "—",
             ],
-            ["Carbon used", fmtG(metrics.optimizedG)],
-            [
-              "Carbon saved",
-              metrics.emissionsIncreased
-                ? fmtG(Math.abs(metrics.savedG))
-                : fmtPct(metrics.reductionPct),
-            ],
             [
               "Latency",
               totalLatencySec != null ? `${totalLatencySec.toFixed(1)} s` : "—",
@@ -355,6 +389,26 @@ function EmptyState({
             </div>
           ))}
         </div>
+
+        <CarbonAccountingPanel
+          className="mt-4"
+          compact
+          documentGco2e={metrics.optimizedG}
+          sessionQueries={0}
+          sessionGco2e={0}
+          timeline={
+            metrics.optimizedG > 0
+              ? [
+                  {
+                    id: "doc",
+                    label: "Upload document",
+                    gco2e: metrics.optimizedG,
+                    kind: "document",
+                  },
+                ]
+              : undefined
+          }
+        />
       </div>
 
       <div>
@@ -479,11 +533,17 @@ function InsightsPanel({
   onClose,
   latest,
   carbonSavedGrams,
+  session,
+  documentGco2e,
+  carbonTimeline,
 }: {
   open: boolean
   onClose: () => void
   latest: ChatMessage | null
   carbonSavedGrams?: number | null
+  session?: { queries: number; co2eG: number; energyKwh: number }
+  documentGco2e?: number
+  carbonTimeline?: CarbonTimelineEntry[]
 }) {
   const chunks = latest?.meta?.retrieved_chunks || []
   const avg = avgChunkScore(chunks)
@@ -512,6 +572,15 @@ function InsightsPanel({
             </button>
           </div>
           <div className="flex-1 space-y-4 overflow-y-auto p-3">
+            <CarbonAccountingPanel
+              documentGco2e={documentGco2e ?? 0}
+              lastQueryGco2e={latest?.meta?.carbon?.estimated_gco2e}
+              sessionQueries={session?.queries ?? 0}
+              sessionGco2e={session?.co2eG ?? 0}
+              gridIntensity={latest?.meta?.carbon?.grid_intensity_gco2_kwh}
+              timeline={carbonTimeline}
+            />
+
             <QueryPerformancePanel
               latency={latest?.meta?.latency}
               frontend={latest?.meta?.frontend_timing}
@@ -596,7 +665,10 @@ function InsightsPanel({
                 {carbonSavedGrams != null ? (
                   <div>
                     <p className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">
-                      Job carbon saved
+                      Document Processing · carbon saved
+                    </p>
+                    <p className="text-[10px] text-muted-foreground mb-0.5">
+                      vs baseline · one-time ingestion
                     </p>
                     <p className="text-xs font-medium">{fmtG(Number(carbonSavedGrams))}</p>
                   </div>
@@ -666,12 +738,15 @@ export function DocumentChat({ result }: Props) {
   const [hydrated, setHydrated] = useState(false)
   const [input, setInput] = useState("")
   const [loading, setLoading] = useState(false)
+  const [streamPhase, setStreamPhase] = useState<string | null>(null)
   const [insightsOpen, setInsightsOpen] = useState(true)
   const [citeFocusId, setCiteFocusId] = useState<string | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const streamTimer = useRef<ReturnType<typeof setInterval> | null>(null)
   const abortRef = useRef<AbortController | null>(null)
+  /** Hard client wall so hung NIM/primary never leaves chat spinning forever. */
+  const CLIENT_RAG_TIMEOUT_MS = 90_000
 
   const hasUserMessages = messages.some((m) => m.role === "user")
   const latestAssistant = [...messages].reverse().find((m) => m.role === "assistant" && m.meta) || null
@@ -679,6 +754,48 @@ export function DocumentChat({ result }: Props) {
     latestAssistant?.meta?.retrieved_chunks?.length ??
     latestAssistant?.meta?.sources?.length ??
     0
+
+  /** Session Interactive RAG totals — derived from message meta; resets with New chat. */
+  const sessionRag = useMemo(() => {
+    let queries = 0
+    let co2eG = 0
+    let energyKwh = 0
+    for (const m of messages) {
+      const c = m.meta?.carbon
+      if (!c || c.estimated_gco2e == null || !Number.isFinite(Number(c.estimated_gco2e))) {
+        continue
+      }
+      queries += 1
+      co2eG += Number(c.estimated_gco2e)
+      energyKwh += Number(c.estimated_energy_kwh || 0)
+    }
+    return { queries, co2eG, energyKwh }
+  }, [messages])
+
+  const carbonTimeline = useMemo((): CarbonTimelineEntry[] => {
+    const entries: CarbonTimelineEntry[] = []
+    if (metrics.optimizedG > 0) {
+      entries.push({
+        id: "doc-ingest",
+        label: "Upload document",
+        gco2e: metrics.optimizedG,
+        kind: "document",
+      })
+    }
+    let qn = 0
+    for (const m of messages) {
+      const g = m.meta?.carbon?.estimated_gco2e
+      if (m.role !== "assistant" || g == null || !Number.isFinite(Number(g))) continue
+      qn += 1
+      entries.push({
+        id: m.id,
+        label: `Question ${qn}`,
+        gco2e: Number(g),
+        kind: "query",
+      })
+    }
+    return entries
+  }, [messages, metrics.optimizedG])
 
   // Restore per-document chat on mount / document switch
   useEffect(() => {
@@ -739,6 +856,10 @@ export function DocumentChat({ result }: Props) {
       abortRef.current?.abort()
       const ac = new AbortController()
       abortRef.current = ac
+      setStreamPhase("Starting…")
+      const wallTimer = window.setTimeout(() => {
+        ac.abort()
+      }, CLIENT_RAG_TIMEOUT_MS)
 
       try {
         const response = await apiFetch("/rag-query/stream", {
@@ -791,6 +912,7 @@ export function DocumentChat({ result }: Props) {
               perceived_ttft_ms: null,
               tokens_per_sec: tokPerSec,
             },
+            carbon: parseRagCarbon(data.carbon),
           }
           setMessages((prev) =>
             prev.map((m) =>
@@ -903,6 +1025,7 @@ export function DocumentChat({ result }: Props) {
               perceived_ttft_ms: perceivedTtft,
               tokens_per_sec: tokPerSec,
             },
+            carbon: parseRagCarbon(data.carbon),
           }
           setMessages((prev) =>
             prev.map((m) =>
@@ -934,9 +1057,16 @@ export function DocumentChat({ result }: Props) {
               continue
             }
             const event = evt.event
-            if (event === "token") {
+            if (event === "status") {
+              const msg = String(evt.message || evt.phase || "").trim()
+              if (msg) setStreamPhase(msg)
+            } else if (event === "meta" || event === "plan") {
+              setStreamPhase("Generating answer…")
+            } else if (event === "token") {
+              setStreamPhase(null)
               applyToken(String(evt.text || ""))
             } else if (event === "done") {
+              setStreamPhase(null)
               finishWithDone(evt)
             } else if (event === "error") {
               flushPending()
@@ -974,7 +1104,24 @@ export function DocumentChat({ result }: Props) {
           return prev
         })
       } catch (err) {
-        if ((err as { name?: string })?.name === "AbortError") return
+        if ((err as { name?: string })?.name === "AbortError") {
+          const elapsed = Math.round(performance.now() - startedAt)
+          const timedOut = elapsed >= CLIENT_RAG_TIMEOUT_MS - 250
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId
+                ? {
+                    ...m,
+                    content: timedOut
+                      ? "This query timed out waiting for the model. Please try again — a fallback model should answer faster."
+                      : "Request cancelled.",
+                    streaming: false,
+                  }
+                : m,
+            ),
+          )
+          return
+        }
         console.error("Chat error:", err)
         setMessages((prev) =>
           prev.map((m) =>
@@ -988,6 +1135,8 @@ export function DocumentChat({ result }: Props) {
           ),
         )
       } finally {
+        window.clearTimeout(wallTimer)
+        setStreamPhase(null)
         setLoading(false)
       }
     },
@@ -1097,6 +1246,12 @@ export function DocumentChat({ result }: Props) {
           {hasUserMessages ? (
             <Chip>
               {lastRetrieved} retrieved
+            </Chip>
+          ) : null}
+          {sessionRag.queries > 0 ? (
+            <Chip className="border-emerald-500/30 text-emerald-300/90">
+              <Leaf className="h-3 w-3 shrink-0 text-emerald-400" />
+              Interactive RAG · {fmtQueryG(sessionRag.co2eG)} ({sessionRag.queries}q)
             </Chip>
           ) : null}
           <Chip>
@@ -1211,13 +1366,16 @@ export function DocumentChat({ result }: Props) {
                         ) : (
                           <div className="flex items-center gap-2 text-sm text-muted-foreground">
                             <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                            Thinking…
+                            {streamPhase || "Thinking…"}
                           </div>
                         )}
                       </div>
 
                       {msg.role === "assistant" && msg.content && !msg.streaming ? (
                         <>
+                          {msg.meta?.carbon ? (
+                            <InteractiveRagQueryCarbon carbon={msg.meta.carbon} />
+                          ) : null}
                           <MessageActions
                             content={msg.content}
                             onCopy={() => navigator.clipboard.writeText(msg.content)}
@@ -1323,6 +1481,9 @@ export function DocumentChat({ result }: Props) {
         onClose={() => setInsightsOpen(false)}
         latest={latestAssistant}
         carbonSavedGrams={Number.isFinite(carbonSaved) ? carbonSaved : null}
+        session={sessionRag}
+        documentGco2e={metrics.optimizedG}
+        carbonTimeline={carbonTimeline}
       />
     </div>
   )

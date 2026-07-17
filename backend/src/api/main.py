@@ -260,6 +260,23 @@ if _trusted:
 # Health / readiness (Phase 0)
 app.include_router(health_router)
 
+# Developer-only GPT benchmark router — never mounted in normal usage / UI.
+# Requires ENABLE_GPT_BENCHMARK=true and X-Benchmark-Token header.
+# Prefer CLI: python run_benchmark.py
+if os.environ.get("ENABLE_GPT_BENCHMARK", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+):
+    from src.eval.gpt_benchmark.api import router as gpt_benchmark_router
+
+    app.include_router(gpt_benchmark_router)
+    log.warning(
+        "ENABLE_GPT_BENCHMARK is on — /dev/benchmark/gpt is mounted "
+        "(developer-only; not used by the UI)."
+    )
+
 # --- Helper Function ---
 async def ingest_upload_to_object_storage(
     file: UploadFile,
@@ -1321,6 +1338,15 @@ def _iter_rag_query_sse(
         prior_entities = mem.prior_entity_resolutions(conversation_id)
 
     try:
+        # Flush immediately so the UI leaves blank "Thinking…" during retrieval.
+        yield _sse_line(
+            {
+                "event": "status",
+                "phase": "retrieving",
+                "message": "Retrieving context…",
+            }
+        )
+
         routing = storage.get_routing_decision(document_id)
         assemble_tier = "heavy"
         if routing and settings.USE_CONTEXT_ASSEMBLER:
@@ -1367,6 +1393,13 @@ def _iter_rag_query_sse(
                 "context_tokens": pack.tokens_used,
                 "context_budget": pack.tokens_budget,
                 "packed": (pack.stats or {}).get("packed"),
+            }
+        )
+        yield _sse_line(
+            {
+                "event": "status",
+                "phase": "generating",
+                "message": "Generating answer…",
             }
         )
 
@@ -1510,6 +1543,19 @@ def _iter_rag_query_sse(
         attach_resource_snapshot(latency, label="end")
         log_query_latency(document_id=document_id, query=query, latency=latency)
         done_payload["latency"] = latency
+        pack_tokens = None
+        try:
+            pack_tokens = int(getattr(pack, "tokens_used", None) or 0) or None
+        except (TypeError, ValueError):
+            pack_tokens = None
+        done_payload["carbon"] = _attach_interactive_rag_carbon(
+            query=query,
+            answer=answer,
+            sources=sources,
+            latency=latency,
+            inference_tier=str(tier or "heavy"),
+            pack_tokens_used=pack_tokens,
+        )
 
         if conversation_id and mem is not None:
             if not owner_type or not owner_id:
@@ -1541,6 +1587,43 @@ def _iter_rag_query_sse(
         yield _sse_line({"event": "error", "message": str(e)})
     finally:
         end_query_path()
+
+
+def _attach_interactive_rag_carbon(
+    *,
+    query: str,
+    answer: str,
+    sources: List[str],
+    latency: Optional[Dict[str, Any]],
+    inference_tier: str = "heavy",
+    pack_tokens_used: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Per-query Interactive RAG carbon estimate.
+
+    Independent of document-job ``carbon_data`` / ``estimate_workflow_carbon``.
+    Failures are swallowed so RAG answers are never blocked by accounting.
+    """
+    try:
+        from src.carbon.accounting import estimate_rag_query_carbon_from_latency
+
+        return estimate_rag_query_carbon_from_latency(
+            latency,
+            query=query,
+            answer=answer,
+            sources=sources,
+            inference_tier=inference_tier,
+            pack_tokens_used=pack_tokens_used,
+        )
+    except Exception as e:
+        log.warning("Interactive RAG carbon estimate failed: %s", e)
+        return {
+            "workload": "interactive_rag",
+            "label": "Interactive RAG CO₂e",
+            "estimated_gco2e": None,
+            "error": "estimate_failed",
+            "independent_of_document_processing": True,
+        }
 
 
 def _run_rag_query(
@@ -1803,6 +1886,20 @@ def _run_rag_query(
         attach_resource_snapshot(latency, label="end")
         log_query_latency(document_id=document_id, query=query, latency=latency)
         resp_kwargs["latency"] = latency
+        pack_tokens = None
+        if pack is not None:
+            try:
+                pack_tokens = int(getattr(pack, "tokens_used", None) or 0) or None
+            except (TypeError, ValueError):
+                pack_tokens = None
+        resp_kwargs["carbon"] = _attach_interactive_rag_carbon(
+            query=query,
+            answer=answer,
+            sources=sources,
+            latency=latency,
+            inference_tier=str(tier or "heavy"),
+            pack_tokens_used=pack_tokens,
+        )
 
         if persist_conversation and conversation_id and mem is not None:
             if not owner_type or not owner_id:

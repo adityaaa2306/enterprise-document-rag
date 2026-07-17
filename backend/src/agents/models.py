@@ -1341,6 +1341,127 @@ def _chat_completion_with_ttft(
         }
 
 
+def _iter_single_model_stream(
+    client: OpenAI,
+    *,
+    model_id: str,
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    timeout: httpx.Timeout,
+    soft_ttft_timeout_sec: float = 0.0,
+):
+    """
+    Yield ``("token", delta)`` then ``("done", timing_dict)`` for one model.
+
+    Soft TTFT is enforced with a reader thread + queue so a hung socket with
+    zero chunks still fails over (the in-loop check alone never fires then).
+    """
+    import queue
+    import threading
+
+    out_q: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+    soft = float(soft_ttft_timeout_sec or 0.0)
+
+    def _reader() -> None:
+        try:
+            stream = client.chat.completions.create(
+                model=model_id,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                stream=True,
+            )
+            for chunk in stream:
+                try:
+                    delta = chunk.choices[0].delta.content if chunk.choices else None
+                except (IndexError, AttributeError):
+                    delta = None
+                out_q.put(("chunk", delta))
+            out_q.put(("end", None))
+        except Exception as exc:  # noqa: BLE001 — surfaced to consumer
+            out_q.put(("err", exc))
+
+    worker = threading.Thread(
+        target=_reader,
+        name=f"rag-stream-{str(model_id)[:24]}",
+        daemon=True,
+    )
+    worker.start()
+
+    t0 = time.perf_counter()
+    ttft_ms: Optional[float] = None
+    first_byte_ms: Optional[float] = None
+    parts: List[str] = []
+
+    try:
+        while True:
+            wait: Optional[float] = None
+            if soft > 0 and ttft_ms is None:
+                wait = max(0.05, soft - (time.perf_counter() - t0))
+            try:
+                kind, payload = out_q.get(timeout=wait)
+            except queue.Empty:
+                raise NimApiError(
+                    f"soft_ttft timeout after {soft:.0f}s on {model_id} "
+                    f"(no first token)"
+                )
+
+            if kind == "err":
+                raise payload  # type: ignore[misc]
+            if kind == "end":
+                break
+
+            if first_byte_ms is None:
+                first_byte_ms = (time.perf_counter() - t0) * 1000.0
+            delta = payload
+            if not delta:
+                # Keepalive / role-only chunk — still enforce soft TTFT wall.
+                if soft > 0 and ttft_ms is None and (time.perf_counter() - t0) >= soft:
+                    raise NimApiError(
+                        f"soft_ttft timeout after {soft:.0f}s on {model_id} "
+                        f"(no first token)"
+                    )
+                continue
+
+            if ttft_ms is None:
+                ttft_ms = (time.perf_counter() - t0) * 1000.0
+                log.info(
+                    "TASK_LIFECYCLE phase=TTFT_RECEIVED task=rag-stream model=%s "
+                    "ttft_ms=%.1f",
+                    model_id,
+                    ttft_ms,
+                )
+            parts.append(str(delta))
+            yield ("token", str(delta))
+
+        text = "".join(parts).strip()
+        if not text:
+            raise ValueError(f"Empty response from {model_id}")
+        ttlt_ms = (time.perf_counter() - t0) * 1000.0
+        if first_byte_ms is None:
+            first_byte_ms = ttlt_ms
+        if ttft_ms is None:
+            ttft_ms = ttlt_ms
+        yield (
+            "done",
+            {
+                "request_start_ms": 0.0,
+                "first_byte_ms": round(first_byte_ms, 3),
+                "ttft_ms": round(ttft_ms, 3),
+                "ttlt_ms": round(ttlt_ms, 3),
+                "network_ms": round(first_byte_ms, 3),
+                "inference_ms": round(max(0.0, ttlt_ms - first_byte_ms), 3),
+                "mode": "client_stream",
+                "http_status": 200,
+            },
+        )
+    finally:
+        # Reader is daemon; abandon hung sockets after soft-TTFT failover.
+        pass
+
+
 def iter_chat_stream_with_fallback(
     model_ids: List[str],
     messages: List[Dict[str, str]],
@@ -1353,15 +1474,21 @@ def iter_chat_stream_with_fallback(
 ):
     """
     Yield ``("token", delta)`` then ``("done", {model_id, timing})``.
-    Falls through models on transient errors (same policy as call_chat_with_fallback).
+    Falls through models on transient errors / soft-TTFT (interactive RAG).
     """
     client = get_nim_client()
     if client is None:
         raise RuntimeError("NVIDIA NIM client is not configured (missing NVIDIA_API_KEY).")
 
     if max_retries_per_model is None:
-        max_retries_per_model = int(getattr(settings, "NIM_TRANSIENT_RETRIES", 3) or 3)
+        max_retries_per_model = int(getattr(settings, "NIM_TRANSIENT_RETRIES", 1) or 1)
     max_retries_per_model = max(1, int(max_retries_per_model))
+
+    soft_ttft = float(
+        getattr(settings, "NIM_RAG_SOFT_TTFT_TIMEOUT_SEC", None)
+        or getattr(settings, "NIM_SOFT_TTFT_TIMEOUT_SEC", 45.0)
+        or 0.0
+    )
 
     last_error: Optional[Exception] = None
     req_timeout = timeout or _nim_timeout()
@@ -1380,39 +1507,34 @@ def iter_chat_stream_with_fallback(
     for model_id in ordered_ids:
         for attempt in range(max_retries_per_model):
             t_attempt = time.perf_counter()
-            ttft_ms: Optional[float] = None
-            first_byte_ms: Optional[float] = None
             parts: List[str] = []
+            streamed_any = False
             try:
-                t0 = time.perf_counter()
-                stream = client.chat.completions.create(
-                    model=model_id,
+                log.info(
+                    "TASK_LIFECYCLE phase=HTTP_REQUEST_STARTED task=rag-stream "
+                    "model=%s soft_ttft=%.1fs read_timeout=%s",
+                    model_id,
+                    soft_ttft,
+                    getattr(req_timeout, "read", None),
+                )
+                done_timing: Optional[Dict[str, Any]] = None
+                for kind, payload in _iter_single_model_stream(
+                    client,
+                    model_id=model_id,
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     timeout=req_timeout,
-                    stream=True,
-                )
-                for chunk in stream:
-                    if first_byte_ms is None:
-                        first_byte_ms = (time.perf_counter() - t0) * 1000.0
-                    try:
-                        delta = chunk.choices[0].delta.content if chunk.choices else None
-                    except (IndexError, AttributeError):
-                        delta = None
-                    if delta:
-                        if ttft_ms is None:
-                            ttft_ms = (time.perf_counter() - t0) * 1000.0
-                        parts.append(delta)
-                        yield ("token", delta)
-                text = "".join(parts).strip()
-                if not text:
+                    soft_ttft_timeout_sec=soft_ttft,
+                ):
+                    if kind == "token":
+                        streamed_any = True
+                        parts.append(str(payload))
+                        yield ("token", str(payload))
+                    elif kind == "done":
+                        done_timing = dict(payload or {})
+                if not done_timing:
                     raise ValueError(f"Empty response from {model_id}")
-                ttlt_ms = (time.perf_counter() - t0) * 1000.0
-                if first_byte_ms is None:
-                    first_byte_ms = ttlt_ms
-                if ttft_ms is None:
-                    ttft_ms = ttlt_ms
                 attempt_ms = (time.perf_counter() - t_attempt) * 1000.0
                 attempts_log.append(
                     {
@@ -1425,14 +1547,7 @@ def iter_chat_stream_with_fallback(
                     }
                 )
                 timing = {
-                    "request_start_ms": 0.0,
-                    "first_byte_ms": round(first_byte_ms, 3),
-                    "ttft_ms": round(ttft_ms, 3),
-                    "ttlt_ms": round(ttlt_ms, 3),
-                    "network_ms": round(first_byte_ms, 3),
-                    "inference_ms": round(max(0.0, ttlt_ms - first_byte_ms), 3),
-                    "mode": "client_stream",
-                    "http_status": 200,
+                    **done_timing,
                     "retry_count": retry_count,
                     "attempt_count": len(attempts_log),
                     "attempts": attempts_log,
@@ -1465,6 +1580,7 @@ def iter_chat_stream_with_fallback(
                     http_status = _http_status_from_exc(e)
                 last_http_status = http_status
                 attempt_ms = (time.perf_counter() - t_attempt) * 1000.0
+                is_soft = "soft_ttft" in err_str.lower() or "soft ttft" in err_str.lower()
                 attempts_log.append(
                     {
                         "model_id": model_id,
@@ -1473,6 +1589,7 @@ def iter_chat_stream_with_fallback(
                         "duration_ms": round(attempt_ms, 1),
                         "http_status": http_status,
                         "error": f"{type(classified).__name__}: {str(classified)[:180]}",
+                        "soft_ttft": is_soft,
                     }
                 )
                 is_rate_limit = (
@@ -1480,9 +1597,11 @@ def iter_chat_stream_with_fallback(
                     or "429" in err_str
                     or "rate" in err_str.lower()
                 )
-                transient = is_transient_nim_error(classified) or is_rate_limit
+                transient = (
+                    is_transient_nim_error(classified) or is_rate_limit or is_soft
+                )
                 # If we already streamed tokens, do not silently switch models
-                if parts:
+                if streamed_any or parts:
                     raise
                 if transient and attempt < max_retries_per_model - 1:
                     retry_count += 1
@@ -1496,9 +1615,10 @@ def iter_chat_stream_with_fallback(
                     time.sleep(wait)
                     continue
                 log.warning(
-                    "Stream model '%s' failed (%s). Trying next fallback if any.",
+                    "Stream model '%s' failed (%s%s). Trying next fallback if any.",
                     model_id,
                     type(classified).__name__,
+                    ", soft_ttft" if is_soft else "",
                 )
                 break
 
