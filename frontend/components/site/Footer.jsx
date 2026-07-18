@@ -51,7 +51,7 @@ export default function Footer() {
                 <Leaf className="w-3.5 h-3.5 text-emerald-400" strokeWidth={1.5} />
               </div>
               <span className="font-mono text-[11px] tracking-[0.18em] uppercase text-neutral-300">
-                CarbonRoute AI
+                EcoRoute AI
               </span>
             </div>
             <p className="mt-4 text-sm text-neutral-500 max-w-xs leading-relaxed">
@@ -82,7 +82,7 @@ export default function Footer() {
           </div>
         </div>
         <div className="hairline-t mt-14 pt-6 flex flex-wrap items-center justify-between gap-3 font-mono text-[10px] uppercase tracking-[0.18em] text-neutral-600">
-          <div>© {new Date().getFullYear()} · CarbonRoute AI</div>
+          <div>© {new Date().getFullYear()} · EcoRoute AI</div>
           <div className="flex items-center gap-4">
             <span>build 2.4.1</span>
             <span>·</span>

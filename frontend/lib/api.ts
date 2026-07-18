@@ -1,5 +1,5 @@
 /**
- * Authenticated + Guest API client for the CarbonRoute AI backend.
+ * Authenticated + Guest API client for the EcoRoute AI backend.
  *
  * Auth modes:
  * - JWT: Authorization: Bearer <access_token>  (credentials omit)

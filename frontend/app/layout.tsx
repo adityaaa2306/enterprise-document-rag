@@ -7,21 +7,21 @@ const _sans = Inter({ subsets: ["latin"], variable: "--font-sans", display: "swa
 const _mono = JetBrains_Mono({ subsets: ["latin"], variable: "--font-mono", display: "swap" })
 
 export const metadata: Metadata = {
-  title: "CarbonRoute AI | Carbon-Aware Document Intelligence",
+  title: "EcoRoute AI | Carbon-Aware Document Intelligence",
   description:
     "Capability-first Light/Medium/Heavy routing on NVIDIA NIM, Boundary-A carbon accounting, and Interactive RAG — with Document Processing CO₂e tracked separately.",
   metadataBase: new URL("https://enterprise-document-rag.vercel.app"),
   openGraph: {
-    title: "CarbonRoute AI | Carbon-Aware Document Intelligence",
+    title: "EcoRoute AI | Carbon-Aware Document Intelligence",
     description:
       "CRE + QVA routing, Document Processing vs Interactive RAG carbon, single-region Electricity Maps intensity.",
     url: "https://enterprise-document-rag.vercel.app",
-    siteName: "CarbonRoute AI",
+    siteName: "EcoRoute AI",
     type: "website",
   },
   twitter: {
     card: "summary_large_image",
-    title: "CarbonRoute AI | Carbon-Aware Document Intelligence",
+    title: "EcoRoute AI | Carbon-Aware Document Intelligence",
     description:
       "CRE + QVA routing, Document Processing vs Interactive RAG carbon, single-region Electricity Maps intensity.",
   },
