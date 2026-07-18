@@ -1,5 +1,5 @@
 /**
- * Authenticated + Guest API client for the Green Agentic backend.
+ * Authenticated + Guest API client for the CarbonRoute AI backend.
  *
  * Auth modes:
  * - JWT: Authorization: Bearer <access_token>  (credentials omit)

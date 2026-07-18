@@ -217,7 +217,7 @@ export function Sidebar() {
             )}
           >
             <p className="text-[15px] font-semibold leading-snug tracking-tight text-foreground">
-              Green Agentic
+              CarbonRoute AI
             </p>
             <p className="text-[11px] text-muted-foreground leading-snug mt-0.5">
               Document Intelligence

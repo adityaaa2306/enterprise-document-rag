@@ -24,7 +24,7 @@ export const FRONTIER_RELATIVE_INTENSITY: ReadonlyArray<readonly [string, number
     ([name, j]) => [name, Math.round((j / A_J_PER_TOKEN_MEDIUM) * 10000) / 10000] as const,
   )
 
-export const OUR_SYSTEM_NAME = "Green Agentic Document Processing System"
+export const OUR_SYSTEM_NAME = "CarbonRoute AI Document Processing System"
 export const OUR_SYSTEM_TAGLINE = "Smart Carbon-Aware Routing"
 
 const LEGACY_CHUNK_GRAMS = 5.25

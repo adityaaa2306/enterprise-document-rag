@@ -29,7 +29,7 @@ export default function Nav() {
             </div>
           </div>
           <span className="font-mono text-[10px] md:text-[11px] tracking-[0.14em] md:tracking-[0.18em] uppercase text-neutral-300 truncate">
-            green/agentic
+            CarbonRoute AI
           </span>
         </a>
         <nav className="hidden md:flex items-center gap-8">

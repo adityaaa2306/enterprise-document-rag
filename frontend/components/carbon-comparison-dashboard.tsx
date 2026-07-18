@@ -151,7 +151,7 @@ function fmtG(value: number | undefined | null, digits = 2) {
 }
 
 function shortChartLabel(name: string) {
-  if (name.includes("Green Agentic")) return "Green Agentic"
+  if (name.includes("CarbonRoute AI") || name.includes("Green Agentic")) return "CarbonRoute AI"
   if (name.startsWith("Claude")) return "Claude Opus"
   if (name.startsWith("Gemini")) return "Gemini 2.5"
   if (name.includes("Behemoth")) return "Llama Behemoth"

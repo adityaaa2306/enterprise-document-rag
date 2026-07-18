@@ -2,6 +2,44 @@
 
 import { Leaf } from "lucide-react";
 
+const GITHUB_URL = "https://github.com/adityaaa2306/enterprise-document-rag";
+const LINKEDIN_URL = "https://www.linkedin.com/in/aditya-nimbalkar-b46405239/";
+const EMAIL = "mailto:adityanimbalkar2306@gmail.com";
+const PAPER_URL = `${GITHUB_URL}/blob/main/docs/architecture.md`;
+
+const columns = [
+  {
+    title: "System",
+    links: [
+      { label: "Overview", href: "#system" },
+      { label: "Pipeline", href: "#pipeline" },
+      { label: "Routing", href: "#routing" },
+    ],
+  },
+  {
+    title: "Research",
+    links: [
+      { label: "Methodology", href: "#methodology" },
+      { label: "Benchmarks", href: "#benchmarks" },
+      { label: "FAQ", href: "#faq" },
+    ],
+  },
+  {
+    title: "Code",
+    links: [
+      { label: "GitHub", href: GITHUB_URL, external: true },
+      { label: "Paper draft", href: PAPER_URL, external: true },
+    ],
+  },
+  {
+    title: "Contact",
+    links: [
+      { label: "Email", href: EMAIL },
+      { label: "LinkedIn", href: LINKEDIN_URL, external: true },
+    ],
+  },
+];
+
 export default function Footer() {
   return (
     <footer data-testid="site-footer" className="relative hairline-t py-14 bg-[#050505]">
@@ -13,7 +51,7 @@ export default function Footer() {
                 <Leaf className="w-3.5 h-3.5 text-emerald-400" strokeWidth={1.5} />
               </div>
               <span className="font-mono text-[11px] tracking-[0.18em] uppercase text-neutral-300">
-                green/agentic
+                CarbonRoute AI
               </span>
             </div>
             <p className="mt-4 text-sm text-neutral-500 max-w-xs leading-relaxed">
@@ -21,19 +59,20 @@ export default function Footer() {
             </p>
           </div>
           <div className="md:col-span-8 grid grid-cols-2 md:grid-cols-4 gap-6 font-mono text-[10px] uppercase tracking-[0.18em]">
-            {[
-              { title: "System", links: ["Overview", "Pipeline", "Routing"] },
-              { title: "Research", links: ["Methodology", "Benchmarks", "FAQ"] },
-              { title: "Code", links: ["GitHub", "Paper draft", "Changelog"] },
-              { title: "Contact", links: ["Email", "LinkedIn", "GScholar"] },
-            ].map((col) => (
+            {columns.map((col) => (
               <div key={col.title}>
                 <div className="text-neutral-500 mb-3">{col.title}</div>
                 <ul className="space-y-2">
                   {col.links.map((l) => (
-                    <li key={l}>
-                      <a href="#" className="text-neutral-300 hover:text-emerald-400 transition-colors">
-                        {l}
+                    <li key={l.label}>
+                      <a
+                        href={l.href}
+                        {...(l.external
+                          ? { target: "_blank", rel: "noopener noreferrer" }
+                          : {})}
+                        className="text-neutral-300 hover:text-emerald-400 transition-colors"
+                      >
+                        {l.label}
                       </a>
                     </li>
                   ))}
@@ -43,7 +82,7 @@ export default function Footer() {
           </div>
         </div>
         <div className="hairline-t mt-14 pt-6 flex flex-wrap items-center justify-between gap-3 font-mono text-[10px] uppercase tracking-[0.18em] text-neutral-600">
-          <div>© {new Date().getFullYear()} · Green Agentic Systems</div>
+          <div>© {new Date().getFullYear()} · CarbonRoute AI</div>
           <div className="flex items-center gap-4">
             <span>build 2.4.1</span>
             <span>·</span>

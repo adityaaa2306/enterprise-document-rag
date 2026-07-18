@@ -345,7 +345,7 @@ function RoutingTab({ m }: { m: CompactJobMetrics }) {
 }
 
 function shortModelLabel(name: string, isOurs?: boolean) {
-  if (isOurs) return "Ours (Green Agentic)"
+  if (isOurs) return "Ours (CarbonRoute AI)"
   if (name.length <= 22) return name
   return `${name.slice(0, 20)}…`
 }

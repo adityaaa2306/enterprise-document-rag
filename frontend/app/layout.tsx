@@ -7,21 +7,21 @@ const _sans = Inter({ subsets: ["latin"], variable: "--font-sans", display: "swa
 const _mono = JetBrains_Mono({ subsets: ["latin"], variable: "--font-mono", display: "swap" })
 
 export const metadata: Metadata = {
-  title: "Green Agentic | Carbon-Aware Document Intelligence",
+  title: "CarbonRoute AI | Carbon-Aware Document Intelligence",
   description:
     "Capability-first Light/Medium/Heavy routing on NVIDIA NIM, Boundary-A carbon accounting, and Interactive RAG — with Document Processing CO₂e tracked separately.",
   metadataBase: new URL("https://enterprise-document-rag.vercel.app"),
   openGraph: {
-    title: "Green Agentic | Carbon-Aware Document Intelligence",
+    title: "CarbonRoute AI | Carbon-Aware Document Intelligence",
     description:
       "CRE + QVA routing, Document Processing vs Interactive RAG carbon, single-region Electricity Maps intensity.",
     url: "https://enterprise-document-rag.vercel.app",
-    siteName: "Green Agentic",
+    siteName: "CarbonRoute AI",
     type: "website",
   },
   twitter: {
     card: "summary_large_image",
-    title: "Green Agentic | Carbon-Aware Document Intelligence",
+    title: "CarbonRoute AI | Carbon-Aware Document Intelligence",
     description:
       "CRE + QVA routing, Document Processing vs Interactive RAG carbon, single-region Electricity Maps intensity.",
   },
@@ -37,7 +37,7 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   return (
-    <html lang="en" className={`dark ${_sans.variable} ${_mono.variable}`}>
+    <html lang="en" className={`dark scroll-smooth ${_sans.variable} ${_mono.variable}`} style={{ scrollPaddingTop: "4.5rem" }}>
       <body className={`${_sans.className} antialiased bg-background text-foreground`}>
         {children}
       </body>
