@@ -1,7 +1,7 @@
-# Green Agentic Document Intelligence
+# EcoRoute AI
 
 <p align="center">
-  <img src="assets/hero.png" alt="Green Agentic Document Intelligence homepage" width="100%" />
+  <img src="assets/hero.png" alt="EcoRoute AI homepage" width="100%" />
 </p>
 
 **Carbon-aware AI document processing** with adaptive model routing, end-to-end summarization, interactive RAG, and a reproducible evaluation framework.
@@ -96,6 +96,10 @@ Methodology: [`docs/carbon-accounting.md`](docs/carbon-accounting.md)
 
 <p align="center">
   <img src="assets/benchmark_result.png" alt="Benchmark results" width="100%" />
+</p>
+
+<p align="center">
+  <img src="assets/benchmark_1.png" alt="Benchmark analytics dashboard" width="100%" />
 </p>
 
 Frozen-input campaigns compare the intelligent router against frontier baselines on quality, latency, estimated cost, and estimated CO₂e — with campaign sync into the analytics UI.
